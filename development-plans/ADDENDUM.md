@@ -888,3 +888,185 @@ of loss and the most promising next place to invest tuning effort --
 this should be revisited once the golden set is grown toward
 EVALUATION.md's ~300-question target, since single-digit-n per category
 numbers here are indicative, not conclusive.
+
+## 21. Opus 5 deep review found critical rerank/rank/chunker bugs; §20's numbers retracted; real re-scoring after fixes
+
+Per the user's explicit instruction ("please review all current
+development and findings with opus 5 and then make any necessary
+improvements or fixes and finish development"), launched a background
+review agent (`claude-opus-5`, high reasoning effort) with instructions
+to read every module deeply, run real measured experiments against the
+actual index/golden set, and not make any code changes itself
+(review-only). It ran ~23 minutes / ~90+ tool calls and returned 12
+major findings backed by reproducible evidence, several of which
+directly invalidate §20's numbers:
+
+- **BUG-1/BUG-2 (rerank.py, 🔴 critical, now fixed)**: the hand-rolled
+  cross-encoder loader never called `model.eval()` after
+  `load_weights()`, so MLX's dropout layers (`hidden_dropout_prob=0.1`,
+  `attention_probs_dropout_prob=0.1`) fired at inference -- measured
+  ~1.8 logit std across identical repeated calls, with rank order
+  flipping run to run. `score()` also never passed `token_type_ids`,
+  defaulting to all-zero BERT segment embeddings (off-distribution for
+  a `[CLS] query [SEP] doc [SEP]` cross-encoder). **This alone means
+  §20's numbers were measured against a nondeterministic scorer and are
+  not reproducible/trustworthy.**
+- **BUG-3 (rank.py, 🔴 critical, now fixed)**: `aggregate_sessions`
+  summed *raw* rerank logits (≈98% negative, median ≈-7) before
+  truncating to `max_sessions` -- this actively penalized sessions with
+  more/better hits (two -5/-6 hits summed to -11, worse than one -9
+  hit). Root-caused to `FakeReranker` in `tests/test_rank.py` returning
+  nonnegative overlap counts, which never exercised the negative-logit
+  regime the bug lived in -- a broader lesson that test fakes must
+  match the *statistical distribution* of what they replace, not just
+  the interface. Fixed by summing `sigmoid(score)` instead of the raw
+  logit.
+- **BUG-4 (chunker.py, 🔴 critical, now fixed)**: `chunk_messages`
+  carried the last `overlap` messages into the next chunk even when the
+  close was triggered by a session gap (not a token/message-count
+  limit) -- measured on the (old, 3,000-chunk) index: 35.9% of chunks
+  had a `start_ts` contaminated by messages from before a multi-year
+  gap, corrupting date filtering and `(chat_id, day)` session grouping.
+  Fixed by gating the overlap carry on whether the close was a genuine
+  gap close.
+- **BUG-5 (mcp_server.py, 🟠, now fixed)**: module-global SQLite
+  connections lacked `check_same_thread=False`, and lazy model-loading
+  globals had no lock, even though the `mcp` SDK dispatches tool calls
+  via a thread pool -- concurrent calls could raise `ProgrammingError`
+  or double-load models. Fixed with `check_same_thread=False` +
+  `threading.Lock` around both lazy init and the inference pipeline
+  itself (MLX has no cross-thread safety guarantee).
+- **BUG-9 (mcp_server.py, 🟡, now fixed)**: `get_conversation(around_ts=
+  ...)` only searched the newest 2000 rows before doing its
+  closest-timestamp sort, so drilling into an old thread in a chat with
+  >2000 messages silently returned unrelated recent messages instead.
+  Fixed to fetch `(ROWID, date)` for the whole chat cheaply, find the
+  closest position, then fetch just that window by id. Added a
+  regression test with a 2,500-message chat confirming an old target
+  message is now found (previously proven to fail against the
+  pre-fix code).
+- **BUG-10 (parse.py, 🟡, now fixed)**: the participant regex's own
+  `re.IGNORECASE` flag defeated its capitalized-name heuristic (matched
+  ordinary lowercase words after "from"/"with" as if they were a
+  person's name); `dateparser`-based date extraction treated a bare
+  occurrence of an ambiguous month/word ("may", "march") as a real date
+  with no corroborating signal, giving false positives like "may i
+  borrow the car". Both fixed; regression tests added for each.
+- **IMPROVEMENT-11 (build.py, 🟡, now fixed)**: int8 calibration only
+  ever embedded the *first* rendered chunk instead of sampling up to
+  the declared `CALIBRATION_SAMPLE_SIZE` (2,000). Fixed to buffer
+  chunks until the sample target (or corpus end) is reached before
+  calibrating. Discovered in the process that `EmbeddingModel.embed()`
+  has no internal batching, so passing ~2,000 texts through in one MLX
+  call exceeds Metal's max single-allocation buffer size on this
+  machine -- fixed by embedding the calibration sample (and any
+  same-batch flush afterward) in `batch_size`/small-batch pieces
+  instead of one giant call.
+- **BUG-6/7/IMPROVEMENT-8/13 (Grogu repo, all 🟠/🟡, now fixed)**: fixed
+  in the Grogu repo, PR #27 (`feature/seaglass-imessage-search`):
+  `grogu_mcp.py` never passed `env=` through to `StdioServerParameters`,
+  silently dropping seaglass's env-var-only config
+  (`SEAGLASS_INDEX_DB`/`SEAGLASS_CHAT_DB`) no matter what a user's
+  `mcp-config.json` specified -- every search would degrade to the SQL
+  LIKE fallback while `imessage status` still falsely reported
+  `"seaglass": true`; `grogu_imessage.py`'s `search_via_seaglass` passed
+  the caller's *message* limit straight through as seaglass's *session*
+  count (`max_sessions`), overfetching sessions on every default-limit
+  call, and `_flatten_seaglass_result` silently dropped a session's
+  `context_messages`, which seaglass's own `recall@final` metric counts
+  as legitimate hits; the SQL LIKE fallback's `date` field returned
+  Apple's raw epoch value (seconds or nanoseconds, ambiguous) verbatim
+  instead of unix seconds, silently inconsistent with seaglass's
+  always-unix-seconds `date` field depending on which backend answered.
+  All fixed, with new/strengthened regression tests, and pushed to PR
+  #27 (91 passed, 1 skipped in Grogu's own suite).
+- **IMPROVEMENT-12 (eval-harness correctness, not yet fixed this
+  pass)**: the reviewer flagged that `generate.py`'s `positive_msg_ids`
+  get expanded by `score.py`'s `_chunks_containing` to 3-5 positive
+  chunks per entry via the ±2-message chunk overlap, inflating measured
+  recall relative to a stricter "just the source chunk" definition;
+  `score_entry` doesn't guard against empty positives; `ghcp_client`'s
+  docstring overstates its own error-handling guarantees. Deferred as
+  lower-priority relative to the correctness bugs above -- noted here
+  for future work, not silently dropped.
+- **Nitpicks (N1-N12)**: mostly deferred as genuinely cosmetic/low-risk
+  given time constraints (e.g. render.py's >26-participant letter
+  rollover, contacts.py's inconsistent fuzzy threshold constant,
+  unused `exifread` dependency, unpinned `mcp` SDK version). Not
+  reflected in this pass's commits; flagged here in case they're worth
+  picking up later.
+
+**Every fix above has a regression test added in the same commit**
+(`tests/test_rank.py`, `tests/test_mlx_integration.py`,
+`tests/test_chunker.py`, `tests/test_mcp_server.py`,
+`tests/test_build.py`, `tests/test_parse.py`, plus Grogu's
+`tests/test_grogu_cli.py`), and each new test was manually verified to
+**fail against the pre-fix code and pass against the fix** -- not just
+added and left unverified. Full seaglass suite: 170 passed (166 unit +
+4 integration). Full Grogu suite: 91 passed, 1 skipped (by design).
+
+### §20's table is retracted; here is the real, reproducible re-run
+
+Rebuilt `data/golden-set-review/index.db` from scratch against the
+fixed chunker (`data/golden-set-review/index.db.bak` keeps the old
+3,000-chunk build for reference) -- the rebuild produced **17,525
+chunks**, not 3,000; the original index used in §20 was evidently a
+partial/truncated build from earlier pipeline testing, not the full
+snapshot. Re-ran `eval/score.py` against this fresh index with every
+fix above applied:
+
+```
+category              n    r@50    r@12   r@fin    gap1    gap2   kill
+exact_string           1    1.00    1.00    0.00    0.00   -1.00   0.00
+media_geo             19    0.63    0.47    0.47   -0.16    0.00   0.00
+person_filtered        5    0.40    0.40    0.20    0.00   -0.20   0.00
+time_filtered          6    0.67    0.50    0.33   -0.17   -0.17   0.17
+topical                1    1.00    1.00    1.00    0.00    0.00   0.00
+--------------------------------------------------------------------------
+OVERALL               32    0.62    0.50    0.41   -0.12   -0.09   0.03
+recall@50 95% Wilson CI: [0.45, 0.77]  n=32
+by nn_band (recall@final): Q1 0.33  Q2 0.38  Q3 0.75  Q4 0.14   <- Q2 is the honest number
+```
+
+**This is the real number, and it's lower than §20's, not higher** --
+the opposite of what the bug fixes alone would predict. The most
+plausible explanation is that this is now a much harder, more
+realistic retrieval problem: the corpus grew from 3,000 to 17,525
+chunks (≈5.8x more distractors for the same 32 golden questions), which
+alone would be expected to reduce recall@50 substantially independent
+of any of the bug fixes. This run is *reproducible* (rerun twice,
+identical numbers both times -- confirming BUG-1/2's determinism fix
+actually holds in practice), which §20's was not.
+
+Reading this against EVALUATION.md §8.3's report shape:
+- **recall@50 = 0.62** [0.45, 0.77] -- still a wide CI at n=32; the
+  fused retrieval stage is finding the right chunk less than two-thirds
+  of the time in the full 17.5k-chunk corpus, which is a real signal
+  that pre-rerank retrieval itself is now the biggest lever, not just
+  the rerank stage as §20 suggested.
+- **gap1 (r@12 - r@50) is still consistently negative** (-0.12
+  overall) -- rerank is still losing some recall between top-50 and
+  top-12, though less severely than §20's -0.16, consistent with the
+  BUG-1/2/3 fixes helping at the margin even though the harder corpus
+  dominates the headline number.
+- **person_filtered (n=5) dropped sharply** (0.40 r@50 vs §20's 0.80)
+  -- worth flagging as the category most likely to need real
+  investigation once the golden set grows, since BUG-10's regex fix
+  should have *helped* this category, not hurt it; the more likely
+  explanation is the much larger corpus surfacing more same-participant
+  distractor chunks, but this deserves scrutiny rather than being
+  waved off.
+- **kill_rate holds at 0.03** -- the pre-rerank filter still essentially
+  never discards the true positive outright, so the recall loss is
+  concentrated in ranking/cutoff, not filtering, same conclusion as §20.
+
+**Honest framing for where this leaves the system**: recall@final=0.41
+at n=32 on the harder (full, ~17.5k-chunk) corpus is a real,
+reproducible starting point -- worse than §20's now-retracted 0.62, but
+trustworthy in a way §20 never was. The single biggest lever going
+forward is almost certainly *pre-rerank retrieval* (recall@50), not
+rerank/aggregation, which flips the priority order §20 implied. This
+should be revisited once the golden set grows toward EVALUATION.md's
+~300-question target -- n=32 with 1-6 samples per category is still
+not enough to draw firm per-category conclusions, only an overall
+directional one.

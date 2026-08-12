@@ -19,3 +19,7 @@ dist/
 *.db-shm
 golden*.jsonl
 candidates_for_review.jsonl
+# Any arbitrary *.jsonl containing real message content -- previously only
+# specifically-named golden/candidates paths were covered, so a
+# custom --golden/--rejected path outside /data/ wasn't protected.
+*.jsonl

@@ -44,6 +44,7 @@ import sqlite3
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
+import numpy as np
 import zstandard
 
 from seaglass.imessage import source
@@ -266,17 +267,27 @@ def _ensure_calibration(
     index_con: sqlite3.Connection,
     embedding_model: EmbeddingModel,
     sample_texts: Sequence[str],
+    *,
+    embed_batch_size: int = 64,
 ) -> float:
     """Compute and persist `meta.int8_absmax` once, from a sample of
     rendered `body_semantic` texts, if not already recorded. Every chunk
     embedded in this build (and every query embedded at search time) must
     quantise against this same value (PLAN.md §6 Phase 3).
+
+    Embeds in `embed_batch_size`-sized pieces rather than one giant call:
+    `EmbeddingModel.embed()` has no internal batching, and calling it
+    with the full ~2000-text calibration sample in one shot can exceed
+    MLX's Metal buffer size limit on a single GPU allocation.
     """
     existing = _get_meta(index_con, "int8_absmax")
     if existing is not None:
         return float(existing)
     sample = list(sample_texts[:CALIBRATION_SAMPLE_SIZE])
-    vectors = embedding_model.embed(sample)
+    all_vectors = []
+    for i in range(0, len(sample), embed_batch_size):
+        all_vectors.append(embedding_model.embed(sample[i : i + embed_batch_size]))
+    vectors = np.concatenate(all_vectors, axis=0) if all_vectors else np.zeros((0, 0))
     absmax = compute_calibration_absmax(vectors)
     _set_meta(index_con, "int8_absmax", repr(absmax))
     _set_meta(index_con, "embed_version", EMBED_VERSION)
@@ -346,9 +357,14 @@ def build_index(
             batch.append(rendered)
 
         if len(batch) >= batch_size:
-            _flush(batch, embedding_model, index_con, compressor)
-            chunks_written += len(batch)
-            batch = []
+            # Loop (not just one `if`): the calibration extend() above can
+            # dump up to CALIBRATION_SAMPLE_SIZE chunks into `batch` at
+            # once, so a single flush() here would embed all of them in
+            # one MLX call and can exceed the GPU's max buffer size.
+            while len(batch) >= batch_size:
+                _flush(batch[:batch_size], embedding_model, index_con, compressor)
+                chunks_written += batch_size
+                batch = batch[batch_size:]
 
         if limit_chunks is not None and chunks_written + len(batch) >= limit_chunks:
             break
@@ -364,6 +380,10 @@ def build_index(
         batch.extend(pending_calibration)
 
     if batch:
+        while len(batch) > batch_size:
+            _flush(batch[:batch_size], embedding_model, index_con, compressor)
+            chunks_written += batch_size
+            batch = batch[batch_size:]
         _flush(batch, embedding_model, index_con, compressor)
         chunks_written += len(batch)
 
