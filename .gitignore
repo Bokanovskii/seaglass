@@ -7,3 +7,15 @@ __pycache__/
 build/
 dist/
 .DS_Store
+
+# Personal data artifacts -- chat.db snapshots, index.db, golden-set
+# candidates/entries. These contain real message content and must never
+# be committed. See development-plans/PLAN.md's own backup note: only
+# attachment_place within index.db is genuinely non-rebuildable; back
+# that up separately and outside of git.
+/data/
+*.db
+*.db-wal
+*.db-shm
+golden*.jsonl
+candidates_for_review.jsonl
