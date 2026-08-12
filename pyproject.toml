@@ -1,0 +1,42 @@
+[project]
+name = "seaglass"
+version = "0.1.0"
+description = "Local semantic + keyword search index over personal iMessage history, exposed as an MCP server."
+requires-python = ">=3.11"
+readme = "README.md"
+license = { text = "MIT" }
+dependencies = [
+    "sqlite-vec",
+    "mlx",
+    "mlx-embeddings",
+    "zstandard",
+    "pyobjc-framework-Contacts",
+    "phonenumbers",
+    "rapidfuzz",
+    "dateparser",
+    "pillow",
+    "exifread",
+    "reverse_geocoder",
+    "pytypedstream",
+    "mcp",
+    "numpy",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-cov",
+]
+
+[project.scripts]
+seaglass = "seaglass.cli:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["seaglass*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -101,7 +101,42 @@ implemented. It does not affect Phase 3 (initial bulk build), which chunks
 whatever is present in one pass regardless of insertion order — only
 *incremental* sync needs the new branch.
 
-## 5. Sequencing decision
+## 6. Second finding: `chat_message_join` lags message insertion during backfill
+
+**Measured directly (2026-08-12), same session as the ROWID/date-inversion
+finding in §4:**
+
+```
+total message rows:              374,333
+associated_message_type = 0:     332,291
+chat_message_join rows:          125,063   (only ~33% of message rows have a join row)
+```
+
+Sampled the unlinked ROWIDs (`message.ROWID NOT IN (SELECT message_id FROM
+chat_message_join)`): they span the **entire** date range, from 2020 through
+messages as recent as 2026-08-09 (three days before this check) — not
+confined to old backfilled history. This means `chat_message_join`
+population is currently lagging `message` insertion broadly, not just for
+historical backfill.
+
+**Why this matters:** `imessage/source.py`'s `iter_messages()` joins through
+`chat_message_join` (correctly — that's the only reliable way to know which
+chat a message belongs to). Right now that means **~67% of message rows are
+invisible to extraction**, including some from days ago, not just years ago.
+
+**This is not a bug in `source.py`.** A message without a `chat_message_join`
+row genuinely isn't attributable to a chat yet, so skipping it is correct
+behavior — and it's self-healing: once local sync catches up and the join
+row appears, a later extraction run (or Phase 7 incremental sync) picks it
+up naturally. No code change needed here.
+
+**It does reinforce the §5 sequencing decision below**, and adds a concrete
+number to it: building the real index today would `omit ~67%` of everything
+currently in `message`, on top of the corpus itself still growing. Treat
+both the total-message-count *and* the `chat_message_join` coverage ratio as
+signals to watch for backfill settling (see updated §7).
+
+## 7. Sequencing decision (supersedes old §5 numbering)
 
 Given the backfill is substantial and ongoing, and the user was unavailable
 to confirm sequencing directly, the reasonable default (stated here so it's
@@ -118,4 +153,6 @@ correctable) is:
   `ATTACH` against the live db, a small `attributedBody` decode sample).
 - A simple backfill-settled signal to watch for: total message count and
   the adjacent-ROWID inversion rate both flattening across repeated checks
-  a day or two apart.
+  a day or two apart, **and** the `chat_message_join` coverage ratio
+  (`count(distinct message_id) from chat_message_join` / `count(*) from
+  message` restricted to `associated_message_type = 0`) approaching ~100%.
