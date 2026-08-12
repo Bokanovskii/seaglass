@@ -485,3 +485,84 @@ scripting, but costs **~4.4s of fixed per-invocation overhead** even for
 a one-word answer -- at ~300 candidate chunks this means batching many
 chunks into few prompts (not one call per chunk) is essential to keep
 golden-set generation from taking tens of minutes in overhead alone.
+
+## 15. Phase 3.5 complete: `eval/generate.py`, `eval/review.py`, `eval/score.py` — the full golden-set + scoring loop now runs end to end
+
+**`eval/ghcp_client.py`** — the sole LLM interface for this project, per
+the user's decision. Wraps `copilot -p "<prompt>" -s --no-color` (no
+`--allow-all-tools`; generation-only prompts get no shell/file/network
+access). `call_ghcp_json` tolerates conversational wrapper text/code
+fences around a JSON array by regex-extracting the array before
+parsing, and returns `None` (never raises) on a malformed batch, so one
+bad batch can't abort a 300-chunk generation run.
+
+**`eval/generate.py`** implements EVALUATION.md §4: stratified selection
+over `eval_candidate` (excludes the bottom nn_distance band per §3.3,
+quotas 30/40/30 across the remaining three bands, highest composite
+score first within each band), batched question generation (10 chunks
+per ghcp call, given the ~4.4s fixed per-call overhead measured in §14),
+then the §4.2 automatic filters: vocabulary-leakage auto-reject (>40%
+content-word overlap between question and source, stopwords excluded),
+and a real-retrieval ambiguity/trivially-hard pass (runs every surviving
+question through the actual `retrieve()` pipeline, records whether the
+source chunk survived to top-200, and flags -- never auto-rejects --
+`sparse_rank1_is_source` per the explicit warning not to condition the
+eval set on the sparse-only ablation's outcome). Output:
+`candidates_for_review.jsonl`.
+
+**`eval/review.py`** — the minimal human review CLI (§4.3):
+accept/edit/reject/multi-positive/skip, driven by any callable
+`interactive_input` (real `input()` by default, a scripted fake in
+tests). Writes accepted/edited entries to `golden.jsonl` in the exact
+§4.4 shape (internal `_*` diagnostic fields stripped), rejects to a
+`.rejected.jsonl` sidecar for auditability rather than silent deletion,
+and skips already-decided entries on rerun so a review session can be
+split across sittings.
+
+**`eval/score.py`** implements §7 scoring plus §6's statistics: runs
+every golden entry through the *actual* production pipeline
+(parse → pre-filter → RRF → rerank → aggregate → expand), computing
+recall@50 (post-fusion), recall@12 (post-rerank), and recall@final
+(post-aggregation/expansion -- context-expansion chunks count as hits,
+per §7's explicit note that being in the context *is* the thing being
+measured), plus the two diagnostic gaps and the filter-kill-rate
+diagnostic (§8.3: distinguishes "parser wrongly excluded the positive"
+from "retrieval ranked it too low", since they demand opposite fixes).
+Reports **Wilson intervals** (not Wald -- Wald degenerates to zero width
+at p=1.0, per §6.2) and exposes `mcnemar_chi2` for paired A/B config
+comparisons (§6.1), plus recall@final broken out by nn_distance band
+(Q2 -- the "crowded neighbourhood" band -- is called out as "the honest
+number" per §3.3, since the top band flatters the system on isolated,
+distractor-free conversations).
+
+**Validated against real data, the entire loop.** Built a 500-chunk real
+index, ran `harvest.py` (340 candidates scored), `generate.py` with
+`--target 6` (real `copilot -p` calls, 2 batches of 3, ~9-12s each,
+producing 4 genuinely vague, non-leaking recall-style questions about
+real past conversations), `review.py` interactively (accept/reject/skip
+all worked correctly via piped stdin), and `score.py` against the 2
+accepted entries (both scored perfect recall@50/@12/@final -- expected
+at n=2 against their own source chat, not a meaningful number, but
+confirms the full pipeline plumbing is correct end to end).
+
+**Tests:** `test_generate.py` (7), `test_review.py` (7), `test_score.py`
+(10) -- all passing, all network/MLX-free (a scripted fake stdin for
+review, a mocked `call_ghcp_json` for generate, the same deterministic
+word-overlap `FakeReranker` pattern from `test_rank.py` for score). Full
+suite: 142 passed (2 integration tests deselected by default).
+
+**Not yet done:** the golden set itself hasn't actually been built at
+scale (§4's ~300-candidate / ~200-accepted target) -- that's a ~30-45
+minute human sitting per §4.3's estimate, appropriately left for the
+user to actually do rather than simulated. `eval/harvest.py`'s `nn`
+stage loads the *entire* `chunks_vec` table into a dense NumPy array for
+the batched cosine-distance pass (§3.2); this is fine at the corpus
+sizes tested so far but should be re-measured for memory/time headroom
+once the real corpus (currently still mid-iCloud-backfill) reaches its
+final size. §5 (validating the eval set itself: controls, reviewer
+self-consistency, coverage audit) and §8/§9 (the ablation matrix and
+parameter sweeps) are still unimplemented -- they're straightforward
+compositions of `score.py`'s existing per-config recall numbers plus
+the "independently switchable" retrieval-stage config flags PLAN.md's
+Phase 4 calls for (not yet built as explicit flags; currently swept by
+calling the pipeline functions directly with different arguments).
