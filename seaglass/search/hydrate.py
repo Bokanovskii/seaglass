@@ -1,0 +1,129 @@
+"""`search/hydrate.py` — PLAN.md §6 Phase 4, step 7: hydrate the final
+~8 surviving sessions (and only those) with raw messages for display and
+citation. Everything upstream of this module works with chunk ids and
+compressed `body_semantic` blobs; this is the one place that goes back to
+`chat.db` for the original per-message rows.
+
+⚠️ Always join through `chunk_message`, never a bare `message.ROWID`
+range -- `message.ROWID` is global and chronological *across all chats*,
+so a naive range spans other conversations (PLAN.md §6 step 7).
+"""
+
+from __future__ import annotations
+
+import dataclasses
+from typing import List, Optional, Sequence
+
+from seaglass.imessage.attributedbody import decode_attributed_body
+from seaglass.imessage.contacts import ContactIndex
+from seaglass.imessage.source import apple_to_unix
+from seaglass.search.rank import Session
+
+
+
+@dataclasses.dataclass(frozen=True)
+class HydratedMessage:
+    message_id: int
+    ts: float
+    is_from_me: bool
+    sender: Optional[str]  # resolved contact display name, else raw handle, else None (is_from_me)
+    text: Optional[str]
+    has_attachment: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class HydratedSession:
+    chat_id: int
+    day: str
+    score: float
+    hit_messages: List[HydratedMessage]  # from chunks that actually scored
+    context_messages: List[HydratedMessage]  # ±2 expansion, zero ranking weight
+
+
+def _resolve_sender(is_from_me: int, handle: Optional[str], contact_index: Optional[ContactIndex]) -> Optional[str]:
+    if is_from_me:
+        return None  # the client already knows who "me" is; no name needed
+    if handle is None:
+        return None
+    if contact_index is not None:
+        name = contact_index.resolve_handle(handle)
+        if name is not None:
+            return name
+    return handle
+
+
+def hydrate_sessions(
+    index_con,
+    chat_con,
+    sessions: Sequence[Session],
+    contact_index: Optional[ContactIndex] = None,
+) -> List[HydratedSession]:
+    """Step 7: for each session's hit and context chunks, pull raw
+    messages via `chunk_message`, resolve sender display names, and
+    return them split into `hit_messages` (chunks that scored) vs
+    `context_messages` (expansion only) -- both are needed for display,
+    only the first group should ever be described as "why this matched".
+
+    `index_con` provides the `chunk_message` join table; `chat_con` (a
+    live/snapshot `chat.db` connection via `imessage.source.connect_readonly`)
+    provides the actual message text/attachments. Both are required --
+    hydration is the one step that needs both databases at once.
+    """
+    hydrated: List[HydratedSession] = []
+    for session in sessions:
+        hit_messages = _hydrate_chunks(index_con, chat_con, session.hit_chunk_ids, contact_index)
+        context_messages = _hydrate_chunks(index_con, chat_con, session.context_chunk_ids, contact_index)
+        hydrated.append(
+            HydratedSession(
+                chat_id=session.chat_id,
+                day=session.day,
+                score=session.score,
+                hit_messages=hit_messages,
+                context_messages=context_messages,
+            )
+        )
+    return hydrated
+
+
+def _hydrate_chunks(
+    index_con, chat_con, chunk_ids: Sequence[int], contact_index: Optional[ContactIndex]
+) -> List[HydratedMessage]:
+    if not chunk_ids:
+        return []
+    placeholders = ",".join("?" for _ in chunk_ids)
+    msg_ids = [
+        row[0]
+        for row in index_con.execute(
+            f"SELECT msg_id FROM chunk_message WHERE chunk_id IN ({placeholders}) ORDER BY msg_id",
+            list(chunk_ids),
+        ).fetchall()
+    ]
+    if not msg_ids:
+        return []
+    msg_placeholders = ",".join("?" for _ in msg_ids)
+    query = f"""
+        SELECT m.ROWID, m.text, m.attributedBody, m.date, m.is_from_me, h.id,
+               EXISTS (SELECT 1 FROM im.message_attachment_join maj WHERE maj.message_id = m.ROWID)
+        FROM im.message m
+        LEFT JOIN im.handle h ON h.ROWID = m.handle_id
+        WHERE m.ROWID IN ({msg_placeholders})
+        ORDER BY m.date ASC
+    """
+    messages: List[HydratedMessage] = []
+    for rowid, text, attributed_body, date, is_from_me, handle, has_attachment in chat_con.execute(
+        query, msg_ids
+    ):
+        if not text and attributed_body:
+            text = decode_attributed_body(attributed_body)
+        sender = _resolve_sender(is_from_me, handle, contact_index)
+        messages.append(
+            HydratedMessage(
+                message_id=rowid,
+                ts=apple_to_unix(date),
+                is_from_me=bool(is_from_me),
+                sender=sender,
+                text=text,
+                has_attachment=bool(has_attachment),
+            )
+        )
+    return messages

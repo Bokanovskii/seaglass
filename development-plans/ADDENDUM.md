@@ -366,3 +366,82 @@ using a new shared `tests/conftest.py` with a reusable
 `FakeEmbeddingModel` and a parameterized multi-chat synthetic chat.db
 builder) all pass. Full suite: 94 passed (2 integration tests deselected
 by default).
+
+## 13. Phase 4b + Phase 5 implemented: rerank, aggregate, expand, hydrate, format — the full pipeline now runs end to end
+
+**`search/rank.py`** implements PLAN.md §6 Phase 4 steps 5-6: batched
+cross-encoder rerank of the fused top-K (via `search/rerank.py`'s custom
+loader, §10) down to the top 12, then aggregation into `(chat_id, day)`
+sessions summing rerank scores (never RRF scores, which are superseded),
+capped at 8 sessions, then ±2 time-adjacent context-chunk expansion per
+session (zero ranking weight, display-only).
+
+**Judgment call, not specified in PLAN.md:** "day" for `(chat_id, day)`
+grouping uses the local system timezone via `datetime.fromtimestamp`, not
+UTC. `chat.db` timestamps carry no stored timezone; local wall-clock day
+is the closest match to how a person actually remembers "that day we
+talked about X". Recorded here as a deviation-by-necessity, not an
+oversight.
+
+**Efficient neighbor expansion, exploiting `build.py`'s determinism:**
+because `build_index` assigns chunk ids in `(chat_id ascending,
+chronological)` order (§11), same-chat chunks are id-contiguous.
+`expand_sessions` still verifies this defensively per session (one
+extra `chat_id`-scoped query) rather than doing raw id±1 arithmetic
+blindly across chats.
+
+**`search/hydrate.py`** implements step 7: pulls raw messages back via
+`chunk_message` (never a bare `message.ROWID` range) for a session's hit
+and context chunks separately, resolves `is_from_me` to `None` (client
+already knows "me") and other senders through `ContactIndex` with a
+fallback to the raw handle string.
+
+**`search/format.py`** implements Phase 5: shapes hydrated sessions into
+a JSON-able payload with `message_id` citations (never `message://`
+links -- that's Mail.app's scheme), a `confidence`/`n_results` signal
+(`"none"`/`"low"`/`"high"` by session count), `max_sessions` truncation,
+and an opt-in `redact` flag stripping phone numbers/emails from every
+message body and sender field via regex.
+
+**`seaglass/cli.py`'s `search` subcommand now runs the full pipeline** by
+default (pre-filter → RRF → rerank → aggregate → expand → hydrate →
+format, printed as JSON), with `--no-rerank` to drop back to the bare
+Phase 4a baseline for comparison, and `--redact` to exercise the
+redaction path.
+
+**Validated against real data, end to end, full pipeline.** Built an
+800-chunk real index from a fresh live-`chat.db` snapshot and ran
+`seaglass search ... "any plans for dinner" --chat-db ...`. Real contact
+names resolved correctly (e.g. "[REDACTED_NAME]", "[REDACTED_NAME]");
+sessions grouped sensibly by day within a real group chat; one session's
+top hit was literally "[REDACTED_MESSAGE_TEXT]
+to join" -- a strong true positive for the query. Cold end-to-end latency
+(embedding model + reranker model load, no daemon, per the user's
+decision to measure this before building one) was **~4.3s** for an
+800-chunk index -- higher than Phase 4a's dense+sparse-only ~1.2s,
+confirming the reranker's model-load cost is the dominant new latency
+term, not its ~22ms-warm scoring cost (§10). This is the number to watch
+as the index grows to full size and to weigh against PLAN.md's
+"no-daemon-yet, measure and revisit" decision.
+
+**Small known follow-up, not fixed:** hydrated `HydratedMessage.text`
+comes straight from raw `chat.db` `message.text`/`attributedBody` (the
+display copy), not through `render.py`'s renderings, so it still contains
+the raw `U+FFFC` object-replacement marker Apple embeds at attachment
+positions (§11 fixed this only in the *indexed* body_semantic/lexical
+text, not in this separate raw-display path). Cosmetic only -- worth
+stripping in `format.py` or `hydrate.py` before this ships past the
+throwaway CLI, not urgent enough to block on now.
+
+**Tests:** `test_rank.py` (7 tests, incl. a deterministic word-overlap
+fake reranker so no MLX load is needed in unit tests), `test_hydrate.py`
+(3 tests), `test_format.py` (5 tests) -- all passing. Full suite: 109
+passed (2 integration tests deselected by default).
+
+**Not yet done:** `index/exif.py` (EXIF GPS + reverse geocoding) still
+doesn't exist -- media placeholders in both the indexed lexical body and
+the raw hydrated display remain bare. Phase 3.5 (golden-set generation via
+`eval/harvest.py`, using GHCP per the user's decision) has also not been
+started; it's the next natural milestone, since real ablation/quality
+numbers (recall@50/@12/@final per EVALUATION.md §7) require it and can't
+be estimated from spot-checking real queries alone.
