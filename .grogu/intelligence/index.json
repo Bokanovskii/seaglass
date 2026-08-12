@@ -1,0 +1,9 @@
+{
+  "derivation": "grogu-knowledge-graph-v2",
+  "edges": [],
+  "kind": "grogu.knowledge_graph",
+  "nodes": {},
+  "repository_id": "c133c6fb877d56bc9142",
+  "schema_version": 2,
+  "updated_at": "2026-08-12T19:48:43+00:00"
+}
