@@ -309,8 +309,8 @@
 
     <section id="retrieval">
       <h2><span class="num">05</span> Hybrid retrieval — dense + sparse, RRF fused</h2>
-      <p><code>seaglass/search/retrieve.py</code> — Phase 4a of the build: a pre-filter followed by
-      two independent candidate-generation paths, fused by Reciprocal Rank Fusion (RRF).</p>
+      <p><code>seaglass/search/retrieve.py</code> implements the baseline retriever: a pre-filter
+      followed by two independent candidate-generation paths, fused by Reciprocal Rank Fusion (RRF).</p>
       <table>
         <tr><th>Stage</th><th>Mechanism</th><th>Top-K</th></tr>
         <tr><td>Pre-filter</td><td>SQL predicate over <code>chunks</code> (dates, media, participant chat_ids) — builds a candidate <code>chunk_id</code> set, or <code>None</code> meaning "unconstrained"</td><td>—</td></tr>
@@ -319,7 +319,7 @@
         <tr><td>Fuse</td><td>Reciprocal Rank Fusion, <code>k=60</code></td><td>50 (<code>FUSED_TOP_K</code>)</td></tr>
       </table>
       <div class="callout warn">
-        <strong>Gotcha fixed by review:</strong> FTS5's <code>bm25()</code> returns <em>negative</em>
+        <strong>Caught by review:</strong> FTS5's <code>bm25()</code> returns <em>negative</em>
         values — best matches sort <strong>ascending</strong>, the opposite of dense-search
         convention. Any code touching sparse scores directly has to remember this.
       </div>
@@ -332,19 +332,19 @@
 
     <section id="rerank-aggregate">
       <h2><span class="num">06</span> Rerank + session aggregation</h2>
-      <p><code>seaglass/search/rank.py</code> + <code>rerank.py</code> — Phase 4b, deliberately kept
+      <p><code>seaglass/search/rank.py</code> + <code>rerank.py</code> — deliberately kept
       separate from retrieval so the baseline (no rerank) and full pipeline could be evaluated
       independently against the golden set.</p>
       <ol>
         <li><strong>Cross-encoder rerank</strong> (<code>ms-marco-MiniLM-L-12-v2</code>) scores each of
         the 50 fused candidates against the query text directly (not just embedding similarity),
         cut to top 12 (<code>RERANK_TOP_K</code>).
-          <span class="badge fixed">BUG fixed: model.eval() was missing → nondeterministic scores across runs</span>
+          <span class="badge fixed">model.eval() was missing → nondeterministic scores across runs</span>
         </li>
         <li><strong>Session aggregation</strong> groups the top-12 reranked chunks by
         <code>(chat_id, local calendar day)</code> — approximating "that day we talked about X" —
         into up to 8 sessions (<code>MAX_SESSIONS</code>).
-          <span class="badge fixed">BUG fixed: raw cross-encoder logits were summed across a session instead of properly aggregated</span>
+          <span class="badge fixed">raw cross-encoder logits were summed across a session instead of properly aggregated</span>
         </li>
         <li><strong>Expansion</strong> pads each session with ±2 time-adjacent chunks
         (<code>EXPANSION_RADIUS</code>) for conversational context, even if those chunks weren't
@@ -371,7 +371,7 @@
         <tr><td><code>index_status</code></td><td>Chunk/vector counts, configured DB paths, hydration/contacts availability — lets a caller sanity-check the index before trusting search results</td><td>—</td></tr>
       </table>
       <div class="callout fix">
-        <strong>Fixed by review:</strong> <code>get_conversation</code>'s <code>around_ts</code>
+        <strong>Caught by review:</strong> <code>get_conversation</code>'s <code>around_ts</code>
         path previously only ever searched the newest 2000 rows of a chat — drilling into an old
         thread in a long chat silently returned unrelated recent messages instead. Rewritten to fetch
         cheap <code>(ROWID, date)</code> pairs for the whole chat, locate the closest position in
@@ -386,7 +386,7 @@
       <code>~/.copilot/mcp-config.json</code>. If seaglass is available,
       <code>search_via_seaglass</code> is preferred over the legacy SQL <code>LIKE</code> fallback.</p>
       <div class="callout fix">
-        <strong>Critical fix:</strong> <code>StdioServerParameters(...)</code> was silently dropping
+        <strong>Critical issue caught:</strong> <code>StdioServerParameters(...)</code> was silently dropping
         the <code>env</code> block from <code>mcp-config.json</code> — meaning <code>SEAGLASS_INDEX_DB</code>
         / <code>SEAGLASS_CHAT_DB</code> were never actually passed through, no matter what the config
         said. This broke the entire integration invisibly (it never errored — it just never worked)
@@ -540,7 +540,7 @@ const PIPELINE_STAGES = [
     detail: {
       title: "Reciprocal Rank Fusion",
       file: "seaglass/search/retrieve.py",
-      body: "Combines dense + sparse rankings into one fused list of the top 50 (FUSED_TOP_K) chunk_ids via RRF with k=60. This is 'Phase 4a' — the baseline retriever, deliberately evaluated on its own before rerank/aggregation (Phase 4b) were added."
+      body: "Combines dense + sparse rankings into one fused list of the top 50 (FUSED_TOP_K) chunk_ids via RRF with k=60. This is the baseline retriever, deliberately evaluated on its own before rerank/aggregation were added."
     }
   },
   {
@@ -548,7 +548,7 @@ const PIPELINE_STAGES = [
     detail: {
       title: "rerank_candidates(...)",
       file: "seaglass/search/rank.py + rerank.py",
-      body: "ms-marco-MiniLM-L-12-v2 cross-encoder scores each of the 50 fused candidates directly against the query, cut to top 12. Fixed bug: model.eval() was missing, causing nondeterministic scores across runs (dropout active at inference time)."
+      body: "ms-marco-MiniLM-L-12-v2 cross-encoder scores each of the 50 fused candidates directly against the query, cut to top 12. Caught by review: model.eval() was missing, causing nondeterministic scores across runs (dropout active at inference time)."
     }
   },
   {
@@ -556,7 +556,7 @@ const PIPELINE_STAGES = [
     detail: {
       title: "aggregate_sessions(...) + expand_sessions(...)",
       file: "seaglass/search/rank.py",
-      body: "Groups top-12 reranked chunks by (chat_id, local calendar day) into up to 8 sessions, then pads each with ±2 time-adjacent chunks for context. Fixed bug: raw cross-encoder logits were being summed across a session instead of properly aggregated."
+      body: "Groups top-12 reranked chunks by (chat_id, local calendar day) into up to 8 sessions, then pads each with ±2 time-adjacent chunks for context. Caught by review: raw cross-encoder logits were being summed across a session instead of properly aggregated."
     }
   }
 ];
