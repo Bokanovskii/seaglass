@@ -6,6 +6,7 @@ fake input function instead of real stdin.
 from __future__ import annotations
 
 import json
+import sqlite3
 
 from seaglass.eval.review import _load_jsonl, review
 
@@ -150,3 +151,45 @@ class TestReview:
         golden = _load_jsonl(golden_path)
         assert len(golden) == 1
         assert golden[0]["id"] == "ev-2"
+
+    def test_review_accepts_chat_con_and_still_decides_correctly(self, tmp_path, capsys):
+        # A fake chat.db, attached under the "im" alias review.py expects
+        # (matching seaglass.imessage.source.connect_readonly's real
+        # ATTACH DATABASE ... AS im), so review() can print real message
+        # text instead of bare integer ids for a human to actually verify.
+        chat_con = sqlite3.connect(":memory:")
+        chat_con.execute("ATTACH DATABASE ':memory:' AS im")
+        chat_con.execute(
+            "CREATE TABLE im.message (ROWID INTEGER PRIMARY KEY, text TEXT, "
+            "attributedBody BLOB, date INTEGER, is_from_me INTEGER, handle_id INTEGER)"
+        )
+        chat_con.execute("CREATE TABLE im.handle (ROWID INTEGER PRIMARY KEY, id TEXT)")
+        chat_con.execute("INSERT INTO im.handle VALUES (1, '+15551234567')")
+        chat_con.execute(
+            "INSERT INTO im.message VALUES (1, 'hey are we still on for dinner', NULL, 0, 0, 1)"
+        )
+        chat_con.execute(
+            "INSERT INTO im.message VALUES (2, 'yeah see you at 7', NULL, 0, 1, NULL)"
+        )
+        chat_con.commit()
+
+        input_path = tmp_path / "candidates.jsonl"
+        _write_jsonl(input_path, [_draft_entry("ev-1")])
+        golden_path = tmp_path / "golden.jsonl"
+        rejected_path = tmp_path / "rejected.jsonl"
+
+        review(
+            input_path, golden_path, rejected_path,
+            already_decided_ids=set(),
+            interactive_input=_ScriptedInput(["a"]),
+            chat_con=chat_con,
+        )
+
+        golden = _load_jsonl(golden_path)
+        assert len(golden) == 1
+        assert golden[0]["id"] == "ev-1"
+
+        printed = capsys.readouterr().out
+        assert "hey are we still on for dinner" in printed
+        assert "yeah see you at 7" in printed
+

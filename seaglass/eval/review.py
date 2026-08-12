@@ -26,7 +26,10 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Dict, List, Set
+from typing import Dict, List, Optional, Set
+
+from seaglass.imessage.attributedbody import decode_attributed_body
+from seaglass.imessage.source import apple_to_unix, connect_readonly
 
 
 def _load_jsonl(path: Path) -> List[dict]:
@@ -50,7 +53,37 @@ def _strip_internal_fields(entry: dict) -> dict:
     return {k: v for k, v in entry.items() if not k.startswith("_")}
 
 
-def _print_entry(entry: dict, index: int, total: int) -> None:
+def _fetch_messages(chat_con, msg_ids: List[int]) -> Dict[int, dict]:
+    """Look up raw message text/sender/date for a flat list of message
+    ROWIDs, straight against `message`/`handle` -- no chunk join needed
+    since these ids are already resolved (unlike search/hydrate.py, which
+    goes chunk -> chunk_message -> message for live search results).
+    """
+    if not msg_ids:
+        return {}
+    placeholders = ",".join("?" for _ in msg_ids)
+    rows = chat_con.execute(
+        f"""
+        SELECT m.ROWID, m.text, m.attributedBody, m.date, m.is_from_me, h.id
+        FROM im.message m
+        LEFT JOIN im.handle h ON h.ROWID = m.handle_id
+        WHERE m.ROWID IN ({placeholders})
+        """,
+        msg_ids,
+    ).fetchall()
+    out: Dict[int, dict] = {}
+    for rowid, text, attributed_body, date, is_from_me, handle in rows:
+        if not text and attributed_body:
+            text = decode_attributed_body(attributed_body)
+        out[rowid] = {
+            "text": text or "[no text -- likely an attachment/reaction]",
+            "ts": apple_to_unix(date),
+            "sender": "me" if is_from_me else (handle or "?"),
+        }
+    return out
+
+
+def _print_entry(entry: dict, index: int, total: int, chat_con=None) -> None:
     print(f"\n[{index}/{total}] {entry['id']}  category={entry['category']}  nn_distance={entry.get('nn_distance'):.3f}")
     print(f"  query: {entry['query']}")
     flags = []
@@ -62,7 +95,20 @@ def _print_entry(entry: dict, index: int, total: int) -> None:
         flags.append(f"vocab overlap: {entry['_vocab_overlap_pct']:.0%}")
     if flags:
         print("  flags: " + "; ".join(flags))
-    print(f"  positive_msg_ids: {entry.get('positive_msg_ids')}")
+    msg_ids = entry.get("positive_msg_ids") or []
+    print(f"  positive_msg_ids: {msg_ids}")
+    if chat_con is None:
+        print("  (pass --chat-db to also print the actual message text here)")
+        return
+    texts = _fetch_messages(chat_con, msg_ids)
+    print("  --- conversation (verify this actually answers the query) ---")
+    for msg_id in msg_ids:
+        info = texts.get(msg_id)
+        if info is None:
+            print(f"    [{msg_id}] <not found in chat.db>")
+            continue
+        print(f"    [{msg_id}] {info['sender']}: {info['text']}")
+    print("  --- end conversation ---")
 
 
 def review(
@@ -72,6 +118,7 @@ def review(
     *,
     already_decided_ids: Set[str],
     interactive_input=input,
+    chat_con=None,
 ) -> None:
     entries = _load_jsonl(input_path)
     pending = [e for e in entries if e["id"] not in already_decided_ids]
@@ -80,7 +127,7 @@ def review(
         return
 
     for i, entry in enumerate(pending, start=1):
-        _print_entry(entry, i, len(pending))
+        _print_entry(entry, i, len(pending), chat_con=chat_con)
         action = interactive_input("  [a]ccept / [e]dit / [r]eject / [m]ulti-positive / [s]kip: ").strip().lower()
 
         if action == "s" or action == "":
@@ -114,13 +161,30 @@ def main(argv=None) -> int:
     parser.add_argument("input", help="candidates_for_review.jsonl, from eval/generate.py")
     parser.add_argument("--golden", default="golden.jsonl", help="output golden set path (appended to)")
     parser.add_argument("--rejected", default="golden.rejected.jsonl", help="rejected entries sidecar (appended to)")
+    parser.add_argument(
+        "--chat-db",
+        help="chat.db snapshot -- if given, prints the actual message text for each "
+        "positive_msg_id so you can verify the query really is answered by them, "
+        "instead of reviewing bare integer ids blind",
+    )
     args = parser.parse_args(argv)
 
     golden_path = Path(args.golden)
     rejected_path = Path(args.rejected)
     already_decided = {e["id"] for e in _load_jsonl(golden_path)} | {e["id"] for e in _load_jsonl(rejected_path)}
 
-    review(Path(args.input), golden_path, rejected_path, already_decided_ids=already_decided)
+    chat_con = connect_readonly(Path(args.chat_db)) if args.chat_db else None
+    try:
+        review(
+            Path(args.input),
+            golden_path,
+            rejected_path,
+            already_decided_ids=already_decided,
+            chat_con=chat_con,
+        )
+    finally:
+        if chat_con is not None:
+            chat_con.close()
     return 0
 
 
