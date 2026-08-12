@@ -566,3 +566,98 @@ compositions of `score.py`'s existing per-config recall numbers plus
 the "independently switchable" retrieval-stage config flags PLAN.md's
 Phase 4 calls for (not yet built as explicit flags; currently swept by
 calling the pipeline functions directly with different arguments).
+
+## 16. Phase 6: `seaglass/mcp_server.py` — the production interface, single-process (daemon deferred)
+
+**The main deviation from PLAN.md §6 Phase 6, and the reason it's worth
+calling out on its own**: PLAN.md specifies a daemon (`imsearchd`) behind
+a Unix socket plus a tiny per-session shim, so that models/page-cache
+stay warm *across* concurrent ghcp sessions. Per the user's earlier
+explicit decision ("we probably don't need the daemon/shim to start...
+eat the startup latency cost at first and see truly how much latency
+that is"), this phase ships as a **single Python process, no daemon, no
+shim** -- `seaglass/mcp_server.py` speaks MCP directly over stdio and is
+what ghcp spawns.
+
+This gets a meaningful fraction of the daemon's benefit for free and
+without the extra moving part: an MCP server process is itself
+long-lived for an entire client session, so `EmbeddingModel` and
+`CrossEncoderReranker` are loaded lazily on first tool call and then
+held warm in module-level globals for every subsequent call in that
+session -- the "cold MLX load on every call" failure mode is already
+avoided. What's genuinely given up versus the daemon design: warm-model
+sharing *across* concurrent ghcp sessions (each spawns its own process
+and pays its own model-load cost once), the shared/hot SQLite page
+cache, and the daemon's serialised-GPU-work guarantee under concurrent
+load. These are precisely the "how much does this actually cost"
+questions the user asked to measure empirically before building the
+extra infrastructure -- if real usage shows concurrent-session cold
+starts are a recurring pain, that's the trigger to revisit the daemon.
+
+**Tools implemented**, matching PLAN.md's table minus `sync_index`
+(there is no `index/sync.py` yet -- Phase 7 incremental sync is
+unbuilt, so re-indexing via `seaglass build` remains the only update
+path, which is exactly what the user already agreed to accept given the
+in-progress iCloud backfill):
+- `search_messages(query, max_sessions=8, redact=False)` -- runs the
+  full pipeline (parse -> pre-filter -> RRF -> rerank -> aggregate ->
+  expand -> hydrate -> format). Degrades gracefully to un-hydrated chunk
+  previews if `SEAGLASS_CHAT_DB` isn't configured, rather than failing
+  the call.
+- `get_conversation(chat_id, around_ts?, limit?)` -- follow-up
+  drill-down into a specific chat. Deliberately does the `around_ts`
+  proximity sort/filter in **Python**, in already-`apple_to_unix`-
+  converted unix seconds, rather than trying to invert the seconds-vs-
+  nanoseconds ambiguity back into a raw SQL `date` predicate (that
+  ambiguity is `apple_to_unix`'s own documented caveat, from Phase 1;
+  inverting it in SQL would silently misorder rows once the corpus
+  spans both eras).
+- `index_status()` -- chunk/vector counts, most recent chunk's
+  `end_ts`, and whether hydration/contacts are actually available, so
+  a caller (model or human) can sanity-check the index before trusting
+  a search.
+
+**Configuration is by environment variable** (`SEAGLASS_INDEX_DB`
+required, `SEAGLASS_CHAT_DB` optional) since there's no daemon config
+file / launchd plist in this design yet -- these get set in ghcp's own
+MCP server config for seaglass, not baked into the code.
+
+**Tool docstrings are the tool descriptions** (the `mcp` SDK's
+`@server.tool()` uses the function's docstring as the tool description
+sent to the client model) -- written per PLAN.md's explicit warning that
+this text is "effectively the system prompt for this capability": states
+plainly what it's good at (topical recall), bad at (exhaustive
+enumeration, counting), and that `person`/participant matching is not
+the same as text-mention matching.
+
+**Validated against real data**: built a 500-chunk real index from a
+`chat.db` snapshot, called `index_status`, `search_messages("any plans
+for dinner")`, and `get_conversation` on the resulting top hit's
+`chat_id` directly through the registered tool functions (not just the
+underlying pipeline) -- all three returned correct, real results.
+`search_messages` end-to-end latency was ~2.9s cold (model loads
+included), consistent with the ~4.3s figure from §13's CLI-level
+measurement of the same reranking pipeline.
+
+**Tests**: `tests/test_mcp_server.py` (8 tests) -- synthetic chat.db +
+index.db via the same `conftest.py` fixtures used everywhere else,
+monkeypatching the module's lazy `_get_*` getters to fakes so no
+test needs MLX or network. Covers: successful hydrated search, the
+zero-fused-results branch, degrading gracefully without a configured
+chat.db, `get_conversation`'s ordering and `around_ts` proximity
+behaviour, its required-chat.db error, and both branches of
+`index_status`. Full suite: **150 passed** (2 integration tests
+deselected by default).
+
+**Package changes**: added a `seaglass-mcp` console-script entry point
+(`pyproject.toml`) pointing at `seaglass.mcp_server:main`, alongside the
+existing `seaglass` CLI entry point. `mcp` was already a declared
+dependency from Phase 0's environment probe.
+
+**Not yet done, left for a deliberate follow-up**: no launchd plist (the
+daemon design's lifecycle mechanism) exists because there's no daemon to
+manage yet; no version-handshake logic (also a daemon-only concern per
+PLAN.md item 4); Grogu's own MCP client config still needs to be pointed
+at `seaglass-mcp` with the right environment variables set -- that's an
+action in Grogu's repo/config, not this one, and hasn't been done as
+part of this session.
