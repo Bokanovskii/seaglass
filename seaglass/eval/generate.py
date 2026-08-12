@@ -50,13 +50,14 @@ _STOPWORDS = {
     "it", "was", "our", "their", "them", "he", "she", "his", "her", "me",
 }
 
-_PROMPT_TEMPLATE = """You will be given {n} numbered text snippets, each from a private group-chat conversation. For EACH snippet, write ONE vague question that a person might ask months later trying to recall that specific conversation.
+_PROMPT_TEMPLATE = """You will be given {n} numbered text snippets, each from a private group-chat conversation. For EACH snippet, write ONE terse search query that a person might type months later trying to recall that specific conversation.
 
-Rules for every question:
-- Phrase it the way someone actually remembers something: vague, partial, uncertain.
+Rules for every query:
+- Phrase it the way someone actually types into a search box: terse, a fragment or a few keywords, NOT a full grammatical question. Do NOT write complete sentences like "what was" or "wasn't there something about" -- drop the question words and helper verbs entirely (e.g. "dinner plans with sam" not "what were the dinner plans with sam", "that thing about the flight" not "wasn't there something about a flight").
+- Keep it vague, partial, uncertain -- like a fuzzy memory, not a precise recall of the snippet's content.
 - Do NOT reuse distinctive words or phrases from the snippet.
 - Do NOT include any dates or names, UNLESS the snippet's category (given after each snippet) is "time_filtered" or "person_filtered" -- for those specific categories, including a rough date or a name is fine and expected.
-- Output the question text only, no preamble.
+- Output the query text only, no preamble.
 
 Output ONLY a JSON array, one object per snippet, in this exact shape and nothing else:
 [{{"id": <snippet id>, "question": "..."}}, ...]

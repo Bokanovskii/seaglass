@@ -797,3 +797,29 @@ actually do rather than simulated -- unlike the mechanical/automatic
 parts of this pipeline, human judgment on "is this question fair, and
 are these really the right positive messages" is the one step in
 EVALUATION.md's design that a human, not an agent, is supposed to do.
+
+## 19. Golden-set question style fixed: terse search-box phrasing, not full questions
+
+The user flagged that `eval/generate.py`'s generated questions were too
+formal -- structured full sentences like "Wasn't there a conversation
+sometime in spring where we commiserated about..." or "What were the
+dinner plans with...". Real recall-search queries people type are much
+terser: keyword fragments, no question words, no helper verbs.
+
+Fixed `_PROMPT_TEMPLATE` in `seaglass/eval/generate.py` to explicitly
+instruct: phrase like something typed into a search box (a fragment or a
+few keywords), not a complete grammatical question; dropped "vague
+question" framing in favor of "terse search query"; gave concrete
+before/after examples in the prompt itself ("dinner plans with sam" not
+"what were the dinner plans with sam").
+
+Regenerated the pending 43-candidate real-scale batch
+(`data/golden-set-review/candidates_for_review.jsonl`) against the same
+already-harvested `index.db` with the new prompt -- 32 draft entries this
+time (batch composition varies run to run since ghcp's phrasing choices
+differ). Spot-checked several: `"[REDACTED_TOPIC]
+texts"`, `"[REDACTED_TOPIC]"`, `"[REDACTED_TOPIC]
+[REDACTED_TOPIC]"` -- terse, no question words, matches the intended
+"typed into a search box" register. Still awaiting the user's human
+review pass (unchanged from §18 -- this only fixes question *style*, not
+the review step itself).
