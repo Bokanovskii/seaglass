@@ -1070,3 +1070,54 @@ should be revisited once the golden set grows toward EVALUATION.md's
 ~300-question target -- n=32 with 1-6 samples per category is still
 not enough to draw firm per-category conclusions, only an overall
 directional one.
+
+## §22: First real end-to-end Grogu↔seaglass MCP verification
+
+Per the reviewer's top-line concern that "the integration has never
+actually run end-to-end," this was verified for the first time on this
+machine this session:
+
+- Created `~/.copilot/mcp-config.json` (did not previously exist),
+  registering a `seaglass` MCP server entry pointing at the installed
+  `seaglass-mcp` console script, with `env.SEAGLASS_INDEX_DB` /
+  `env.SEAGLASS_CHAT_DB` pointing at the freshly-rebuilt, full
+  (17,525-chunk) index and chat snapshot.
+- Installed the `mcp` package for the system Python
+  (`/opt/homebrew/bin/python3.14`) that Grogu's `find_python()`
+  resolves via PATH search — this was previously missing and silently
+  caused `grogu_mcp.available()` to report `False`, masking BUG-6 even
+  after it was fixed in code.
+- `grogu imessage status` now reports `"seaglass": true` for the first
+  time on this machine (previously always `false`, since the config
+  never existed and `mcp` wasn't importable for the resolved Python).
+- Ran `grogu imessage search "lisbon trip" --limit 5` twice
+  independently. Both runs returned identical, genuinely relevant
+  semantically-matched results (a real conversation about cutting a day
+  from a Lisbon itinerary and the Duoro valley) with correctly
+  unix-second-normalized timestamps — not a silent SQL LIKE fallback,
+  not an error. Wall time was **~4.0-4.1s per invocation** end-to-end
+  (embedding model cold start + reranker cold start + HuggingFace
+  revision-check HTTP calls + actual search), consistent across both
+  runs. This is the first real measurement of "how much does eating the
+  startup cost actually cost" per the user's own earlier decision to
+  skip the daemon/shim at first — ~4s per CLI invocation is the honest
+  answer for this corpus size on this machine, with no evidence yet of
+  whether/how this scales as the index grows further.
+- This exercise itself caught one more real bug (IMPROVEMENT-13
+  recurrence): `tests/test_grogu_cli.py`'s
+  `test_seaglass_available_reflects_mcp_config` started failing the
+  instant a real `~/.copilot/mcp-config.json` with a seaglass entry
+  existed on the machine, exactly as the reviewer warned this class of
+  test was fragile. Fixed in Grogu by isolating the "no config" branch
+  of the test behind a temp `COPILOT_HOME`, decoupling it from the
+  ambient environment entirely (Grogu commit `9e5f385`).
+
+**Status**: all Opus-review findings prioritized as bugs (BUG-1 through
+BUG-10) and the calibration-sample-size improvement (IMPROVEMENT-11)
+are now fixed, tested, committed, and — for the integration bugs
+specifically — verified against a real, live end-to-end search. Full
+suites pass: seaglass 170 passed (166 unit + 4 integration); Grogu 91
+passed, 1 skipped. Deferred, documented, and not forgotten:
+IMPROVEMENT-12 (eval-harness correctness details) and nitpicks N1-N12,
+plus growing the golden set toward EVALUATION.md's ~300-question
+target for statistically firm per-category numbers.
