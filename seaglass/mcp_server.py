@@ -55,10 +55,11 @@ from __future__ import annotations
 import os
 import sqlite3
 import sys
+import threading
 import time
 import zstandard
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 from mcp.server import MCPServer
 
@@ -102,6 +103,17 @@ _reranker: Optional[CrossEncoderReranker] = None
 _contact_index: Optional[ContactIndex] = None
 _contact_index_attempted = False
 
+# The MCP SDK dispatches sync tool functions via a thread pool (not one
+# fixed thread per session), so any lazy-init global here can race:
+# concurrent tool calls could each see `_embedding_model is None` and each
+# load a full MLX model, and SQLite connections opened with the default
+# check_same_thread=True raise ProgrammingError when used from a
+# different pool thread than the one that opened them. This lock
+# serializes lazy-init AND the underlying model calls (MLX itself has no
+# cross-thread safety guarantee, unlike SQLite which is safe per
+# connection once check_same_thread=False is set).
+_init_lock = threading.Lock()
+
 
 def _log(msg: str) -> None:
     # Never print() here -- stdout is the MCP transport (see module docstring).
@@ -111,57 +123,82 @@ def _log(msg: str) -> None:
 def _get_index_con() -> sqlite3.Connection:
     global _index_con
     if _index_con is None:
-        index_db = os.environ.get("SEAGLASS_INDEX_DB")
-        if not index_db:
-            raise RuntimeError(
-                "SEAGLASS_INDEX_DB is not set -- point it at a built index.db "
-                "(see `seaglass build`)."
-            )
-        _log(f"opening index.db: {index_db}")
-        _index_con = open_index_db(Path(index_db))
+        with _init_lock:
+            if _index_con is None:
+                index_db = os.environ.get("SEAGLASS_INDEX_DB")
+                if not index_db:
+                    raise RuntimeError(
+                        "SEAGLASS_INDEX_DB is not set -- point it at a built index.db "
+                        "(see `seaglass build`)."
+                    )
+                index_path = Path(index_db)
+                if not index_path.exists():
+                    raise RuntimeError(
+                        f"SEAGLASS_INDEX_DB={index_db} does not exist -- check the path "
+                        "(a typo'd path would otherwise silently create an empty index.db)."
+                    )
+                _log(f"opening index.db: {index_db}")
+                _index_con = open_index_db(index_path, check_same_thread=False, create=False)
     return _index_con
 
 
 def _get_chat_con() -> Optional[sqlite3.Connection]:
     global _chat_con
     if _chat_con is None:
-        chat_db = os.environ.get("SEAGLASS_CHAT_DB")
-        if not chat_db:
-            return None
-        _log(f"opening chat.db snapshot: {chat_db}")
-        _chat_con = connect_readonly(Path(chat_db))
+        with _init_lock:
+            if _chat_con is None:
+                chat_db = os.environ.get("SEAGLASS_CHAT_DB")
+                if not chat_db:
+                    return None
+                _log(f"opening chat.db snapshot: {chat_db}")
+                _chat_con = connect_readonly(Path(chat_db))
     return _chat_con
 
 
 def _get_embedding_model() -> EmbeddingModel:
     global _embedding_model
     if _embedding_model is None:
-        _log("loading embedding model (first call this session -- cold start)")
-        t0 = time.time()
-        _embedding_model = EmbeddingModel()
-        _log(f"embedding model warm in {time.time() - t0:.2f}s")
+        with _init_lock:
+            if _embedding_model is None:
+                _log("loading embedding model (first call this session -- cold start)")
+                t0 = time.time()
+                _embedding_model = EmbeddingModel()
+                _log(f"embedding model warm in {time.time() - t0:.2f}s")
     return _embedding_model
 
 
 def _get_reranker() -> CrossEncoderReranker:
     global _reranker
     if _reranker is None:
-        _log("loading reranker (first call this session -- cold start)")
-        t0 = time.time()
-        _reranker = CrossEncoderReranker()
-        _log(f"reranker warm in {time.time() - t0:.2f}s")
+        with _init_lock:
+            if _reranker is None:
+                _log("loading reranker (first call this session -- cold start)")
+                t0 = time.time()
+                _reranker = CrossEncoderReranker()
+                _log(f"reranker warm in {time.time() - t0:.2f}s")
     return _reranker
 
 
 def _get_contact_index() -> Optional[ContactIndex]:
     global _contact_index, _contact_index_attempted
     if not _contact_index_attempted:
-        _contact_index_attempted = True
-        try:
-            _contact_index = ContactIndex.load()
-        except ContactsUnavailableError:
-            _log("Contacts unavailable -- names will degrade to raw handles")
+        with _init_lock:
+            if not _contact_index_attempted:
+                _contact_index_attempted = True
+                try:
+                    _contact_index = ContactIndex.load()
+                except ContactsUnavailableError:
+                    _log("Contacts unavailable -- names will degrade to raw handles")
     return _contact_index
+
+
+# Separate from _init_lock: this serializes actual MLX inference calls
+# (embedding + reranking), since MLX gives no cross-thread safety
+# guarantee for concurrent GPU work, unlike SQLite (safe per-connection
+# once check_same_thread=False). The MCP SDK dispatches sync tools via a
+# thread pool, so two concurrent search_messages calls could otherwise
+# both hit the GPU at once.
+_pipeline_lock = threading.Lock()
 
 
 @server.tool()
@@ -181,6 +218,11 @@ def search_messages(
     parsed automatically (e.g. "last week", "with Sam") -- `person`
     matches chat participants, not people merely mentioned in message text.
     """
+    with _pipeline_lock:
+        return _search_messages_impl(query, max_sessions=max_sessions, redact=redact)
+
+
+def _search_messages_impl(query: str, *, max_sessions: int, redact: bool) -> dict:
     t0 = time.time()
     index_con = _get_index_con()
     chat_con = _get_chat_con()
@@ -250,22 +292,59 @@ def get_conversation(chat_id: int, around_ts: Optional[float] = None, limit: int
         )
     contact_index = _get_contact_index()
 
-    # `date` mixes seconds/nanoseconds depending on macOS version at write
-    # time (see apple_to_unix's own warning) -- rather than trying to invert
-    # that ambiguity in SQL, pull a bounded window ordered by the raw column
-    # (monotonic either way within one chat) and do the actual around_ts
-    # distance sort in Python, in already-converted unix seconds.
-    window = max(limit * 20, 2000)
-    query = """
-        SELECT m.ROWID, m.text, m.attributedBody, m.date, m.is_from_me, h.id
-        FROM im.message m
-        JOIN im.chat_message_join cmj ON cmj.message_id = m.ROWID
-        LEFT JOIN im.handle h ON h.ROWID = m.handle_id
-        WHERE cmj.chat_id = ?
-        ORDER BY m.date DESC
-        LIMIT ?
-    """
-    rows = chat_con.execute(query, (chat_id, window)).fetchall()
+    if around_ts is not None:
+        # Rather than guessing a recent window and hoping around_ts falls
+        # inside it (previously: only the newest 2000 rows were fetched,
+        # so drilling into an old thread in a chat with >2000 messages
+        # silently returned unrelated recent messages instead) -- pull
+        # just (ROWID, date) for the WHOLE chat (cheap: two columns, no
+        # join, uses the indexed chat_message_join), convert every date
+        # with apple_to_unix in Python (the ambiguous seconds/ns handling
+        # only needs to run once per message, not per query), find the
+        # closest position to around_ts, then fetch full rows for just
+        # that window by ROWID.
+        id_date_rows = chat_con.execute(
+            """
+            SELECT m.ROWID, m.date
+            FROM im.message m
+            JOIN im.chat_message_join cmj ON cmj.message_id = m.ROWID
+            WHERE cmj.chat_id = ?
+            ORDER BY m.date ASC
+            """,
+            (chat_id,),
+        ).fetchall()
+        if not id_date_rows:
+            target_ids: List[int] = []
+        else:
+            converted = [(rowid, apple_to_unix(date)) for rowid, date in id_date_rows]
+            # closest position by absolute distance to around_ts
+            closest_idx = min(range(len(converted)), key=lambda i: abs(converted[i][1] - around_ts))
+            half = limit // 2
+            lo = max(0, closest_idx - half)
+            hi = min(len(converted), lo + limit)
+            lo = max(0, hi - limit)  # re-clamp lo if hi hit the end first
+            target_ids = [rowid for rowid, _ in converted[lo:hi]]
+        if not target_ids:
+            return {"chat_id": chat_id, "n_messages": 0, "messages": []}
+        placeholders = ",".join("?" for _ in target_ids)
+        query = f"""
+            SELECT m.ROWID, m.text, m.attributedBody, m.date, m.is_from_me, h.id
+            FROM im.message m
+            LEFT JOIN im.handle h ON h.ROWID = m.handle_id
+            WHERE m.ROWID IN ({placeholders})
+        """
+        rows = chat_con.execute(query, target_ids).fetchall()
+    else:
+        query = """
+            SELECT m.ROWID, m.text, m.attributedBody, m.date, m.is_from_me, h.id
+            FROM im.message m
+            JOIN im.chat_message_join cmj ON cmj.message_id = m.ROWID
+            LEFT JOIN im.handle h ON h.ROWID = m.handle_id
+            WHERE cmj.chat_id = ?
+            ORDER BY m.date DESC
+            LIMIT ?
+        """
+        rows = chat_con.execute(query, (chat_id, limit)).fetchall()
 
     messages = []
     for rowid, text, attributed_body, date, is_from_me, handle in rows:
@@ -283,11 +362,6 @@ def get_conversation(chat_id: int, around_ts: Optional[float] = None, limit: int
             )
         )
 
-    if around_ts is not None:
-        messages.sort(key=lambda m: abs(m.ts - around_ts))
-        messages = messages[:limit]
-    else:
-        messages = messages[:limit]
     messages.sort(key=lambda m: m.ts)
     return {
         "chat_id": chat_id,

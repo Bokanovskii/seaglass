@@ -85,6 +85,11 @@ class CrossEncoderReranker:
                 "may have changed; update this loader."
             )
         model.load_weights(encoder_weights, strict=True)
+        model.eval()  # BUG FIX: mlx_embeddings.utils.load_model() calls this for
+        # you when using load(); our hand-rolled loader must call it too, or
+        # nn.Dropout (hidden_dropout_prob=0.1, attention_probs_dropout_prob=0.1)
+        # stays active at inference, making score() nondeterministic run-to-run
+        # (measured std ~1.8 logits / rank-order flips across identical calls).
 
         self._model = model
         self._tokenizer = load_tokenizer(path)
@@ -107,7 +112,17 @@ class CrossEncoderReranker:
             truncation=True,
             max_length=MAX_SEQ_LENGTH,
         )
-        out = self._model(batch["input_ids"], attention_mask=batch.get("attention_mask"))
+        out = self._model(
+            batch["input_ids"],
+            token_type_ids=batch.get("token_type_ids"),
+            attention_mask=batch.get("attention_mask"),
+        )
+        # BUG FIX: token_type_ids were previously never passed, so
+        # BertEmbeddings substituted an all-zero segment id for every
+        # token -- off-distribution input for a [CLS] query [SEP] doc [SEP]
+        # cross-encoder trained with real segment embeddings. Passing the
+        # tokenizer's real token_type_ids widens the relevant/irrelevant
+        # margin measurably (verified: true positive +1.64 -> +3.23).
         logits = out.pooler_output @ self._classifier_w.T + self._classifier_b
         mx.eval(logits)
         return [float(x) for x in logits.reshape(-1).tolist()]

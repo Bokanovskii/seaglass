@@ -79,17 +79,26 @@ def chunk_messages(
     for msg in messages:
         if current:
             gap = msg.ts - current[-1].ts
+            is_gap_close = gap > gap_threshold_s
             projected_tokens = token_count + approx_token_count(msg.text or "")
             should_close = (
-                gap > gap_threshold_s
+                is_gap_close
                 or projected_tokens > token_target
                 or len(current) >= max_messages
             )
             if should_close:
                 yield flush()
                 # Overlap: the next chunk starts with the last `overlap`
-                # messages of the one just closed.
-                carried = current[-overlap:] if overlap > 0 else []
+                # messages of the one just closed -- but ONLY when the
+                # close was a token/message-count limit, never a gap
+                # close. A gap close means the conversation genuinely
+                # paused (default 45min); carrying the pre-gap messages
+                # into the next chunk corrupts that chunk's start_ts with
+                # a timestamp from before the gap (sometimes years
+                # earlier -- BUG-4, see ADDENDUM), mislabels its
+                # (chat_id, day) session key, and pollutes its embedding
+                # with content from an unrelated conversation.
+                carried = current[-overlap:] if (overlap > 0 and not is_gap_close) else []
                 current = list(carried)
                 token_count = sum(approx_token_count(m.text or "") for m in current)
         current.append(msg)

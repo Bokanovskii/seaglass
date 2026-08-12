@@ -21,8 +21,13 @@ _MEDIA_KEYWORDS = {"photo", "photos", "picture", "pictures", "pic", "pics",
 
 # Preposition heuristic (PLAN.md §6 Phase 4): "from"/"with" implies
 # participant filter; "about"/"re"/bare mention stays in the residual.
+# NOTE (BUG-10 fix): only the preposition itself is case-insensitive here
+# (scoped inline flag) -- the capitalized-name group must stay
+# case-SENSITIVE, or the whole point of requiring a capitalized name is
+# defeated and ordinary lowercase words after "with"/"from" ("with the
+# trip", "from yesterday") get misread as a person's name.
 _PARTICIPANT_PATTERN = re.compile(
-    r"\b(?:from|with)\s+([A-Z][\w'-]*(?:\s+[A-Z][\w'-]*)?)", re.IGNORECASE
+    r"\b(?i:from|with)\s+([A-Z][\w'-]*(?:\s+[A-Z][\w'-]*)?)"
 )
 
 DATE_PAD_DAYS = 3
@@ -43,11 +48,33 @@ _UNAMBIGUOUS_DATE_WORDS = {
     "morning", "afternoon", "evening", "noon", "midnight",
 }
 
+# Month names that double as common non-date English words (BUG-10:
+# "may i borrow the car" was misread as a May date filter). These are
+# only trusted as a date match when the *full query* has some other
+# corroborating date signal (a digit, or a second unambiguous date word)
+# -- a single bare occurrence of one of these words alone is treated as
+# the ordinary word, not a month reference.
+_AMBIGUOUS_DATE_WORDS = {"may", "march"}
 
-def _looks_like_a_real_date_match(substring: str) -> bool:
+
+def _looks_like_a_real_date_match(substring: str, full_text: str = "") -> bool:
     has_digit = any(char.isdigit() for char in substring)
+    if has_digit:
+        return True
     words = set(re.findall(r"[a-zA-Z]+", substring.lower()))
-    return has_digit or bool(words & _UNAMBIGUOUS_DATE_WORDS)
+    unambiguous_hit = words & _UNAMBIGUOUS_DATE_WORDS - _AMBIGUOUS_DATE_WORDS
+    if unambiguous_hit:
+        return True
+    ambiguous_hit = words & _AMBIGUOUS_DATE_WORDS
+    if not ambiguous_hit:
+        return False
+    # Corroborate against the rest of the query: a digit anywhere, or a
+    # second unambiguous date word, makes it plausible this really is a
+    # month reference rather than the common verb/modal usage.
+    full_words = set(re.findall(r"[a-zA-Z]+", full_text.lower()))
+    has_other_digit = any(char.isdigit() for char in full_text)
+    has_other_date_word = bool((full_words - ambiguous_hit) & _UNAMBIGUOUS_DATE_WORDS)
+    return has_other_digit or has_other_date_word
 
 
 @dataclasses.dataclass
@@ -72,7 +99,7 @@ def _extract_date_range(text: str) -> Tuple[Optional[float], Optional[float], Li
     results = search_dates(text, settings={"PREFER_DATES_FROM": "past"})
     if not results:
         return None, None, []
-    results = [(substring, dt) for substring, dt in results if _looks_like_a_real_date_match(substring)]
+    results = [(substring, dt) for substring, dt in results if _looks_like_a_real_date_match(substring, text)]
     if not results:
         return None, None, []
     matched_substrings = [substring for substring, _ in results]

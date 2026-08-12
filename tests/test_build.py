@@ -124,6 +124,32 @@ class TestBuildIndex:
         assert "build_cursor" in rows
         assert int(rows["build_cursor"]) > 0
 
+    def test_calibration_samples_multiple_chunks_not_just_the_first(self, tmp_path, monkeypatch):
+        # Regression test for IMPROVEMENT-11: calibration used to run on
+        # a single-element list (the very first rendered chunk), even
+        # though CALIBRATION_SAMPLE_SIZE declares a much larger target.
+        # Lower the target so a small fixture corpus can still exceed it,
+        # and assert _ensure_calibration is invoked with more than one
+        # sample text when more than one chunk is available.
+        import seaglass.index.build as build_mod
+
+        monkeypatch.setattr(build_mod, "CALIBRATION_SAMPLE_SIZE", 5)
+        seen_sample_sizes = []
+        real_ensure_calibration = build_mod._ensure_calibration
+
+        def spy(index_con, embedding_model, sample_texts):
+            seen_sample_sizes.append(len(sample_texts))
+            return real_ensure_calibration(index_con, embedding_model, sample_texts)
+
+        monkeypatch.setattr(build_mod, "_ensure_calibration", spy)
+
+        chat_db_path = _build_fixture_chat_db(tmp_path, n_chats=3, n_messages_per_chat=10)
+        index_db_path = tmp_path / "index.db"
+        build_index(chat_db_path, index_db_path, embedding_model=FakeEmbeddingModel(), batch_size=3)
+
+        assert len(seen_sample_sizes) == 1  # calibration only runs once
+        assert seen_sample_sizes[0] > 1
+
     def test_rerunning_a_completed_build_writes_nothing_new(self, tmp_path):
         chat_db_path = _build_fixture_chat_db(tmp_path, n_chats=2, n_messages_per_chat=5)
         index_db_path = tmp_path / "index.db"

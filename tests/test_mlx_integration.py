@@ -37,3 +37,25 @@ class TestCrossEncoderRerankerIntegration:
         scores = reranker.score([(query, relevant), (query, irrelevant)])
         assert len(scores) == 2
         assert scores[0] > scores[1]
+
+    def test_model_is_in_eval_mode_not_training_mode(self):
+        # Regression test: the loader previously never called .eval(),
+        # so MLX's default train-mode dropout (hidden_dropout_prob=0.1,
+        # attention_probs_dropout_prob=0.1) fired at inference, making
+        # score() nondeterministic run-to-run (rank order flipped across
+        # identical calls). A single .training assertion catches this.
+        reranker = CrossEncoderReranker()
+        reranker._ensure_loaded()
+        assert reranker._model.training is False
+
+    def test_score_is_deterministic_across_repeated_calls(self):
+        # Regression test for the same dropout-in-train-mode bug: with
+        # eval mode correctly set, identical inputs must produce bit-for-
+        # bit identical scores every call.
+        reranker = CrossEncoderReranker()
+        query = "are you free tonight?"
+        candidate = "Them: hey are you free tonight?\nMe: yeah what's up"
+        first = reranker.score([(query, candidate)])
+        for _ in range(4):
+            again = reranker.score([(query, candidate)])
+            assert again == first

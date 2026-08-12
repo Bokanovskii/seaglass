@@ -55,6 +55,20 @@ class TestDateExtraction:
         parsed = parse_query("plans on march 15 2024")
         assert parsed.date_to - parsed.date_from > DATE_PAD_DAYS * 86400 * 1.5
 
+    def test_may_as_modal_verb_is_not_a_date_false_positive(self):
+        # Regression test for BUG-10: "may" is both a month name and a
+        # common modal verb -- a bare occurrence with no other date
+        # signal (digit, second date word) must not trigger a date filter.
+        parsed = parse_query("may i borrow the car")
+        assert parsed.date_from is None
+        assert parsed.date_to is None
+        assert "may" in parsed.semantic
+
+    def test_may_with_a_day_number_is_still_a_real_date(self):
+        parsed = parse_query("what did we plan for may 5th")
+        assert parsed.date_from is not None
+        assert parsed.date_to is not None
+
 
 class TestParticipantExtraction:
     def test_from_preposition_extracts_participant_handle(self):
@@ -74,6 +88,17 @@ class TestParticipantExtraction:
         parsed = parse_query("what did we say about Alice Chen", contact_index=index)
         assert parsed.people_participant == []
         assert "Alice" in parsed.semantic
+
+    def test_lowercase_word_after_preposition_is_not_mistaken_for_a_name(self):
+        # Regression test for BUG-10: the participant regex's own
+        # re.IGNORECASE flag defeated its capitalized-name heuristic,
+        # letting ordinary lowercase words after from/with (e.g. "the",
+        # "yesterday") match as if they were a person's name.
+        index = _sample_index()
+        parsed = parse_query("what did we plan with the plumber", contact_index=index)
+        assert parsed.people_participant == []
+        parsed2 = parse_query("what happened from yesterday onward", contact_index=index)
+        assert parsed2.people_participant == []
 
     def test_no_contact_index_never_raises_and_extracts_nothing(self):
         parsed = parse_query("photos from Alice Chen")

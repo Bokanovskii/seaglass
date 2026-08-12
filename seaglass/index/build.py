@@ -68,13 +68,25 @@ class RenderedChunk:
     body_lexical: str
 
 
-def open_index_db(index_db_path: Path) -> sqlite3.Connection:
+def open_index_db(index_db_path: Path, *, check_same_thread: bool = True, create: bool = True) -> sqlite3.Connection:
     """Open (creating if needed) index.db with the schema applied and
     sqlite-vec loaded. WAL mode is set by schema.sql.
+
+    `check_same_thread=False` is needed by callers (e.g. mcp_server.py)
+    whose connection is used from a thread pool rather than the thread
+    that opened it -- SQLite connections are otherwise thread-affine and
+    raise ProgrammingError from any other thread.
+
+    `create=False` fails fast with FileNotFoundError instead of silently
+    creating an empty database -- important for read-only callers
+    (mcp_server.py, eval/score.py) where a typo'd path should be a loud
+    error, not a phantom empty index that then reports 0 chunks.
     """
     import sqlite_vec
 
-    con = sqlite3.connect(index_db_path)
+    if not create and not index_db_path.exists():
+        raise FileNotFoundError(f"index.db not found at {index_db_path} (create=False)")
+    con = sqlite3.connect(index_db_path, check_same_thread=check_same_thread)
     con.enable_load_extension(True)
     sqlite_vec.load(con)
     con.enable_load_extension(False)
@@ -299,6 +311,14 @@ def build_index(
     position = 0  # 1-indexed chunk id, stable across restarts
     chunks_written = 0
     batch: List[RenderedChunk] = []
+    # IMPROVEMENT-11 fix: calibration must be computed from a real sample
+    # of up to CALIBRATION_SAMPLE_SIZE chunks, not just the very first
+    # one -- a single chunk's absmax can be an outlier (unusually short/
+    # long text) that miscalibrates int8 quantization for the whole
+    # index. Buffer rendered-but-uncalibrated chunks here until either
+    # the sample target is reached or the corpus runs out, then
+    # calibrate once and flush everything buffered so far.
+    pending_calibration: List[RenderedChunk] = []
 
     for chunk, messages_by_id in iter_chunks_by_chat(chat_con, chunker_kwargs=chunker_kwargs):
         position += 1
@@ -311,10 +331,19 @@ def build_index(
         rendered = _render_chunk(chunk_id, chunk, messages_by_id, attachments, places_by_attachment)
 
         if not calibrated:
+            pending_calibration.append(rendered)
+            reached_sample_target = len(pending_calibration) >= CALIBRATION_SAMPLE_SIZE
+            reached_run_limit = limit_chunks is not None and chunks_written + len(pending_calibration) >= limit_chunks
+            if not (reached_sample_target or reached_run_limit):
+                continue
             calibrated = True
-            _ensure_calibration(index_con, embedding_model, [rendered.body_semantic])
-
-        batch.append(rendered)
+            _ensure_calibration(
+                index_con, embedding_model, [r.body_semantic for r in pending_calibration]
+            )
+            batch.extend(pending_calibration)
+            pending_calibration = []
+        else:
+            batch.append(rendered)
 
         if len(batch) >= batch_size:
             _flush(batch, embedding_model, index_con, compressor)
@@ -323,6 +352,16 @@ def build_index(
 
         if limit_chunks is not None and chunks_written + len(batch) >= limit_chunks:
             break
+
+    if not calibrated and pending_calibration:
+        # Corpus exhausted before reaching the sample target -- calibrate
+        # from whatever we collected (this is the correct, deliberate
+        # fallback, not the bug: the bug was calibrating from 1 chunk
+        # when thousands were available).
+        _ensure_calibration(
+            index_con, embedding_model, [r.body_semantic for r in pending_calibration]
+        )
+        batch.extend(pending_calibration)
 
     if batch:
         _flush(batch, embedding_model, index_con, compressor)

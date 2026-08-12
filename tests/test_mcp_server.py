@@ -135,6 +135,43 @@ def test_get_conversation_around_ts_picks_closest_messages(tmp_path, monkeypatch
     assert "lisbon trip planning starts now" in texts
 
 
+def test_get_conversation_around_ts_finds_old_message_beyond_2000_row_window(tmp_path, monkeypatch):
+    # Regression test for BUG-9: get_conversation(around_ts=...) used to
+    # only fetch the newest 2000 rows before doing its distance sort, so
+    # an old target message in a chat with >2000 messages was silently
+    # invisible. Build a chat with an old message, a large run of recent
+    # filler, and confirm around_ts pointing at the old message still
+    # finds it.
+    chats = [
+        {
+            "chat_id": 1,
+            "handles": ["+15551110000"],
+            "messages": (
+                [("ancient lisbon trip message", APPLE_EPOCH_START, False, 0)]
+                + [
+                    (f"filler message {i}", APPLE_EPOCH_START + 10_000_000 + i, False, 0)
+                    for i in range(2500)
+                ]
+            ),
+        }
+    ]
+    chat_db_path = build_fixture_chat_db(tmp_path, chats)
+    index_db_path = tmp_path / "index.db"
+    build_index(chat_db_path, index_db_path, embedding_model=FakeEmbeddingModel(), batch_size=200)
+    index_con = open_index_db(index_db_path)
+    chat_con = connect_readonly(chat_db_path)
+    monkeypatch.setattr(mcp_server, "_get_index_con", lambda: index_con)
+    monkeypatch.setattr(mcp_server, "_get_chat_con", lambda: chat_con)
+    monkeypatch.setattr(mcp_server, "_get_contact_index", lambda: None)
+
+    result = mcp_server.get_conversation(
+        chat_id=1, around_ts=mcp_server.apple_to_unix(APPLE_EPOCH_START), limit=5
+    )
+
+    texts = [m["text"] for m in result["messages"]]
+    assert "ancient lisbon trip message" in texts
+
+
 def test_get_conversation_requires_chat_db(tmp_path, monkeypatch):
     _, index_db_path = _fixture(tmp_path)
     index_con = open_index_db(index_db_path)

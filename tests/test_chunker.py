@@ -55,17 +55,55 @@ class TestChunkMessages:
         assert chunks[1].msg_ids == (3, 4)
 
     def test_overlap_carries_last_n_messages_into_next_chunk(self):
+        # Overlap must only carry across a token/message-count close, never
+        # a gap close (BUG-4 fix): a gap close means the conversation
+        # genuinely paused, so carrying pre-gap messages would corrupt the
+        # next chunk's start_ts/day with a stale timestamp. Use
+        # max_messages to force the split here instead of a gap.
+        messages = [_msg(i, ts=1000.0 + i * 10) for i in range(1, 6)]
+        chunks = list(chunk_messages(messages, max_messages=3, overlap=1))
+        assert len(chunks) == 2
+        assert chunks[0].msg_ids == (1, 2, 3)
+        # chunk 2 carries message 3 (the last of chunk 1) plus 4, 5
+        assert chunks[1].msg_ids == (3, 4, 5)
+
+    def test_overlap_is_never_carried_across_a_gap_close(self):
+        # Regression test for BUG-4: a gap close is a genuine conversation
+        # break, so the next chunk must start clean -- never seeded with
+        # messages from before the gap. Previously the overlap carry ran
+        # unconditionally, corrupting ~36% of chunks' start_ts on the real
+        # index (sometimes with a timestamp years earlier than the rest of
+        # the chunk).
         messages = [
             _msg(1, ts=1000.0),
             _msg(2, ts=1010.0),
-            _msg(3, ts=1010.0 + 3600),
+            _msg(3, ts=1010.0 + 3600),  # 1hr later, over 45min default gap
             _msg(4, ts=1010.0 + 3610),
         ]
-        chunks = list(chunk_messages(messages, overlap=1))
+        chunks = list(chunk_messages(messages, overlap=2))
         assert len(chunks) == 2
         assert chunks[0].msg_ids == (1, 2)
-        # chunk 2 carries message 2 (the last of chunk 1) plus 3, 4
-        assert chunks[1].msg_ids == (2, 3, 4)
+        assert chunks[1].msg_ids == (3, 4)  # no carry-over from chunk 1
+        assert chunks[1].start_ts == 1010.0 + 3600  # not contaminated by msg 1/2's ts
+
+    def test_no_chunk_has_an_internal_gap_over_threshold(self):
+        # Broader regression check across a mix of gap and non-gap closes:
+        # every chunk's own internal max gap must stay under the
+        # threshold that's supposed to close chunks in the first place.
+        gap_threshold = 45 * 60
+        messages = (
+            [_msg(i, ts=1000.0 + i * 30) for i in range(1, 6)]  # tight cluster
+            + [_msg(i, ts=1000.0 + i * 30 + i * gap_threshold * 2) for i in range(6, 11)]  # each far apart
+        )
+        chunks = list(chunk_messages(messages, overlap=2))
+        for chunk in chunks:
+            timestamps = []
+            for mid in chunk.msg_ids:
+                match = next(m for m in messages if m.rowid == mid)
+                timestamps.append(match.ts)
+            timestamps.sort()
+            for a, b in zip(timestamps, timestamps[1:]):
+                assert b - a <= gap_threshold
 
     def test_max_messages_forces_a_split(self):
         messages = [_msg(i, ts=1000.0 + i) for i in range(1, 11)]

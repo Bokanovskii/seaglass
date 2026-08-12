@@ -5,6 +5,8 @@ aggregation (dedup + group-by-(chat_id, day) + score summation), and
 
 from __future__ import annotations
 
+import pytest
+
 from seaglass.index.build import build_index, open_index_db
 from seaglass.search.rank import (
     RankedChunk,
@@ -21,6 +23,13 @@ class FakeReranker:
     """Deterministic stand-in for CrossEncoderReranker: scores a pair by
     how many query words appear in the candidate text, so tests can
     assert on ordering without loading MLX.
+
+    Deliberately maps overlap counts into the same negative-logit range
+    the real cross-encoder actually produces (median ~-7 over real
+    queries, ~98% negative) rather than a nonnegative overlap count --
+    a nonnegative FakeReranker previously masked a real aggregate_sessions
+    bug (raw-logit summation penalising multi-hit sessions) because the
+    fake never exercised the negative regime the bug lived in.
     """
 
     def score(self, pairs):
@@ -28,7 +37,8 @@ class FakeReranker:
         for query, text in pairs:
             query_words = set(query.lower().split())
             text_words = set(text.lower().split())
-            scores.append(float(len(query_words & text_words)))
+            overlap = len(query_words & text_words)
+            scores.append(float(overlap) - 8.0)  # e.g. 0 overlap -> -8, 3 overlap -> -5
         return scores
 
 
@@ -78,6 +88,8 @@ class TestRerankCandidates:
 
 class TestAggregateSessions:
     def test_groups_by_chat_and_day_summing_scores(self):
+        from seaglass.search.rank import _sigmoid
+
         ranked = [
             RankedChunk(chunk_id=1, chat_id=1, start_ts=700000000, rerank_score=2.0),
             RankedChunk(chunk_id=2, chat_id=1, start_ts=700000030, rerank_score=3.0),  # same day
@@ -85,14 +97,19 @@ class TestAggregateSessions:
             RankedChunk(chunk_id=4, chat_id=2, start_ts=700000000, rerank_score=5.0),  # different chat
         ]
         sessions = aggregate_sessions(ranked, max_sessions=8)
-        # chat 2's single-chunk session (score 5.0) should outrank chat 1's fused day (score 5.0 too -- tie broken by insertion order is fine)
+        # chat 2's single-chunk session should outrank either of chat 1's split-day sessions
         by_chat = {s.chat_id: s for s in sessions}
         assert set(by_chat[1].hit_chunk_ids) == {1, 2} or set(by_chat[1].hit_chunk_ids) == {3}
         total_chat1_score = sum(s.score for s in sessions if s.chat_id == 1)
-        assert total_chat1_score == 6.0  # 2.0+3.0 (same day) + 1.0 (different day) split into 2 sessions
-        assert by_chat[2].score == 5.0
+        # scores are sigmoid-mapped before summing (see rank.py's aggregate_sessions
+        # docstring: raw-logit summation penalises multi-hit sessions), so the
+        # same-day pair (2.0, 3.0) sums their *sigmoids*, not the raw logits.
+        assert total_chat1_score == pytest.approx(_sigmoid(2.0) + _sigmoid(3.0) + _sigmoid(1.0))
+        assert by_chat[2].score == pytest.approx(_sigmoid(5.0))
 
     def test_caps_at_max_sessions(self):
+        from seaglass.search.rank import _sigmoid
+
         ranked = [
             RankedChunk(chunk_id=i, chat_id=i, start_ts=700000000, rerank_score=float(i))
             for i in range(1, 11)
@@ -100,17 +117,37 @@ class TestAggregateSessions:
         sessions = aggregate_sessions(ranked, max_sessions=8)
         assert len(sessions) == 8
         # highest scores kept
-        assert sessions[0].score == 10.0
+        assert sessions[0].score == pytest.approx(_sigmoid(10.0))
 
     def test_dedup_by_chunk_id(self):
+        from seaglass.search.rank import _sigmoid
+
         ranked = [
             RankedChunk(chunk_id=1, chat_id=1, start_ts=700000000, rerank_score=2.0),
             RankedChunk(chunk_id=1, chat_id=1, start_ts=700000000, rerank_score=2.0),  # duplicate
         ]
         sessions = aggregate_sessions(ranked)
         assert len(sessions) == 1
-        assert sessions[0].score == 2.0
+        assert sessions[0].score == pytest.approx(_sigmoid(2.0))
         assert sessions[0].hit_chunk_ids == [1]
+
+    def test_more_relevant_hits_never_hurt_a_session(self):
+        # Regression test for the raw-logit-summation bug: a session with
+        # two decent (less-negative) hits must never score below a
+        # single-hit session whose one hit is worse, even though summing
+        # *raw* negative logits would invert that (e.g. -5 + -6 = -11 <
+        # -9). Scores here mimic the real cross-encoder's mostly-negative
+        # logit range.
+        two_hit_session = [
+            RankedChunk(chunk_id=1, chat_id=1, start_ts=700000000, rerank_score=-5.0),
+            RankedChunk(chunk_id=2, chat_id=1, start_ts=700000030, rerank_score=-6.0),
+        ]
+        one_hit_session = [
+            RankedChunk(chunk_id=3, chat_id=2, start_ts=700000000, rerank_score=-9.0),
+        ]
+        sessions = aggregate_sessions(two_hit_session + one_hit_session, max_sessions=8)
+        by_chat = {s.chat_id: s for s in sessions}
+        assert by_chat[1].score > by_chat[2].score
 
 
 class TestExpandSessions:

@@ -104,11 +104,25 @@ def rerank_candidates(
     return result
 
 
+def _sigmoid(logit: float) -> float:
+    # Cross-encoder logits are raw (Identity activation, see rerank.py's
+    # score() docstring) and in practice mostly negative (median ~-7 over
+    # real queries) -- summing raw logits across a session's hits
+    # penalises sessions with *more* relevant hits (two decent -5/-6 hits
+    # sums to -11, worse than one mediocre -9 hit), which silently drops
+    # well-corroborated multi-hit sessions during the max_sessions cutoff.
+    # Map to (0, 1) before summing so more relevant hits always help.
+    import math
+
+    return 1.0 / (1.0 + math.exp(-logit))
+
+
 def aggregate_sessions(ranked: Sequence[RankedChunk], max_sessions: int = MAX_SESSIONS) -> List[Session]:
     """Step 6a: dedup by chunk_id (a chunk can only appear once in `ranked`
     already, since it came from a single top-k rerank pass, but this stays
-    defensive) then group by `(chat_id, day)`, summing rerank scores.
-    Returns sessions sorted by score descending, capped at `max_sessions`.
+    defensive) then group by `(chat_id, day)`, summing each chunk's
+    sigmoid-mapped rerank score (see `_sigmoid`). Returns sessions sorted
+    by score descending, capped at `max_sessions`.
     """
     groups: Dict[Tuple[int, str], Session] = {}
     seen_chunk_ids: set = set()
@@ -123,7 +137,7 @@ def aggregate_sessions(ranked: Sequence[RankedChunk], max_sessions: int = MAX_SE
                 chat_id=chunk.chat_id, day=key[1], score=0.0, hit_chunk_ids=[], context_chunk_ids=[]
             )
             groups[key] = session
-        session.score += chunk.rerank_score
+        session.score += _sigmoid(chunk.rerank_score)
         session.hit_chunk_ids.append(chunk.chunk_id)
 
     sessions = sorted(groups.values(), key=lambda s: s.score, reverse=True)
