@@ -743,3 +743,57 @@ removal alongside the exif.py work); the small country-name map will
 need occasional manual extension if a code outside its ~15 entries
 shows up in a real corpus (falls back gracefully to the raw code, not a
 correctness bug, just a cosmetic gap).
+
+## 18. First real-scale golden-set candidate batch generated — ready for your review sitting
+
+Ran the full eval pipeline at a meaningfully real (if not full-corpus)
+scale, to produce an actual first batch of golden-set candidates rather
+than leaving Phase 3.5 purely spec'd-and-tested:
+
+- Snapshotted the live (still mid-backfill, 385,870 messages as of this
+  run -- up from ~330k earlier this session, confirming the backfill is
+  still actively progressing) `chat.db`.
+- Built a 3,000-chunk real index (52.3s).
+- Ran `harvest.py`'s all 4 stages (sql/idf/nn/score) -- 1,802 candidates
+  scored in well under a second.
+- Ran `generate.py --target 60 --batch-size 10` against real `copilot -p`
+  calls (6 batches, ~11-15s each, ~77s total) -- **43 draft golden
+  entries** survived the automatic vocabulary-leakage filter (out of 60
+  attempted), spanning categories `media_geo` (27), `person_filtered`
+  (7), `time_filtered` (4), `exact_string` (4), `topical` (1). 5 are
+  flagged `_trivially_hard` (real retrieval didn't surface the source in
+  top-200) and 0 are flagged `_sparse_rank1_is_source` -- both left as
+  review-time signals, per §4.2's rule, not auto-rejected.
+- Spot-checked several generated questions by eye: genuinely vague,
+  plausible, non-leaking recall-style questions about real past
+  conversations (e.g. "wasn't there a conversation sometime in spring
+  where we [REDACTED_TOPIC]..."),
+  which is exactly the intent of EVALUATION.md §4.1's question style.
+
+**⚠️ This output contains real personal message content and was
+deliberately kept out of git.** Added `.gitignore` rules (`*.db`,
+`golden*.jsonl`, `candidates_for_review.jsonl`, `/data/`) and moved the
+snapshot/index/candidates into `data/golden-set-review/` (gitignored,
+untracked, local to this machine only) -- **not** committed, and not
+intended to ever be. Consistent with every other real-data validation
+run this session (all of which used `/tmp` and were cleaned up
+afterward); this one persists locally instead of being deleted because
+it's an actual work artifact meant for your review, not a disposable
+validation spike.
+
+**Your turn next, whenever convenient**: run
+```
+python -m seaglass.eval.review data/golden-set-review/candidates_for_review.jsonl \
+    --golden data/golden-set-review/golden.jsonl \
+    --rejected data/golden-set-review/golden.rejected.jsonl
+```
+to interactively accept/edit/reject/skip through the 43 drafted
+questions (EVALUATION.md §4.3 estimates ~30-45 min for a full pass at
+target scale; 43 entries is a fraction of that). Once you have some
+accepted entries, `python -m seaglass.eval.score data/golden-set-review/index.db
+data/golden-set-review/golden.jsonl --chat-db data/golden-set-review/chat_snapshot.db`
+reports real recall@50/@12/@final numbers. Deliberately left for you to
+actually do rather than simulated -- unlike the mechanical/automatic
+parts of this pipeline, human judgment on "is this question fair, and
+are these really the right positive messages" is the one step in
+EVALUATION.md's design that a human, not an agent, is supposed to do.
