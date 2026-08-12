@@ -445,3 +445,43 @@ the raw hydrated display remain bare. Phase 3.5 (golden-set generation via
 started; it's the next natural milestone, since real ablation/quality
 numbers (recall@50/@12/@final per EVALUATION.md §7) require it and can't
 be estimated from spot-checking real queries alone.
+
+## 14. Phase 3.5 begun: `eval/harvest.py` (candidate harvesting)
+
+Implements EVALUATION.md §3's four resumable stages against `index.db`
+(+ `chat.db` for `chat_handle_join`/`chat.style`): `sql` (regex signals
+over decompressed `body_semantic`, plus chunk/chat/temporal-derived
+signals), `idf` (mean IDF of the 5 rarest terms per chunk, via FTS5's
+own `fts5vocab` shadow table -- no hand-rolled document-frequency
+tracking), `nn` (nearest-neighbour cosine distance, §3.2's "prefilter to
+~5000 then one batched NumPy pass over the loaded int8 vectors" rather
+than 5000 separate KNN queries, excluding self-matches and any chunk
+sharing a message with the source), and `score` (composite priority +
+automatic category assignment per §3.3/§3.4).
+
+**Validated against real data.** Ran all four stages against an 1000-
+chunk real index built from a live-`chat.db` snapshot; completed in
+under a second total (the `nn` stage's 644-candidate batched NumPy pass
+was the only nontrivial one, still sub-second at this scale -- will need
+re-measuring at full corpus size per §3.2's "budget = 5000 × measured
+scan latency" warning). Category distribution looked plausible for this
+user's real data: `media_geo` dominated (a photo/video-heavy corpus),
+followed by `person_filtered` (mostly group chats), a small
+`exact_string` slice (URL-bearing chunks), and ~35% left uncategorized
+because they fell outside the `nn` stage's token-count prefilter window
+(too short to be interesting eval candidates) -- exactly the intended
+exclusion.
+
+**Tests:** `tests/test_harvest.py` (9 tests) using the shared
+`tests/conftest.py` fixture builder, all passing. Full suite: 118 passed
+(2 integration tests deselected by default).
+
+**Not yet done, and the next natural step:** `eval/generate.py`
+(question generation via GHCP, per the user's decision to use it
+exclusively for LLM calls in this project) and `eval/review.py` (the
+human review CLI) haven't been built yet. A quick spike confirmed
+`copilot -p "<prompt>" -s --no-color` is usable non-interactively for
+scripting, but costs **~4.4s of fixed per-invocation overhead** even for
+a one-word answer -- at ~300 candidate chunks this means batching many
+chunks into few prompts (not one call per chunk) is essential to keep
+golden-set generation from taking tens of minutes in overhead alone.
