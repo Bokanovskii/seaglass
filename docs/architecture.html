@@ -1,0 +1,847 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>seaglass — Architecture</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --panel-alt: #1c2330;
+    --border: #2a313d;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --accent: #58a6ff;
+    --accent2: #7ee787;
+    --accent3: #f0883e;
+    --accent4: #d2a8ff;
+    --danger: #f85149;
+    --mono: "SF Mono", "Fira Code", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    line-height: 1.5;
+  }
+  header {
+    padding: 28px 32px 18px;
+    border-bottom: 1px solid var(--border);
+    position: sticky;
+    top: 0;
+    background: rgba(13,17,23,0.92);
+    backdrop-filter: blur(6px);
+    z-index: 50;
+  }
+  header h1 { margin: 0 0 4px; font-size: 22px; letter-spacing: 0.3px; }
+  header p.sub { margin: 0; color: var(--muted); font-size: 13.5px; }
+  .layout { display: flex; align-items: flex-start; }
+  nav#toc {
+    width: 220px;
+    flex-shrink: 0;
+    position: sticky;
+    top: 92px;
+    padding: 20px 12px 40px 24px;
+    height: calc(100vh - 92px);
+    overflow-y: auto;
+    font-size: 13px;
+  }
+  nav#toc a {
+    display: block;
+    color: var(--muted);
+    text-decoration: none;
+    padding: 5px 8px;
+    border-radius: 6px;
+    margin-bottom: 1px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  nav#toc a:hover { color: var(--text); background: var(--panel-alt); }
+  nav#toc a.active { color: var(--accent); background: var(--panel-alt); font-weight: 600; }
+  main {
+    flex: 1;
+    padding: 32px 40px 120px;
+    max-width: 980px;
+  }
+  section { margin-bottom: 52px; scroll-margin-top: 90px; }
+  h2 {
+    font-size: 20px;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 8px;
+    margin-bottom: 16px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  h2 .num { color: var(--accent); font-family: var(--mono); font-size: 15px; }
+  h3 { font-size: 16px; margin-top: 28px; color: var(--accent); }
+  p, li { color: #c9d1d9; font-size: 14.5px; }
+  code {
+    font-family: var(--mono);
+    background: var(--panel-alt);
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-size: 13px;
+    color: var(--accent2);
+  }
+  pre {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 16px;
+    overflow-x: auto;
+    font-family: var(--mono);
+    font-size: 12.8px;
+    line-height: 1.6;
+  }
+  pre code { background: none; padding: 0; color: #c9d1d9; }
+  .callout {
+    border-left: 3px solid var(--accent);
+    background: var(--panel);
+    padding: 10px 16px;
+    border-radius: 0 8px 8px 0;
+    margin: 14px 0;
+    font-size: 13.8px;
+  }
+  .callout.warn { border-color: var(--accent3); }
+  .callout.fix { border-color: var(--accent2); }
+  .callout.decision { border-color: var(--accent4); }
+  table { border-collapse: collapse; width: 100%; margin: 14px 0; font-size: 13.5px; }
+  th, td { border: 1px solid var(--border); padding: 7px 12px; text-align: left; }
+  th { background: var(--panel-alt); color: var(--muted); font-weight: 600; }
+  tr:nth-child(even) td { background: rgba(255,255,255,0.015); }
+  .badge {
+    display: inline-block;
+    font-family: var(--mono);
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 10px;
+    background: var(--panel-alt);
+    border: 1px solid var(--border);
+    color: var(--muted);
+    margin-left: 8px;
+  }
+  .badge.fixed { color: var(--accent2); border-color: var(--accent2); }
+  .badge.deferred { color: var(--accent3); border-color: var(--accent3); }
+
+  /* Diagram (SVG-based, built dynamically) */
+  #pipeline-diagram { margin: 8px 0 20px; }
+  .stage-box {
+    fill: var(--panel-alt);
+    stroke: var(--border);
+    stroke-width: 1.5;
+    rx: 8;
+    cursor: pointer;
+    transition: stroke 0.15s, fill 0.15s;
+  }
+  .stage-box:hover { stroke: var(--accent); fill: #212a38; }
+  .stage-box.active { stroke: var(--accent); fill: #21304a; }
+  .stage-label { fill: var(--text); font-size: 12.5px; font-family: -apple-system, sans-serif; pointer-events: none; }
+  .stage-sub { fill: var(--muted); font-size: 10.5px; pointer-events: none; }
+  .flow-arrow { stroke: var(--muted); stroke-width: 1.5; marker-end: url(#arrowhead); fill: none; }
+  #stage-detail {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px 20px;
+    margin-top: 4px;
+    min-height: 70px;
+    font-size: 13.5px;
+  }
+  #stage-detail h4 { margin: 0 0 6px; color: var(--accent); font-size: 14px; }
+  #stage-detail .file { color: var(--muted); font-family: var(--mono); font-size: 12px; }
+
+  /* Live metrics widget */
+  .metrics-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 12px;
+    margin: 16px 0;
+  }
+  .metric-card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px 16px;
+  }
+  .metric-card .val { font-size: 22px; font-weight: 700; font-family: var(--mono); }
+  .metric-card .lbl { color: var(--muted); font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.5px; margin-top: 2px; }
+  .metric-card.good .val { color: var(--accent2); }
+  .metric-card.warn .val { color: var(--accent3); }
+  .metric-card.neutral .val { color: var(--accent); }
+
+  /* Recall table + filter chips */
+  .chip-row { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0 16px; }
+  .chip {
+    font-size: 12.5px;
+    padding: 5px 12px;
+    border-radius: 14px;
+    border: 1px solid var(--border);
+    background: var(--panel-alt);
+    cursor: pointer;
+    color: var(--muted);
+    user-select: none;
+  }
+  .chip.active { background: var(--accent); color: #06121f; border-color: var(--accent); font-weight: 600; }
+  #eval-table tr.hidden { display: none; }
+
+  .bar-track { background: var(--panel-alt); border-radius: 5px; height: 10px; width: 100%; overflow: hidden; }
+  .bar-fill { height: 100%; border-radius: 5px; background: linear-gradient(90deg, var(--accent), var(--accent2)); }
+
+  .toggle-row { display: flex; gap: 10px; align-items: center; margin: 10px 0 4px; font-size: 13px; color: var(--muted); }
+  .switch {
+    width: 36px; height: 20px; background: var(--panel-alt); border: 1px solid var(--border);
+    border-radius: 12px; position: relative; cursor: pointer; flex-shrink: 0;
+  }
+  .switch .knob { width: 16px; height: 16px; border-radius: 50%; background: var(--muted); position: absolute; top: 1px; left: 1px; transition: left 0.15s, background 0.15s; }
+  .switch.on { background: #1b3a2c; border-color: var(--accent2); }
+  .switch.on .knob { left: 17px; background: var(--accent2); }
+
+  footer { padding: 30px 40px; color: var(--muted); font-size: 12px; border-top: 1px solid var(--border); }
+  a { color: var(--accent); }
+
+  ::-webkit-scrollbar { width: 9px; height: 9px; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 5px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>🔍 seaglass — Architecture Reference</h1>
+  <p class="sub">Local semantic + keyword search over iMessage history, exposed as an MCP server for Grogu. Generated as a living document — click through the pipeline, filter the eval table, and toggle detail levels below.</p>
+</header>
+
+<div class="layout">
+  <nav id="toc"></nav>
+  <main id="main-content">
+
+    <section id="overview">
+      <h2><span class="num">01</span> Overview</h2>
+      <p>
+        <strong>seaglass</strong> builds a local, offline search index over a user's iMessage
+        history (<code>~/Library/Messages/chat.db</code>) and exposes it as an
+        <a href="https://modelcontextprotocol.io/">MCP</a> server with two tools:
+        <code>search_messages</code> and <code>get_conversation</code>. Grogu (the user's CLI agent)
+        calls this server instead of doing raw SQL <code>LIKE</code> queries against
+        <code>chat.db</code> directly, giving it real semantic recall ("what did we decide about the
+        trip") on top of exact keyword matching, date-range/participant filtering, and
+        conversation-level context expansion.
+      </p>
+      <div class="callout decision">
+        <strong>Design decision:</strong> no persistent daemon (yet). Each invocation pays a cold
+        model-load cost (embedding model + cross-encoder reranker) and exits. This was an explicit,
+        deliberate choice — see <a href="#latency">§7 Latency</a> for the real measured cost of that
+        decision, and why it may get revisited.
+      </div>
+      <div class="metrics-grid">
+        <div class="metric-card neutral"><div class="val" id="m-messages">385,949</div><div class="lbl">messages indexed</div></div>
+        <div class="metric-card neutral"><div class="val" id="m-chunks">17,525</div><div class="lbl">chunks in index.db</div></div>
+        <div class="metric-card neutral"><div class="val" id="m-indexsize">19.4 MB</div><div class="lbl">index.db size</div></div>
+        <div class="metric-card good"><div class="val" id="m-recall">0.41</div><div class="lbl">recall@final (n=32)</div></div>
+        <div class="metric-card warn"><div class="val" id="m-cold">~4.1s</div><div class="lbl">cold invocation</div></div>
+        <div class="metric-card good"><div class="val" id="m-warm">~0.75s</div><div class="lbl">warm query (2nd+)</div></div>
+      </div>
+    </section>
+
+    <section id="pipeline">
+      <h2><span class="num">02</span> Pipeline (click a stage)</h2>
+      <p>This is the exact call sequence for <code>search_messages</code>, shared verbatim by both the
+      live MCP server (<code>seaglass/mcp_server.py</code>) and the eval harness
+      (<code>seaglass/eval/score.py</code>) — the eval always exercises the real filter/query-parsing
+      layer, never a bypass straight to the index.</p>
+      <svg id="pipeline-diagram" width="100%" viewBox="0 0 980 190" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="arrowhead" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+            <path d="M0,0 L6,3 L0,6 Z" fill="var(--muted)"></path>
+          </marker>
+        </defs>
+      </svg>
+      <div id="stage-detail">
+        <em style="color:var(--muted)">Click a stage above for details, or use ← / → keys.</em>
+      </div>
+    </section>
+
+    <section id="storage">
+      <h2><span class="num">03</span> Storage layer — <code>index.db</code></h2>
+      <p>A single SQLite file holds three cooperating tables per chunk plus two virtual (derived)
+      indexes. No text is ever duplicated between them — full text lives compressed in
+      <code>chunks.body_semantic</code>; the FTS5 index is <em>contentless</em> (inverted index only,
+      no stored copy).</p>
+
+      <div class="toggle-row">
+        <div class="switch" id="schema-toggle"><div class="knob"></div></div>
+        <span id="schema-toggle-label">Show full column comments</span>
+      </div>
+      <div id="schema-tables"></div>
+    </section>
+
+    <section id="query-parse">
+      <h2><span class="num">04</span> Query parsing</h2>
+      <p><code>seaglass/search/parse.py</code> turns a raw natural-language query into a
+      <code>ParsedQuery</code>: a <code>semantic</code> text (fed to the embedder + BM25) plus
+      structured extractions — <code>date_from</code>/<code>date_to</code>, <code>has_media</code>,
+      and <code>people_participant</code> (chat participant handles, resolved via
+      <code>ContactIndex</code>).</p>
+      <table>
+        <tr><th>Pattern</th><th>Extracted as</th><th>Notes</th></tr>
+        <tr><td><code>"last week"</code>, <code>"in march"</code></td><td><code>date_from</code> / <code>date_to</code></td>
+            <td>Ambiguous bare month words ("may", "march") require corroboration (a digit or a second
+            unambiguous date word) before being treated as a date — fixed after an Opus review found
+            "may" alone was falsely triggering date parsing.</td></tr>
+        <tr><td><code>"with Sam"</code>, <code>"from Sam"</code></td><td><code>people_participant</code></td>
+            <td>Case-insensitivity is scoped to just the <code>from|with</code> keyword via inline
+            <code>(?i:...)</code>, not the whole pattern — needed so the capitalized-name heuristic
+            still works.</td></tr>
+        <tr><td><code>"photo"</code>, <code>"pic"</code>, <code>"video"</code></td><td><code>has_media = true</code></td>
+            <td>Maps to the pre-computed <code>chunks.has_attachment</code> column.</td></tr>
+      </table>
+      <div class="callout">
+        <strong>Known simplification:</strong> "from X" (sender) and "with X" (participant) are not
+        yet distinguished — both resolve to the broader "current chat membership" semantics. This can
+        only make results <em>too permissive</em>, never miss a relevant chunk. Documented as a
+        revisit-if-eval-shows-it-hurts-precision item.
+      </div>
+    </section>
+
+    <section id="retrieval">
+      <h2><span class="num">05</span> Hybrid retrieval — dense + sparse, RRF fused</h2>
+      <p><code>seaglass/search/retrieve.py</code> — Phase 4a of the build: a pre-filter followed by
+      two independent candidate-generation paths, fused by Reciprocal Rank Fusion (RRF).</p>
+      <table>
+        <tr><th>Stage</th><th>Mechanism</th><th>Top-K</th></tr>
+        <tr><td>Pre-filter</td><td>SQL predicate over <code>chunks</code> (dates, media, participant chat_ids) — builds a candidate <code>chunk_id</code> set, or <code>None</code> meaning "unconstrained"</td><td>—</td></tr>
+        <tr><td>Dense</td><td><code>sqlite-vec</code> int8 cosine KNN over <code>chunks_vec</code>, constrained to the pre-filter set if present</td><td>200</td></tr>
+        <tr><td>Sparse</td><td>FTS5 BM25 over <code>chunks_fts</code> (porter/unicode61 tokenizer), same constraint</td><td>200</td></tr>
+        <tr><td>Fuse</td><td>Reciprocal Rank Fusion, <code>k=60</code></td><td>50 (<code>FUSED_TOP_K</code>)</td></tr>
+      </table>
+      <div class="callout warn">
+        <strong>Gotcha fixed by review:</strong> FTS5's <code>bm25()</code> returns <em>negative</em>
+        values — best matches sort <strong>ascending</strong>, the opposite of dense-search
+        convention. Any code touching sparse scores directly has to remember this.
+      </div>
+      <div class="callout warn">
+        <strong>Gotcha:</strong> <code>sqlite-vec</code>'s int8 column type will silently
+        misinterpret a bare blob parameter as float32 — every insert/query wraps the vector with
+        <code>vec_int8(...)</code> explicitly.
+      </div>
+    </section>
+
+    <section id="rerank-aggregate">
+      <h2><span class="num">06</span> Rerank + session aggregation</h2>
+      <p><code>seaglass/search/rank.py</code> + <code>rerank.py</code> — Phase 4b, deliberately kept
+      separate from retrieval so the baseline (no rerank) and full pipeline could be evaluated
+      independently against the golden set.</p>
+      <ol>
+        <li><strong>Cross-encoder rerank</strong> (<code>ms-marco-MiniLM-L-12-v2</code>) scores each of
+        the 50 fused candidates against the query text directly (not just embedding similarity),
+        cut to top 12 (<code>RERANK_TOP_K</code>).
+          <span class="badge fixed">BUG fixed: model.eval() was missing → nondeterministic scores across runs</span>
+        </li>
+        <li><strong>Session aggregation</strong> groups the top-12 reranked chunks by
+        <code>(chat_id, local calendar day)</code> — approximating "that day we talked about X" —
+        into up to 8 sessions (<code>MAX_SESSIONS</code>).
+          <span class="badge fixed">BUG fixed: raw cross-encoder logits were summed across a session instead of properly aggregated</span>
+        </li>
+        <li><strong>Expansion</strong> pads each session with ±2 time-adjacent chunks
+        (<code>EXPANSION_RADIUS</code>) for conversational context, even if those chunks weren't
+        independently retrieved.</li>
+      </ol>
+      <div class="callout decision">
+        Day-boundary grouping uses the <strong>local system timezone</strong>, not UTC — a deliberate
+        judgment call since <code>chat.db</code> timestamps carry no stored timezone of their own, and
+        local wall-clock day is the closest approximation to how a person actually remembers a
+        conversation.
+      </div>
+    </section>
+
+    <section id="mcp">
+      <h2><span class="num">07</span> MCP server surface</h2>
+      <p><code>seaglass/mcp_server.py</code> exposes three tools over stdio, single-process, guarded by
+      a global lock (<code>_pipeline_lock</code>) since MLX has no cross-thread safety guarantee, plus
+      a separate <code>_init_lock</code> around all lazy singleton getters (index connection, chat
+      connection, embedding model, reranker, contact index).</p>
+      <table>
+        <tr><th>Tool</th><th>Purpose</th><th>Key params</th></tr>
+        <tr><td><code>search_messages</code></td><td>Ranked, hydrated conversation sessions with message-id citations for a topical/semantic query</td><td><code>query</code>, <code>max_sessions=8</code>, <code>redact=false</code></td></tr>
+        <tr><td><code>get_conversation</code></td><td>Drill-down: raw messages from one <code>chat_id</code>, optionally centered on a timestamp</td><td><code>chat_id</code>, <code>around_ts</code>, <code>limit=50</code></td></tr>
+        <tr><td><code>index_status</code></td><td>Chunk/vector counts, configured DB paths, hydration/contacts availability — lets a caller sanity-check the index before trusting search results</td><td>—</td></tr>
+      </table>
+      <div class="callout fix">
+        <strong>Fixed by review:</strong> <code>get_conversation</code>'s <code>around_ts</code>
+        path previously only ever searched the newest 2000 rows of a chat — drilling into an old
+        thread in a long chat silently returned unrelated recent messages instead. Rewritten to fetch
+        cheap <code>(ROWID, date)</code> pairs for the whole chat, locate the closest position in
+        Python, then fetch just that window by ROWID.
+      </div>
+    </section>
+
+    <section id="grogu-integration">
+      <h2><span class="num">08</span> Grogu integration</h2>
+      <p>Grogu (<code>src/grogu_mcp.py</code> + <code>src/grogu_imessage.py</code>) launches
+      <code>seaglass-mcp</code> as a stdio subprocess per invocation, configured via
+      <code>~/.copilot/mcp-config.json</code>. If seaglass is available,
+      <code>search_via_seaglass</code> is preferred over the legacy SQL <code>LIKE</code> fallback.</p>
+      <div class="callout fix">
+        <strong>Critical fix:</strong> <code>StdioServerParameters(...)</code> was silently dropping
+        the <code>env</code> block from <code>mcp-config.json</code> — meaning <code>SEAGLASS_INDEX_DB</code>
+        / <code>SEAGLASS_CHAT_DB</code> were never actually passed through, no matter what the config
+        said. This broke the entire integration invisibly (it never errored — it just never worked)
+        until this session's Opus review caught it.
+      </div>
+      <p>Other integration fixes: Apple-epoch → unix-seconds normalization on the SQL-fallback date
+      field (previously inconsistent with seaglass's own always-unix-seconds output); requesting
+      seaglass's own default <code>max_sessions=8</code> instead of conflating it with the caller's
+      message <code>limit</code>; and no longer silently dropping <code>context_messages</code> when
+      flattening a seaglass result.</p>
+      <p><strong>Verified end-to-end for the first time this session:</strong> <code>grogu imessage
+      status</code> now reports <code>seaglass: true</code>, and <code>grogu imessage search "lisbon
+      trip"</code> returns genuine seaglass-backed semantic results (not a SQL LIKE fallback) in
+      ~4 seconds.</p>
+    </section>
+
+    <section id="latency">
+      <h2><span class="num">09</span> Measured performance</h2>
+      <p>All numbers below were captured live against the real 17,525-chunk index on this machine
+      (not estimated). Toggle between memory and latency views.</p>
+      <div class="chip-row" id="perf-toggle">
+        <span class="chip active" data-view="latency">Latency</span>
+        <span class="chip" data-view="memory">Memory (RSS)</span>
+      </div>
+      <div id="perf-latency">
+        <table>
+          <tr><th>Scenario</th><th>Time</th><th>Notes</th></tr>
+          <tr><td>Full cold CLI invocation</td><td><strong>~4.0–4.1s</strong></td><td>New process, embedding model + reranker load from scratch, HuggingFace revision-check HTTP calls, then the actual query</td></tr>
+          <tr><td>First query, models already loaded in-process</td><td><strong>~1.8s</strong></td><td>Still pays a one-time MLX kernel-compilation tax even though weights are resident</td></tr>
+          <tr><td>Steady-state query (2nd+)</td><td><strong>~0.3–0.9s</strong> (avg ~0.75s)</td><td>No measurable growth/leak across repeated queries</td></tr>
+        </table>
+        <div class="callout decision">
+          Once warm, queries are <strong>~5–13× faster</strong> than a cold invocation. Nearly all of
+          the ~4s cold cost is process/model-load overhead, not search work itself — a real data point
+          in favor of eventually building the daemon/shim that was deliberately deferred at project
+          start ("eat the startup latency cost at first and see how much it actually is").
+        </div>
+      </div>
+      <div id="perf-memory" style="display:none">
+        <table>
+          <tr><th>Stage</th><th>RSS</th></tr>
+          <tr><td>Interpreter baseline</td><td>~18 MB</td></tr>
+          <tr><td>+ <code>open_index_db()</code> (SQLite connections only)</td><td>~69 MB</td></tr>
+          <tr><td>+ embedding model + reranker loaded, warm, idle</td><td>~300 MB</td></tr>
+          <tr><td>First query executed</td><td>~566 MB (one-time jump)</td></tr>
+          <tr><td>Subsequent queries</td><td>~566–570 MB (flat)</td></tr>
+        </table>
+        <p>Comfortably within normal laptop RAM headroom for a single-invocation CLI tool; worth
+        revisiting if this ever runs as a persistent daemon alongside other MLX-using processes
+        sharing the same unified memory pool.</p>
+      </div>
+    </section>
+
+    <section id="eval">
+      <h2><span class="num">10</span> Evaluation results</h2>
+      <p>Golden set: 32 hand-reviewed queries against real message history, scored by
+      <code>seaglass/eval/score.py</code> — which runs the <em>exact same</em>
+      parse → filter → retrieve → rerank → aggregate pipeline as the live MCP server, so these
+      numbers reflect real end-user behavior, not a shortcut.</p>
+      <div class="chip-row" id="eval-filters"></div>
+      <table id="eval-table">
+        <thead>
+          <tr><th>Category</th><th>n</th><th>recall@50</th><th>recall@12</th><th>recall@final</th><th>gap1</th><th>gap2</th><th>kill</th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <p style="color:var(--muted); font-size:13px;">
+        recall@50 95% Wilson CI: <strong>[0.45, 0.77]</strong> (n=32 — still wide; treat per-category
+        splits as directional only). <code>gap1 = recall@12 − recall@50</code> (rerank loss),
+        <code>gap2 = recall@final − recall@12</code> (aggregation/expansion loss), <code>kill</code> =
+        rate the pre-rerank filter discarded the true positive outright.
+      </p>
+      <div class="callout warn">
+        <strong>Retracted:</strong> an earlier scoring run (documented, then retracted, in
+        <code>ADDENDUM.md</code> §20) reported higher numbers (recall@final 0.62) against a partial
+        3,000-chunk index and a nondeterministic reranker. The numbers above are the honest,
+        reproducible re-score against the full 17,525-chunk index with all Opus-review bugs fixed.
+      </div>
+    </section>
+
+    <section id="bugs">
+      <h2><span class="num">11</span> Opus 5 review — findings & fix status</h2>
+      <p>A deep review pass (separate high-effort agent session, ~90+ tool calls, run-real-experiments
+      methodology) surfaced 12 substantive findings. All bugs and flagged improvements were fixed and
+      regression-tested this project; low-risk nitpicks were explicitly deferred, not silently
+      dropped.</p>
+      <div id="bug-list"></div>
+    </section>
+
+    <section id="cli">
+      <h2><span class="num">12</span> CLI &amp; operational commands</h2>
+      <pre><code># build (or resume) an index from a chat.db snapshot
+python -m seaglass.cli build &lt;chat.db&gt; &lt;index.db&gt;
+
+# ad-hoc search from the terminal (bypasses MCP, same pipeline)
+python -m seaglass.cli search &lt;index.db&gt; "lisbon trip" --chat-db &lt;chat.db&gt;
+
+# score a golden set against a built index
+python -m seaglass.eval.score &lt;index.db&gt; &lt;golden.jsonl&gt; --chat-db &lt;chat.db&gt;
+
+# run as an MCP server (what Grogu launches as a subprocess)
+seaglass-mcp   # entry point: seaglass.mcp_server:main
+  # env: SEAGLASS_INDEX_DB, SEAGLASS_CHAT_DB</code></pre>
+    </section>
+
+  </main>
+</div>
+
+<footer>
+  seaglass architecture reference · generated for internal use · reflects state as of the Opus-5
+  review + fix cycle and v0.1.0 tag · data is embedded at generation time, not fetched live
+</footer>
+
+<script>
+// ---------- Data (embedded; this doc is self-contained / offline) ----------
+const PIPELINE_STAGES = [
+  {
+    id: "parse", label: "Query Parse", sub: "parse.py", x: 20, w: 130,
+    detail: {
+      title: "parse_query(query, contact_index)",
+      file: "seaglass/search/parse.py",
+      body: "Extracts date_from/date_to, has_media, people_participant from raw text into a ParsedQuery; leaves the residual 'semantic' text for embedding + BM25. Ambiguous month words ('may'/'march') require corroboration before being treated as a date filter."
+    }
+  },
+  {
+    id: "filter", label: "Pre-filter", sub: "retrieve.py", x: 175, w: 130,
+    detail: {
+      title: "build_candidate_chunk_ids(index_con, parsed, chat_con)",
+      file: "seaglass/search/retrieve.py",
+      body: "Combines date/media SQL predicates over chunks with a participant filter (resolved to chat_ids via chat_handle_join) into one candidate chunk_id set, or None meaning 'no constraint'. An explicit people filter matching zero chats fails closed (returns empty set), not ignored."
+    }
+  },
+  {
+    id: "dense", label: "Dense KNN", sub: "sqlite-vec int8", x: 330, w: 120,
+    detail: {
+      title: "dense_search(...) — top 200",
+      file: "seaglass/search/retrieve.py",
+      body: "int8 cosine KNN over chunks_vec via sqlite-vec, constrained to the pre-filter set. Query text gets the BGE asymmetric-embedder instruction prefix ('Represent this sentence for searching relevant passages: ') — documents never do."
+    }
+  },
+  {
+    id: "sparse", label: "Sparse BM25", sub: "FTS5", x: 330, w: 120, y: 90,
+    detail: {
+      title: "sparse_search(...) — top 200",
+      file: "seaglass/search/retrieve.py",
+      body: "BM25 over the contentless chunks_fts virtual table (porter/unicode61 tokenizer). bm25() returns negative scores — best matches sort ascending, opposite of the dense-search convention."
+    }
+  },
+  {
+    id: "rrf", label: "RRF Fuse", sub: "k=60, top 50", x: 480, w: 120,
+    detail: {
+      title: "Reciprocal Rank Fusion",
+      file: "seaglass/search/retrieve.py",
+      body: "Combines dense + sparse rankings into one fused list of the top 50 (FUSED_TOP_K) chunk_ids via RRF with k=60. This is 'Phase 4a' — the baseline retriever, deliberately evaluated on its own before rerank/aggregation (Phase 4b) were added."
+    }
+  },
+  {
+    id: "rerank", label: "Cross-Encoder Rerank", sub: "rank.py / rerank.py, top 12", x: 630, w: 150,
+    detail: {
+      title: "rerank_candidates(...)",
+      file: "seaglass/search/rank.py + rerank.py",
+      body: "ms-marco-MiniLM-L-12-v2 cross-encoder scores each of the 50 fused candidates directly against the query, cut to top 12. Fixed bug: model.eval() was missing, causing nondeterministic scores across runs (dropout active at inference time)."
+    }
+  },
+  {
+    id: "aggregate", label: "Session Aggregate + Expand", sub: "rank.py, max 8 sessions", x: 810, w: 150,
+    detail: {
+      title: "aggregate_sessions(...) + expand_sessions(...)",
+      file: "seaglass/search/rank.py",
+      body: "Groups top-12 reranked chunks by (chat_id, local calendar day) into up to 8 sessions, then pads each with ±2 time-adjacent chunks for context. Fixed bug: raw cross-encoder logits were being summed across a session instead of properly aggregated."
+    }
+  }
+];
+
+const BUGS = [
+  {id:"BUG-1/2", title:"Nondeterministic reranker", severity:"critical", status:"fixed",
+   detail:"Missing model.eval() left dropout active at inference — cross-encoder scores (and thus recall numbers) varied run to run. Fixed by calling .eval() after loading; verified two independent full re-scoring runs now produce identical numbers."},
+  {id:"BUG-3", title:"Missing token_type_ids", severity:"high", status:"fixed",
+   detail:"Cross-encoder tokenization omitted token_type_ids, silently degrading query/passage segment distinction quality."},
+  {id:"BUG-4", title:"Chunker overlap bleeds across session gaps", severity:"high", status:"fixed",
+   detail:"The last-N-message overlap carried forward even across a time gap that should have started a fresh chunk boundary, contaminating chunk starts with unrelated prior context. Fixed + 3 new regression tests, one of which specifically checks no chunk has an internal gap over threshold."},
+  {id:"BUG-5", title:"MCP server thread-unsafety", severity:"high", status:"fixed",
+   detail:"Lazy singleton getters (index/chat connections, embedding model, reranker) had no locking; MLX has no cross-thread safety guarantee. Added _init_lock around getters and a _pipeline_lock around the whole search_messages body."},
+  {id:"BUG-6", title:"Grogu drops seaglass env config", severity:"critical", status:"fixed",
+   detail:"StdioServerParameters(...) never passed env= through from mcp-config.json — SEAGLASS_INDEX_DB/SEAGLASS_CHAT_DB were silently ignored no matter what was configured. This broke the entire integration invisibly (no error, just never worked) until this review caught it."},
+  {id:"BUG-7", title:"Grogu date-unit mismatch", severity:"medium", status:"fixed",
+   detail:"Grogu's SQL LIKE fallback returned raw Apple-epoch timestamps inconsistent with seaglass's always-unix-seconds convention. Added the same apple-to-unix heuristic used in seaglass itself."},
+  {id:"BUG-9", title:"get_conversation's 2000-row window bug", severity:"high", status:"fixed",
+   detail:"around_ts only ever searched the newest 2000 messages of a chat — drilling into an old thread in a long chat silently returned unrelated recent messages. Rewritten to search the whole chat cheaply by (ROWID, date) pairs first."},
+  {id:"BUG-10", title:"parse.py regex / ambiguous date false positives", severity:"medium", status:"fixed",
+   detail:"re.IGNORECASE applied to the whole participant pattern broke the capitalized-name heuristic; bare 'may'/'march' were treated as dates with no corroborating evidence. Both fixed + 4 new tests."},
+  {id:"IMPROVEMENT-8", title:"Grogu max_sessions conflation + dropped context_messages", severity:"medium", status:"fixed",
+   detail:"search_via_seaglass passed the caller's message limit straight through as a session count instead of seaglass's own default of 8; context_messages were silently dropped when flattening results even though recall@final counts them."},
+  {id:"IMPROVEMENT-11", title:"Calibration sample size + follow-on OOM", severity:"medium", status:"fixed",
+   detail:"Calibration used only the first chunk instead of a real sample. Fixed to buffer up to 2,000 chunks — which then triggered a new MLX Metal OOM from an unbatched embed() call on the whole buffer; fixed with embed_batch_size=64 chunking."},
+  {id:"IMPROVEMENT-13", title:"Test fragility (recurred twice)", severity:"low", status:"fixed",
+   detail:"Fragile stub/assertions couldn't distinguish 'seaglass succeeded with zero results' from 'seaglass failed'. Fixed once during the main review, then recurred for real the moment a genuine ~/.copilot/mcp-config.json was created for end-to-end testing — fixed again by isolating the test behind a temp COPILOT_HOME."},
+  {id:"IMPROVEMENT-12", title:"Eval-harness correctness details", severity:"low", status:"deferred",
+   detail:"positive_msg_ids inflation via chunk overlap in score.py's _chunks_containing, missing empty-positives guard, ghcp_client docstring/error-handling gaps. Documented, not yet fixed."},
+  {id:"N1-N12", title:"Cosmetic nitpicks", severity:"low", status:"deferred",
+   detail:"render.py's >26-participant letter rollover, contacts.py's inconsistent fuzzy threshold constant, unused exifread dependency, unpinned mcp SDK version, stray U+FFFC in MCP payload text, and others. Explicitly deferred given time constraints, not hidden."}
+];
+
+const EVAL_ROWS = [
+  {cat:"exact_string", n:1, r50:1.00, r12:1.00, rfin:0.00, gap1:0.00, gap2:-1.00, kill:0.00},
+  {cat:"media_geo", n:19, r50:0.63, r12:0.47, rfin:0.47, gap1:-0.16, gap2:0.00, kill:0.00},
+  {cat:"person_filtered", n:5, r50:0.40, r12:0.40, rfin:0.20, gap1:0.00, gap2:-0.20, kill:0.00},
+  {cat:"time_filtered", n:6, r50:0.67, r12:0.50, rfin:0.33, gap1:-0.17, gap2:-0.17, kill:0.17},
+  {cat:"topical", n:1, r50:1.00, r12:1.00, rfin:1.00, gap1:0.00, gap2:0.00, kill:0.00},
+  {cat:"OVERALL", n:32, r50:0.62, r12:0.50, rfin:0.41, gap1:-0.12, gap2:-0.09, kill:0.03, overall:true}
+];
+
+const SCHEMA_TABLES = [
+  {
+    name: "chunks", kind: "table",
+    cols: [
+      ["id", "INTEGER PK AUTOINCREMENT", "rowid coupling — see PLAN.md §5"],
+      ["chat_id", "INTEGER NOT NULL", "→ chat.db chat.ROWID"],
+      ["start_ts / end_ts", "INTEGER NOT NULL", "unix seconds; the ONLY date mechanism in the schema"],
+      ["has_attachment", "INTEGER", "media pre-filter, avoids a join at query time"],
+      ["body_semantic", "BLOB", "zstd-compressed; format_semantic() output — the only place full chunk text lives"]
+    ]
+  },
+  {
+    name: "chunk_message", kind: "table (WITHOUT ROWID)",
+    cols: [
+      ["msg_id", "INTEGER NOT NULL", "→ chat.db message.ROWID"],
+      ["chunk_id", "INTEGER NOT NULL", "PRIMARY KEY (msg_id, chunk_id)"],
+      ["—", "—", "THE membership relation — explicit and exact. Never derive membership from a ROWID range: message.ROWID is global and chronological across ALL chats, not per-chat."]
+    ]
+  },
+  {
+    name: "chunks_fts", kind: "virtual table (FTS5)",
+    cols: [
+      ["body", "TEXT (contentless)", "content='' + contentless_delete=1 — no copy of any text lives here, only the inverted index"],
+      ["tokenize", "porter unicode61", "stemming + unicode-aware tokenization"]
+    ]
+  },
+  {
+    name: "chunks_vec", kind: "virtual table (sqlite-vec vec0)",
+    cols: [
+      ["embedding", "int8[384], cosine", "⚠️ always wrap inserted/queried vectors with vec_int8(...) — a bare blob is ambiguously read as float32"]
+    ]
+  },
+  {
+    name: "eval_candidate / attachment_place / attachment_retry / meta", kind: "support tables",
+    cols: [
+      ["eval_candidate", "—", "golden-set harvesting scratch space; droppable once golden.jsonl exists"],
+      ["attachment_place", "—", "reverse-geocoded place names per attachment; NOT freely rebuildable, needs original attachment files on disk"],
+      ["attachment_retry / meta", "—", "iCloud-offloading retry queue / build bookkeeping key-value store"]
+    ]
+  }
+];
+
+// ---------- Table of contents (auto-built) ----------
+const sections = document.querySelectorAll("main section");
+const toc = document.getElementById("toc");
+sections.forEach(s => {
+  const h2 = s.querySelector("h2");
+  if (!h2) return;
+  const label = h2.textContent.replace(/^\d+\s*/, "").trim();
+  const a = document.createElement("a");
+  a.href = "#" + s.id;
+  a.textContent = label;
+  a.dataset.target = s.id;
+  toc.appendChild(a);
+});
+const tocLinks = toc.querySelectorAll("a");
+const observer = new IntersectionObserver((entries) => {
+  entries.forEach(entry => {
+    const link = toc.querySelector(`a[data-target="${entry.target.id}"]`);
+    if (!link) return;
+    if (entry.isIntersecting) {
+      tocLinks.forEach(l => l.classList.remove("active"));
+      link.classList.add("active");
+    }
+  });
+}, { rootMargin: "-20% 0px -70% 0px" });
+sections.forEach(s => observer.observe(s));
+
+// ---------- Pipeline diagram (SVG, built + interactive) ----------
+const svg = document.getElementById("pipeline-diagram");
+const NS = "http://www.w3.org/2000/svg";
+const detailPane = document.getElementById("stage-detail");
+let activeStage = null;
+
+function drawArrow(x1, y1, x2, y2) {
+  const path = document.createElementNS(NS, "path");
+  const midX = (x1 + x2) / 2;
+  path.setAttribute("d", `M${x1},${y1} C${midX},${y1} ${midX},${y2} ${x2},${y2}`);
+  path.setAttribute("class", "flow-arrow");
+  svg.appendChild(path);
+}
+
+function stageCenter(stage) {
+  const y = (stage.y || 0) + 45;
+  return { x: stage.x + stage.w, y: y + 20, xIn: stage.x, y0: y };
+}
+
+PIPELINE_STAGES.forEach((stage, i) => {
+  const y = (stage.y || 0) + 20;
+  const g = document.createElementNS(NS, "g");
+  const rect = document.createElementNS(NS, "rect");
+  rect.setAttribute("x", stage.x);
+  rect.setAttribute("y", y);
+  rect.setAttribute("width", stage.w);
+  rect.setAttribute("height", 46);
+  rect.setAttribute("class", "stage-box");
+  rect.dataset.id = stage.id;
+  g.appendChild(rect);
+
+  const label = document.createElementNS(NS, "text");
+  label.setAttribute("x", stage.x + stage.w / 2);
+  label.setAttribute("y", y + 20);
+  label.setAttribute("text-anchor", "middle");
+  label.setAttribute("class", "stage-label");
+  label.textContent = stage.label;
+  g.appendChild(label);
+
+  const sub = document.createElementNS(NS, "text");
+  sub.setAttribute("x", stage.x + stage.w / 2);
+  sub.setAttribute("y", y + 35);
+  sub.setAttribute("text-anchor", "middle");
+  sub.setAttribute("class", "stage-sub");
+  sub.textContent = stage.sub;
+  g.appendChild(sub);
+
+  g.style.cursor = "pointer";
+  g.addEventListener("click", () => selectStage(stage.id));
+  svg.appendChild(g);
+});
+
+// arrows: parse->filter->dense/sparse->rrf->rerank->aggregate
+drawArrow(150, 43, 175, 43);
+drawArrow(305, 43, 330, 43);
+drawArrow(305, 43, 330, 133);
+drawArrow(450, 43, 480, 43);
+drawArrow(450, 133, 480, 55);
+drawArrow(600, 43, 630, 43);
+drawArrow(780, 43, 810, 43);
+
+function selectStage(id) {
+  activeStage = id;
+  document.querySelectorAll(".stage-box").forEach(r => {
+    r.classList.toggle("active", r.dataset.id === id);
+  });
+  const stage = PIPELINE_STAGES.find(s => s.id === id);
+  detailPane.innerHTML = `<h4>${stage.detail.title}</h4><div class="file">${stage.detail.file}</div><p style="margin:8px 0 0;">${stage.detail.body}</p>`;
+}
+selectStage(PIPELINE_STAGES[0].id);
+
+document.addEventListener("keydown", (e) => {
+  if (!document.getElementById("pipeline").getBoundingClientRect().top < window.innerHeight) return;
+  const idx = PIPELINE_STAGES.findIndex(s => s.id === activeStage);
+  if (e.key === "ArrowRight" && idx < PIPELINE_STAGES.length - 1) selectStage(PIPELINE_STAGES[idx + 1].id);
+  if (e.key === "ArrowLeft" && idx > 0) selectStage(PIPELINE_STAGES[idx - 1].id);
+});
+
+// ---------- Schema tables (dynamic, toggle comment verbosity) ----------
+const schemaContainer = document.getElementById("schema-tables");
+let showComments = true;
+function renderSchema() {
+  schemaContainer.innerHTML = "";
+  SCHEMA_TABLES.forEach(t => {
+    const h3 = document.createElement("h3");
+    h3.innerHTML = `${t.name} <span class="badge">${t.kind}</span>`;
+    schemaContainer.appendChild(h3);
+    const table = document.createElement("table");
+    const thead = document.createElement("tr");
+    thead.innerHTML = showComments ? "<th>Column</th><th>Type</th><th>Notes</th>" : "<th>Column</th><th>Type</th>";
+    table.appendChild(thead);
+    t.cols.forEach(c => {
+      const tr = document.createElement("tr");
+      tr.innerHTML = showComments ? `<td><code>${c[0]}</code></td><td>${c[1]}</td><td>${c[2]}</td>` : `<td><code>${c[0]}</code></td><td>${c[1]}</td>`;
+      table.appendChild(tr);
+    });
+    schemaContainer.appendChild(table);
+  });
+}
+renderSchema();
+const schemaToggle = document.getElementById("schema-toggle");
+schemaToggle.classList.add("on");
+schemaToggle.addEventListener("click", () => {
+  showComments = !showComments;
+  schemaToggle.classList.toggle("on", showComments);
+  document.getElementById("schema-toggle-label").textContent = showComments ? "Show full column comments" : "Compact view";
+  renderSchema();
+});
+
+// ---------- Perf view toggle ----------
+document.querySelectorAll("#perf-toggle .chip").forEach(chip => {
+  chip.addEventListener("click", () => {
+    document.querySelectorAll("#perf-toggle .chip").forEach(c => c.classList.remove("active"));
+    chip.classList.add("active");
+    const view = chip.dataset.view;
+    document.getElementById("perf-latency").style.display = view === "latency" ? "block" : "none";
+    document.getElementById("perf-memory").style.display = view === "memory" ? "block" : "none";
+  });
+});
+
+// ---------- Bug list (dynamic, severity-colored) ----------
+const bugList = document.getElementById("bug-list");
+const sevColor = { critical: "var(--danger)", high: "var(--accent3)", medium: "var(--accent)", low: "var(--muted)" };
+BUGS.forEach(b => {
+  const div = document.createElement("div");
+  div.className = "callout" + (b.status === "fixed" ? " fix" : " warn");
+  div.innerHTML = `<strong>${b.id}: ${b.title}</strong>
+    <span class="badge" style="border-color:${sevColor[b.severity]}; color:${sevColor[b.severity]}">${b.severity}</span>
+    <span class="badge ${b.status === 'fixed' ? 'fixed' : 'deferred'}">${b.status}</span>
+    <p style="margin:8px 0 0;">${b.detail}</p>`;
+  bugList.appendChild(div);
+});
+
+// ---------- Eval table (dynamic, filterable) ----------
+const evalFilters = document.getElementById("eval-filters");
+const categories = [...new Set(EVAL_ROWS.map(r => r.cat))];
+let activeCats = new Set(categories);
+categories.forEach(cat => {
+  const chip = document.createElement("span");
+  chip.className = "chip active";
+  chip.textContent = cat;
+  chip.dataset.cat = cat;
+  chip.addEventListener("click", () => {
+    if (activeCats.has(cat)) { activeCats.delete(cat); chip.classList.remove("active"); }
+    else { activeCats.add(cat); chip.classList.add("active"); }
+    renderEvalTable();
+  });
+  evalFilters.appendChild(chip);
+});
+
+function barCell(val) {
+  const pct = Math.max(0, Math.min(1, val)) * 100;
+  return `<div style="display:flex; align-items:center; gap:8px;">
+    <span style="width:34px; font-family:var(--mono);">${val.toFixed(2)}</span>
+    <span class="bar-track" style="flex:1"><span class="bar-fill" style="width:${pct}%"></span></span>
+  </div>`;
+}
+
+function renderEvalTable() {
+  const tbody = document.querySelector("#eval-table tbody");
+  tbody.innerHTML = "";
+  EVAL_ROWS.forEach(r => {
+    const tr = document.createElement("tr");
+    if (!activeCats.has(r.cat)) tr.classList.add("hidden");
+    if (r.overall) tr.style.fontWeight = "700";
+    const gapColor = v => v < 0 ? "color:var(--danger)" : "color:var(--muted)";
+    tr.innerHTML = `<td>${r.cat}</td><td>${r.n}</td>
+      <td>${barCell(r.r50)}</td><td>${barCell(r.r12)}</td><td>${barCell(r.rfin)}</td>
+      <td style="${gapColor(r.gap1)}">${r.gap1.toFixed(2)}</td>
+      <td style="${gapColor(r.gap2)}">${r.gap2.toFixed(2)}</td>
+      <td>${r.kill.toFixed(2)}</td>`;
+    tbody.appendChild(tr);
+  });
+}
+renderEvalTable();
+</script>
+</body>
+</html>
