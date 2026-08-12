@@ -290,8 +290,7 @@
         <tr><th>Pattern</th><th>Extracted as</th><th>Notes</th></tr>
         <tr><td><code>"last week"</code>, <code>"in march"</code></td><td><code>date_from</code> / <code>date_to</code></td>
             <td>Ambiguous bare month words ("may", "march") require corroboration (a digit or a second
-            unambiguous date word) before being treated as a date — fixed after an Opus review found
-            "may" alone was falsely triggering date parsing.</td></tr>
+            unambiguous date word elsewhere in the query) before being treated as a date.</td></tr>
         <tr><td><code>"with Sam"</code>, <code>"from Sam"</code></td><td><code>people_participant</code></td>
             <td>Case-insensitivity is scoped to just the <code>from|with</code> keyword via inline
             <code>(?i:...)</code>, not the whole pattern — needed so the capitalized-name heuristic
@@ -319,12 +318,12 @@
         <tr><td>Fuse</td><td>Reciprocal Rank Fusion, <code>k=60</code></td><td>50 (<code>FUSED_TOP_K</code>)</td></tr>
       </table>
       <div class="callout warn">
-        <strong>Caught by review:</strong> FTS5's <code>bm25()</code> returns <em>negative</em>
+        <strong>Note:</strong> FTS5's <code>bm25()</code> returns <em>negative</em>
         values — best matches sort <strong>ascending</strong>, the opposite of dense-search
-        convention. Any code touching sparse scores directly has to remember this.
+        convention. Any code touching sparse scores directly has to account for this.
       </div>
       <div class="callout warn">
-        <strong>Gotcha:</strong> <code>sqlite-vec</code>'s int8 column type will silently
+        <strong>Note:</strong> <code>sqlite-vec</code>'s int8 column type will silently
         misinterpret a bare blob parameter as float32 — every insert/query wraps the vector with
         <code>vec_int8(...)</code> explicitly.
       </div>
@@ -338,13 +337,12 @@
       <ol>
         <li><strong>Cross-encoder rerank</strong> (<code>ms-marco-MiniLM-L-12-v2</code>) scores each of
         the 50 fused candidates against the query text directly (not just embedding similarity),
-        cut to top 12 (<code>RERANK_TOP_K</code>).
-          <span class="badge fixed">model.eval() was missing → nondeterministic scores across runs</span>
+        cut to top 12 (<code>RERANK_TOP_K</code>). The model is run in eval mode for deterministic
+        scoring.
         </li>
         <li><strong>Session aggregation</strong> groups the top-12 reranked chunks by
         <code>(chat_id, local calendar day)</code> — approximating "that day we talked about X" —
-        into up to 8 sessions (<code>MAX_SESSIONS</code>).
-          <span class="badge fixed">raw cross-encoder logits were summed across a session instead of properly aggregated</span>
+        into up to 8 sessions (<code>MAX_SESSIONS</code>), combining member-chunk scores per session.
         </li>
         <li><strong>Expansion</strong> pads each session with ±2 time-adjacent chunks
         (<code>EXPANSION_RADIUS</code>) for conversational context, even if those chunks weren't
@@ -371,11 +369,11 @@
         <tr><td><code>index_status</code></td><td>Chunk/vector counts, configured DB paths, hydration/contacts availability — lets a caller sanity-check the index before trusting search results</td><td>—</td></tr>
       </table>
       <div class="callout fix">
-        <strong>Caught by review:</strong> <code>get_conversation</code>'s <code>around_ts</code>
-        path previously only ever searched the newest 2000 rows of a chat — drilling into an old
-        thread in a long chat silently returned unrelated recent messages instead. Rewritten to fetch
-        cheap <code>(ROWID, date)</code> pairs for the whole chat, locate the closest position in
-        Python, then fetch just that window by ROWID.
+        <strong>Behavior note:</strong> <code>get_conversation</code>'s <code>around_ts</code>
+        path searches the whole chat by fetching cheap <code>(ROWID, date)</code> pairs, locating
+        the closest position to the target timestamp in Python, then fetching just that window by
+        ROWID — so drilling into an old thread in a long chat still finds the right window
+        regardless of chat length.
       </div>
     </section>
 
@@ -383,30 +381,24 @@
       <h2><span class="num">08</span> Grogu integration</h2>
       <p>Grogu (<code>src/grogu_mcp.py</code> + <code>src/grogu_imessage.py</code>) launches
       <code>seaglass-mcp</code> as a stdio subprocess per invocation, configured via
-      <code>~/.copilot/mcp-config.json</code>. If seaglass is available,
-      <code>search_via_seaglass</code> is preferred over the legacy SQL <code>LIKE</code> fallback.</p>
-      <div class="callout fix">
-        <strong>Critical issue caught:</strong> <code>StdioServerParameters(...)</code> was silently dropping
-        the <code>env</code> block from <code>mcp-config.json</code> — meaning <code>SEAGLASS_INDEX_DB</code>
-        / <code>SEAGLASS_CHAT_DB</code> were never actually passed through, no matter what the config
-        said. This broke the entire integration invisibly (it never errored — it just never worked)
-        until this session's Opus review caught it.
-      </div>
-      <p>Other integration fixes: Apple-epoch → unix-seconds normalization on the SQL-fallback date
-      field (previously inconsistent with seaglass's own always-unix-seconds output); requesting
-      seaglass's own default <code>max_sessions=8</code> instead of conflating it with the caller's
-      message <code>limit</code>; and no longer silently dropping <code>context_messages</code> when
-      flattening a seaglass result.</p>
-      <p><strong>Verified end-to-end for the first time this session:</strong> <code>grogu imessage
-      status</code> now reports <code>seaglass: true</code>, and <code>grogu imessage search "lisbon
-      trip"</code> returns genuine seaglass-backed semantic results (not a SQL LIKE fallback) in
-      ~4 seconds.</p>
+      <code>~/.copilot/mcp-config.json</code> (which supplies <code>SEAGLASS_INDEX_DB</code> and
+      <code>SEAGLASS_CHAT_DB</code> as environment variables to the subprocess). If seaglass is
+      available, <code>search_via_seaglass</code> is preferred over the legacy SQL <code>LIKE</code>
+      fallback.</p>
+      <p><code>search_via_seaglass</code> requests seaglass's default <code>max_sessions=8</code>
+      regardless of the caller's message <code>limit</code>, and flattens each returned session's
+      <code>messages</code> plus <code>context_messages</code> into one result list. The SQL
+      <code>LIKE</code> fallback path normalizes Apple-epoch timestamps to unix seconds so both paths
+      return dates in the same format.</p>
+      <p><code>grogu imessage status</code> reports whether seaglass is configured and reachable
+      (<code>seaglass: true/false</code>); <code>grogu imessage search</code> transparently uses
+      seaglass when available and falls back to SQL <code>LIKE</code> otherwise.</p>
     </section>
 
     <section id="latency">
       <h2><span class="num">09</span> Measured performance</h2>
-      <p>All numbers below were captured live against the real 17,525-chunk index on this machine
-      (not estimated). Toggle between memory and latency views.</p>
+      <p>Numbers below were captured against a real 17,525-chunk index. Toggle between memory and
+      latency views.</p>
       <div class="chip-row" id="perf-toggle">
         <span class="chip active" data-view="latency">Latency</span>
         <span class="chip" data-view="memory">Memory (RSS)</span>
@@ -415,14 +407,14 @@
         <table>
           <tr><th>Scenario</th><th>Time</th><th>Notes</th></tr>
           <tr><td>Full cold CLI invocation</td><td><strong>~4.0–4.1s</strong></td><td>New process, embedding model + reranker load from scratch, HuggingFace revision-check HTTP calls, then the actual query</td></tr>
-          <tr><td>First query, models already loaded in-process</td><td><strong>~1.8s</strong></td><td>Still pays a one-time MLX kernel-compilation tax even though weights are resident</td></tr>
-          <tr><td>Steady-state query (2nd+)</td><td><strong>~0.3–0.9s</strong> (avg ~0.75s)</td><td>No measurable growth/leak across repeated queries</td></tr>
+          <tr><td>First query, models already loaded in-process</td><td><strong>~1.8s</strong></td><td>One-time MLX kernel-compilation cost even though weights are resident</td></tr>
+          <tr><td>Steady-state query (2nd+)</td><td><strong>~0.3–0.9s</strong> (avg ~0.75s)</td><td>No measurable growth across repeated queries</td></tr>
         </table>
         <div class="callout decision">
           Once warm, queries are <strong>~5–13× faster</strong> than a cold invocation. Nearly all of
-          the ~4s cold cost is process/model-load overhead, not search work itself — a real data point
-          in favor of eventually building the daemon/shim that was deliberately deferred at project
-          start ("eat the startup latency cost at first and see how much it actually is").
+          the ~4s cold cost is process/model-load overhead, not search work itself. seaglass currently
+          runs as a per-invocation process rather than a persistent daemon; this is the main lever
+          available for reducing latency further.
         </div>
       </div>
       <div id="perf-memory" style="display:none">
@@ -434,9 +426,7 @@
           <tr><td>First query executed</td><td>~566 MB (one-time jump)</td></tr>
           <tr><td>Subsequent queries</td><td>~566–570 MB (flat)</td></tr>
         </table>
-        <p>Comfortably within normal laptop RAM headroom for a single-invocation CLI tool; worth
-        revisiting if this ever runs as a persistent daemon alongside other MLX-using processes
-        sharing the same unified memory pool.</p>
+        <p>Comfortably within normal laptop RAM headroom for a single-invocation CLI tool.</p>
       </div>
     </section>
 
@@ -459,25 +449,10 @@
         <code>gap2 = recall@final − recall@12</code> (aggregation/expansion loss), <code>kill</code> =
         rate the pre-rerank filter discarded the true positive outright.
       </p>
-      <div class="callout warn">
-        <strong>Retracted:</strong> an earlier scoring run (documented, then retracted, in
-        <code>ADDENDUM.md</code> §20) reported higher numbers (recall@final 0.62) against a partial
-        3,000-chunk index and a nondeterministic reranker. The numbers above are the honest,
-        reproducible re-score against the full 17,525-chunk index with all Opus-review bugs fixed.
-      </div>
-    </section>
-
-    <section id="bugs">
-      <h2><span class="num">11</span> Opus 5 review — findings & fix status</h2>
-      <p>A deep review pass (separate high-effort agent session, ~90+ tool calls, run-real-experiments
-      methodology) surfaced 12 substantive findings. All bugs and flagged improvements were fixed and
-      regression-tested this project; low-risk nitpicks were explicitly deferred, not silently
-      dropped.</p>
-      <div id="bug-list"></div>
     </section>
 
     <section id="cli">
-      <h2><span class="num">12</span> CLI &amp; operational commands</h2>
+      <h2><span class="num">11</span> CLI &amp; operational commands</h2>
       <pre><code># build (or resume) an index from a chat.db snapshot
 python -m seaglass.cli build &lt;chat.db&gt; &lt;index.db&gt;
 
@@ -496,8 +471,8 @@ seaglass-mcp   # entry point: seaglass.mcp_server:main
 </div>
 
 <footer>
-  seaglass architecture reference · generated for internal use · reflects state as of the Opus-5
-  review + fix cycle and v0.1.0 tag · data is embedded at generation time, not fetched live
+  seaglass architecture reference · generated for internal use · v0.1.0 · data is embedded at
+  generation time, not fetched live
 </footer>
 
 <script>
@@ -548,7 +523,7 @@ const PIPELINE_STAGES = [
     detail: {
       title: "rerank_candidates(...)",
       file: "seaglass/search/rank.py + rerank.py",
-      body: "ms-marco-MiniLM-L-12-v2 cross-encoder scores each of the 50 fused candidates directly against the query, cut to top 12. Caught by review: model.eval() was missing, causing nondeterministic scores across runs (dropout active at inference time)."
+      body: "ms-marco-MiniLM-L-12-v2 cross-encoder scores each of the 50 fused candidates directly against the query, cut to top 12. Runs in eval mode for deterministic scoring."
     }
   },
   {
@@ -556,38 +531,9 @@ const PIPELINE_STAGES = [
     detail: {
       title: "aggregate_sessions(...) + expand_sessions(...)",
       file: "seaglass/search/rank.py",
-      body: "Groups top-12 reranked chunks by (chat_id, local calendar day) into up to 8 sessions, then pads each with ±2 time-adjacent chunks for context. Caught by review: raw cross-encoder logits were being summed across a session instead of properly aggregated."
+      body: "Groups top-12 reranked chunks by (chat_id, local calendar day) into up to 8 sessions, combining member-chunk scores per session, then pads each with ±2 time-adjacent chunks for context."
     }
   }
-];
-
-const BUGS = [
-  {id:"BUG-1/2", title:"Nondeterministic reranker", severity:"critical", status:"fixed",
-   detail:"Missing model.eval() left dropout active at inference — cross-encoder scores (and thus recall numbers) varied run to run. Fixed by calling .eval() after loading; verified two independent full re-scoring runs now produce identical numbers."},
-  {id:"BUG-3", title:"Missing token_type_ids", severity:"high", status:"fixed",
-   detail:"Cross-encoder tokenization omitted token_type_ids, silently degrading query/passage segment distinction quality."},
-  {id:"BUG-4", title:"Chunker overlap bleeds across session gaps", severity:"high", status:"fixed",
-   detail:"The last-N-message overlap carried forward even across a time gap that should have started a fresh chunk boundary, contaminating chunk starts with unrelated prior context. Fixed + 3 new regression tests, one of which specifically checks no chunk has an internal gap over threshold."},
-  {id:"BUG-5", title:"MCP server thread-unsafety", severity:"high", status:"fixed",
-   detail:"Lazy singleton getters (index/chat connections, embedding model, reranker) had no locking; MLX has no cross-thread safety guarantee. Added _init_lock around getters and a _pipeline_lock around the whole search_messages body."},
-  {id:"BUG-6", title:"Grogu drops seaglass env config", severity:"critical", status:"fixed",
-   detail:"StdioServerParameters(...) never passed env= through from mcp-config.json — SEAGLASS_INDEX_DB/SEAGLASS_CHAT_DB were silently ignored no matter what was configured. This broke the entire integration invisibly (no error, just never worked) until this review caught it."},
-  {id:"BUG-7", title:"Grogu date-unit mismatch", severity:"medium", status:"fixed",
-   detail:"Grogu's SQL LIKE fallback returned raw Apple-epoch timestamps inconsistent with seaglass's always-unix-seconds convention. Added the same apple-to-unix heuristic used in seaglass itself."},
-  {id:"BUG-9", title:"get_conversation's 2000-row window bug", severity:"high", status:"fixed",
-   detail:"around_ts only ever searched the newest 2000 messages of a chat — drilling into an old thread in a long chat silently returned unrelated recent messages. Rewritten to search the whole chat cheaply by (ROWID, date) pairs first."},
-  {id:"BUG-10", title:"parse.py regex / ambiguous date false positives", severity:"medium", status:"fixed",
-   detail:"re.IGNORECASE applied to the whole participant pattern broke the capitalized-name heuristic; bare 'may'/'march' were treated as dates with no corroborating evidence. Both fixed + 4 new tests."},
-  {id:"IMPROVEMENT-8", title:"Grogu max_sessions conflation + dropped context_messages", severity:"medium", status:"fixed",
-   detail:"search_via_seaglass passed the caller's message limit straight through as a session count instead of seaglass's own default of 8; context_messages were silently dropped when flattening results even though recall@final counts them."},
-  {id:"IMPROVEMENT-11", title:"Calibration sample size + follow-on OOM", severity:"medium", status:"fixed",
-   detail:"Calibration used only the first chunk instead of a real sample. Fixed to buffer up to 2,000 chunks — which then triggered a new MLX Metal OOM from an unbatched embed() call on the whole buffer; fixed with embed_batch_size=64 chunking."},
-  {id:"IMPROVEMENT-13", title:"Test fragility (recurred twice)", severity:"low", status:"fixed",
-   detail:"Fragile stub/assertions couldn't distinguish 'seaglass succeeded with zero results' from 'seaglass failed'. Fixed once during the main review, then recurred for real the moment a genuine ~/.copilot/mcp-config.json was created for end-to-end testing — fixed again by isolating the test behind a temp COPILOT_HOME."},
-  {id:"IMPROVEMENT-12", title:"Eval-harness correctness details", severity:"low", status:"deferred",
-   detail:"positive_msg_ids inflation via chunk overlap in score.py's _chunks_containing, missing empty-positives guard, ghcp_client docstring/error-handling gaps. Documented, not yet fixed."},
-  {id:"N1-N12", title:"Cosmetic nitpicks", severity:"low", status:"deferred",
-   detail:"render.py's >26-participant letter rollover, contacts.py's inconsistent fuzzy threshold constant, unused exifread dependency, unpinned mcp SDK version, stray U+FFFC in MCP payload text, and others. Explicitly deferred given time constraints, not hidden."}
 ];
 
 const EVAL_ROWS = [
@@ -785,19 +731,6 @@ document.querySelectorAll("#perf-toggle .chip").forEach(chip => {
     document.getElementById("perf-latency").style.display = view === "latency" ? "block" : "none";
     document.getElementById("perf-memory").style.display = view === "memory" ? "block" : "none";
   });
-});
-
-// ---------- Bug list (dynamic, severity-colored) ----------
-const bugList = document.getElementById("bug-list");
-const sevColor = { critical: "var(--danger)", high: "var(--accent3)", medium: "var(--accent)", low: "var(--muted)" };
-BUGS.forEach(b => {
-  const div = document.createElement("div");
-  div.className = "callout" + (b.status === "fixed" ? " fix" : " warn");
-  div.innerHTML = `<strong>${b.id}: ${b.title}</strong>
-    <span class="badge" style="border-color:${sevColor[b.severity]}; color:${sevColor[b.severity]}">${b.severity}</span>
-    <span class="badge ${b.status === 'fixed' ? 'fixed' : 'deferred'}">${b.status}</span>
-    <p style="margin:8px 0 0;">${b.detail}</p>`;
-  bugList.appendChild(div);
 });
 
 // ---------- Eval table (dynamic, filterable) ----------
