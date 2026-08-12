@@ -6,7 +6,11 @@ I've read the full pipeline, the architecture doc, and verified key facts agains
 
 ## 1. Technology choice for the app shell
 
-**Recommendation: a single Python process running FastAPI + uvicorn on `127.0.0.1`, serving a dependency-free static HTML/CSS/JS frontend, opened in the user's default browser. Optionally wrapped later in `pywebview` for a real window — but not in v1.**
+**Revised recommendation (superseding the original v1 call below): a single Python process running FastAPI + uvicorn on `127.0.0.1`, serving a dependency-free static HTML/CSS/JS frontend, rendered inside a native `pywebview` window from v1 — not a browser tab.**
+
+A browser-tab launcher was the original v1 plan (see the now-superseded reasoning immediately below), but a plain browser tab doesn't feel like an app: it has a URL bar, lives among the user's other tabs, has no Dock icon/identity of its own, and `Cmd+W` closes it like any other tab. Verified live on this machine (Python 3.14.6, Apple Silicon, venv): `pip install pywebview pyobjc-framework-WebKit pyobjc-framework-Cocoa` succeeds, and a smoke test (`webview.create_window(...)` + `webview.start()` against a local HTTP server) opens a real native `WKWebView` window with no URL bar and exits cleanly — `pywebview==6.2.1` works with no caveats found. This retires R7's "unverified on 3.14.6" risk below.
+
+Electron and WebView2 were also considered and rejected: Electron bundles an entire separate Node/Chromium runtime (~150-200 MB) purely to do what `pywebview` already does natively in ~2 extra dependencies, with none of Electron's actual differentiators (its own extension APIs, cross-platform packaging for Windows/Linux) mattering for a macOS-only, single-user Python tool. WebView2 is a Windows-only API (Edge/Chromium embedding) and doesn't apply on macOS at all — `WKWebView` (which `pywebview` wraps) is the macOS equivalent. A PWA was also considered: it would need zero new Python dependencies and macOS 17+/Chrome do support "install as app" windowing, but the app is still owned by the browser engine's process/update/permissions model rather than a process this tool controls, and "install to Dock" is an extra manual step with its own first-run friction for a personal, single-install tool — `pywebview` gets the same windowed, no-chrome result with less user-facing ceremony.
 
 ### Why this and not the alternatives
 
@@ -15,9 +19,9 @@ I've read the full pipeline, the architecture doc, and verified key facts agains
 | **(a) SwiftUI shell + Python subprocess over socket/stdio** | **Reject** | Requires inventing and versioning an IPC protocol, then re-implementing every UI-facing model (sessions, hydrated messages, contacts) in Swift. Two languages, two build systems, Xcode, code-signing, and entitlements for Full Disk Access *in the Swift app* on top of the Python process that also needs it. For a solo hobbyist whose AI pair is a CLI agent operating on a Python repo, this triples the surface area for zero retrieval-quality gain. The "native feel" this buys is a menu-bar icon and an NSWindow — not worth it. |
 | **(b) PyQt6/PySide6 single-process GUI** | **Reject** | Genuinely viable and it *is* one process holding warm models. But: adds a ~100 MB binary dependency to a venv that currently has zero GUI deps; PyQt6 is GPL/commercial-licensed (PySide6 LGPL is the saner pick if you go this way); building a chip-based person autocomplete, a date range picker, and a rich results list in Qt widgets is materially slower than in HTML; and you must be careful to keep MLX work off the Qt event loop thread anyway, so you end up with the same worker-thread design as (c) plus a heavier toolkit. Long-term it's the best "real .app" story, which is why I'd revisit it only if the browser UX genuinely grates. |
 | **(c) FastAPI + static HTML/JS in browser** | **✅ Recommend** | **Zero new dependencies.** `fastapi 0.141.1`, `uvicorn 0.52.1`, `starlette 1.6.0`, `sse-starlette 3.4.8`, `jinja2 3.1.6` are already installed in `.venv` as transitive deps of `mcp 2.0.0`. The whole pipeline stays in-process — `EmbeddingModel`, `CrossEncoderReranker`, `ContactIndex`, and both SQLite connections are plain module globals exactly as in `mcp_server.py`, no re-implementation anywhere. HTML gives you a chips autocomplete, `<input type="date">`, and a scrollable session list essentially for free. Packaging is `pip install -e .` + a console script — the same thing that already works for `seaglass-mcp`. Full Disk Access is inherited from the terminal/venv that already has it. |
-| **(d) `pywebview` native window** | **Defer to v1.5** | It's a strict superset of (c): the same FastAPI backend, but rendered inside a WKWebView window instead of a browser tab. `pyobjc-core` and `pyobjc-framework-Cocoa` are already installed; `pywebview` on macOS additionally wants `pyobjc-framework-WebKit`. Because it's purely a *shell swap* over the same HTTP API, adopting it later costs ~30 lines. Doing it in v1 adds an untested dependency to the critical path of "get something working." |
+| **(d) `pywebview` native window** | **✅ Promoted to v1** | It's a strict superset of (c): the same FastAPI backend, but rendered inside a WKWebView window instead of a browser tab. Verified live on this machine: `pywebview==6.2.1` + `pyobjc-framework-WebKit` install and run cleanly on Python 3.14.6 (a real native window opened against a local HTTP server, no crashes, clean shutdown). Because it's purely a *shell swap* over the same HTTP API, this changes nothing about the backend design in §2-§7 below — only `__main__.py`'s launcher swaps `webbrowser.open(url)` for `webview.create_window(...)` + `webview.start()`. |
 
-**Decisive call: build (c), structured so (d) is a 30-line addition.** All UI logic lives behind HTTP; the shell (browser tab vs. pywebview window vs. eventually a py2app bundle) is a swappable launcher concern.
+**Decisive call: build (c)'s FastAPI/HTML backend exactly as designed, with (d) `pywebview` as the v1 shell instead of a browser tab.** All UI logic lives behind HTTP; only the launcher differs. A plain-browser-tab fallback (`--browser` flag) is trivial to keep for headless/debug use (e.g. inspecting the page with browser devtools during development) but is not the default user-facing launch path.
 
 ### One important consequence: localhost is not a security boundary
 
@@ -50,18 +54,22 @@ Be honest about each component, because "load the index into memory" means four 
 
 ### 2.2 Startup sequence — and how the frontend sees it
 
-**Critical design decision: do NOT warm before uvicorn accepts connections.** If the HTTP server isn't listening, the browser gets `ERR_CONNECTION_REFUSED` and you cannot render a loading screen at all — the requirement is that the user *sees and feels* the load. So:
+**Critical design decision: do NOT warm before uvicorn accepts connections.** If the HTTP server isn't listening, the window gets a connection-refused error and you cannot render a loading screen at all — the requirement is that the user *sees and feels* the load. So:
 
 ```
 launcher (seaglass/app/__main__.py)
  ├─ read config (env + ~/.seaglass/config.json), resolve index.db / chat.db paths
  ├─ acquire single-instance lock (~/.seaglass/app.lock: {pid, port, token})
- │     └─ if a live instance exists → just open its URL in the browser and exit
+ │     └─ if a live instance exists → just focus/open its window and exit
  ├─ pick port (default 8765, scan upward), mint auth token, write lockfile
- ├─ start uvicorn in a thread  ────────────────► serving IMMEDIATELY, state=STARTING
+ ├─ start uvicorn in a background thread  ─────► serving IMMEDIATELY, state=STARTING
  ├─ start warmup on a dedicated single worker thread (the same thread that will
  │  later execute every search — see 2.3)
- └─ webbrowser.open(f"http://127.0.0.1:{port}/#{token}")
+ └─ on the MAIN thread: webview.create_window("seaglass", f"http://127.0.0.1:{port}/#{token}")
+    followed by webview.start() — pywebview requires window creation/event loop to
+    own the main thread on macOS, so uvicorn and warmup must already be running in
+    background threads by this point, not the other way around. A `--browser` flag
+    swaps this last step for `webbrowser.open(...)` instead, for headless/devtools use.
 ```
 
 The frontend loads instantly, polls `GET /api/health` every 250 ms, and renders a progress screen driven by a real step list. Warmup steps, in order, each publishing `{name, state, elapsed_s}` into a thread-safe `WarmupState`:
@@ -430,11 +438,13 @@ Concrete non-interference guarantees to hold the implementation to:
 seaglass/app/
   __init__.py              Exports SearchEngine, create_app. No side effects, no heavy imports.
   __main__.py              Launcher / `main()` for the `seaglass-app` script. Arg parsing
-                           (--index-db, --chat-db, --port, --no-browser, --assist),
+                           (--index-db, --chat-db, --port, --browser, --assist),
                            config load/merge, single-instance lockfile (~/.seaglass/app.lock:
-                           {pid,port,token}; if a live pid holds it, open that URL and exit),
-                           port selection, token minting, uvicorn thread start, warmup
-                           dispatch, webbrowser.open, SIGINT/SIGTERM cleanup.
+                           {pid,port,token}; if a live pid holds it, focus/reopen its window
+                           and exit), port selection, token minting, uvicorn thread start,
+                           warmup dispatch, pywebview window creation on the main thread
+                           (`webview.create_window` + `webview.start()`; `--browser` swaps
+                           this for `webbrowser.open` instead), SIGINT/SIGTERM cleanup.
   config.py                AppConfig dataclass + load/save for ~/.seaglass/config.json;
                            env-var overrides (SEAGLASS_INDEX_DB, SEAGLASS_CHAT_DB,
                            SEAGLASS_COPILOT_BIN, SEAGLASS_APP_MEMORY_INDEX); path validation
@@ -522,7 +532,7 @@ development-plans/
 
 **R6 — Packaging: punting entirely for now.** v1 is `pip install -e .` + `seaglass-app` (or `python -m seaglass.app`) from the existing venv, which already holds Full Disk Access. **No py2app/PyInstaller, no signing, no notarization.** Rationale: bundling MLX + Metal shaders + PyObjC frameworks + a 600 MB-class HF cache is a substantial project in itself; unsigned .app bundles need Gatekeeper right-click-open; and Full Disk Access / Contacts TCC permissions must be re-granted to the *bundle identity*, silently breaking things in confusing ways. The dev-mode launcher costs one terminal command and sidesteps all of it. Revisit only if the tool is shared with someone else. Middle ground if launching from a terminal grates: a hand-written `~/Applications/seaglass.app` stub containing only an `Info.plist` and a shell script that execs the venv binary — 10 lines, gets a Dock icon, keeps the TCC grants of the underlying binary.
 
-**R7 — pywebview deferral.** Needs `pywebview` + `pyobjc-framework-WebKit` (Cocoa and pyobjc-core are already present). Unverified on Python 3.14.6 — a very new interpreter — and it introduces the standard "webview window owns the main thread while uvicorn runs in a thread" ordering hazard. Deferred to v1.5 precisely because the browser path has zero such unknowns.
+**R7 — pywebview main-thread ownership.** `pywebview` requires its window/event loop to own the main thread on macOS, so `__main__.py` must start uvicorn and warmup in background threads *before* calling `webview.start()` on the main thread — reversing the naive ordering. Dependency compatibility itself is no longer a risk: verified live on this machine that `pywebview==6.2.1` + `pyobjc-framework-WebKit` install and run cleanly on Python 3.14.6 (native window opens against a local HTTP server, closes cleanly, no crashes). A `--browser` flag is kept as an escape hatch (falls back to `webbrowser.open`) for devtools debugging, where pywebview's WKWebView inspector is less convenient than a full browser's.
 
 **R8 — Contacts autocomplete quality.** `ContactIndex.fuzzy_match` is `rapidfuzz.WRatio` over display names with `limit=5` hardcoded. For an autocomplete needing ~10 prefix-friendly suggestions, `WRatio` at threshold 60 may rank oddly (it's a similarity scorer, not a prefix matcher). Likely fix: add a `limit` parameter and, in the app layer, merge a cheap `startswith`/substring pass ahead of the fuzzy results. Minor, but it will need a tuning pass against the real 2,331-handle roster.
 

@@ -29,10 +29,17 @@ dev = [
     "pytest",
     "pytest-cov",
 ]
+app = [
+    "fastapi",
+    "uvicorn",
+    "pywebview",
+    "pyobjc-framework-WebKit",
+]
 
 [project.scripts]
 seaglass = "seaglass.cli:main"
 seaglass-mcp = "seaglass.mcp_server:main"
+seaglass-app = "seaglass.app.__main__:main"
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]
