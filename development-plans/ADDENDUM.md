@@ -307,3 +307,62 @@ exist yet, so `build_index` always passes an empty `places_by_attachment`
 dict to `format_lexical` -- media placeholders currently render bare
 (`[attachment]`) with no place name or filename. Wiring EXIF in only
 changes `build.py`'s inputs to `_render_chunk`, not its structure.
+
+## 12. Phase 4a implemented: query parsing, baseline retrieval, and the "earliest useful checkpoint" CLI
+
+**`search/parse.py`** implements deterministic query parsing per PLAN.md
+§7: `dateparser.search.search_dates` for date ranges, a fixed keyword list
+for media intent ("photo", "video", "attachment", etc.), `rapidfuzz` +
+`ContactIndex.handle_ids_for_names` for people-name extraction, and the
+untouched remainder of the query text as the semantic residual (fail-open
+-- if nothing else parses, the whole query still goes to embedding
+search).
+
+**Real `dateparser` bug found and worked around:** `search_dates` misreads
+the bare word "we" as "Wed[nesday]" (and plausibly other short common
+words similarly collide with weekday/month abbreviations). Fixed with
+`_looks_like_a_real_date_match()`, which only trusts a matched substring
+if it contains a digit or an unambiguous date-vocabulary word (weekday
+names, month names, "today"/"tomorrow"/"ago"/"last"/"next"/"week"/
+"month"/"year"/season names/time-of-day words). Worth remembering for
+any future dateparser use in this codebase.
+
+**`search/retrieve.py`** implements the Phase 4a baseline exactly per
+PLAN.md's 4a/4b split -- pre-filter (date/media/people) -> dense int8 KNN
++ sparse BM25 FTS5, independently -> RRF fusion. No reranker yet (that's
+4b, gated on `search/rerank.py`'s custom cross-encoder loader from §10).
+
+**Known, intentional simplification:** PLAN.md distinguishes "from X"
+(sender-level filter) from "with X" (chat-membership filter), but
+`parse.py`'s people extraction doesn't yet distinguish the two
+prepositions. `retrieve.py` currently applies the broader "with"
+semantics (current `chat_handle_join` membership) to every extracted
+name, uniformly. This is over-permissive, never under-inclusive --
+acceptable for now, to be revisited once the Phase 3.5 golden-set eval
+can actually measure whether it costs precision.
+
+**Validated against real data, end to end.** Built a real (capped, 800
+chunk) index from a fresh snapshot of the live, partially-backfilled
+`chat.db`, then ran real free-text queries ("what time are we meeting
+tonight", "any plans for dinner", "boat") through the full
+parse -> retrieve pipeline. Results were semantically on-target in every
+case (e.g. "any plans for dinner" surfaced actual dinner-planning threads
+ranked above unrelated chat). End-to-end latency including cold MLX model
+load (no daemon, per the user's decision) was ~1.1-1.3s for an 800-chunk
+index -- this will need to be re-measured against the full-size index
+once backfill settles, but confirms the no-daemon starting point is
+viable to *start* with, as intended.
+
+**New: `seaglass/cli.py`**, a throwaway (non-production) CLI with `build`
+and `search` subcommands, wired to the existing `seaglass` console-script
+entry point in `pyproject.toml`. This is PLAN.md's "earliest useful
+checkpoint" -- the system is now genuinely queryable end to end against
+real data, without the MCP server (a later phase) existing yet. Usage:
+`seaglass build <chat_db_snapshot> <index_db>` then
+`seaglass search <index_db> "<query>" [--chat-db <chat_db>] [--show N]`.
+
+**Tests:** `test_parse.py` (15 tests) and `test_retrieve.py` (13 tests,
+using a new shared `tests/conftest.py` with a reusable
+`FakeEmbeddingModel` and a parameterized multi-chat synthetic chat.db
+builder) all pass. Full suite: 94 passed (2 integration tests deselected
+by default).
