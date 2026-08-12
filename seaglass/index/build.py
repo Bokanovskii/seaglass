@@ -26,11 +26,15 @@ a build-time copy, not the live database -- this module doesn't make the
 copy itself (that's an operational/CLI concern), it just reads whatever
 path it's given read-only.
 
-**Known follow-up, not yet implemented:** `attachment_place` lookups
-always pass an empty dict (media placeholders render bare) -- Phase 2's
-EXIF/reverse-geocoding module (index/exif.py) hasn't been built yet.
-Wiring it in only changes `format_lexical`'s inputs, not this module's
-structure.
+**`attachment_place` (Phase 2 EXIF/geo) is wired in.** Before rendering
+each chunk, `_resolve_places` looks up already-known places for that
+chunk's attachments, and for any attachment not yet in
+`attachment_place`, calls `index/exif.py` to extract GPS + reverse-geocode
+it, persisting new rows immediately (idempotent by `attachment_id`
+primary key, so a crash/restart mid-build just re-does the cheap SELECT
+lookup, never re-decodes an already-resolved photo). Attachments whose
+file can't be opened/decoded at all are recorded in `attachment_retry`
+for a later retry pass, distinct from "opened fine, just not geotagged".
 """
 
 from __future__ import annotations
@@ -43,7 +47,7 @@ from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 import zstandard
 
 from seaglass.imessage import source
-from seaglass.index import render
+from seaglass.index import exif, render
 from seaglass.index.chunker import Chunk, chunk_messages
 from seaglass.index.embed import EmbeddingModel, compute_calibration_absmax, quantize_int8
 
@@ -143,6 +147,61 @@ def _render_chunk(
         body_semantic=render.format_semantic(ordered_messages),
         body_lexical=render.format_lexical(ordered_messages, attachments_by_msg, places_by_attachment),
     )
+
+
+def _resolve_places(
+    index_con: sqlite3.Connection,
+    chunk_id: int,
+    attachments_by_msg: Dict[int, List["source.AttachmentRow"]],
+) -> Dict[int, str]:
+    """Resolve place names for every attachment referenced in this chunk:
+    reuse already-known `attachment_place` rows, and for anything new,
+    call `index/exif.py` (GPS extraction + offline reverse-geocode) and
+    persist the result immediately. Idempotent and safe to re-run on
+    restart -- already-resolved attachment_ids are never re-decoded.
+    """
+    attachment_ids = sorted(
+        {a.attachment_id for atts in attachments_by_msg.values() for a in atts}
+    )
+    if not attachment_ids:
+        return {}
+
+    placeholders = ",".join("?" for _ in attachment_ids)
+    existing = dict(
+        index_con.execute(
+            f"SELECT attachment_id, place FROM attachment_place WHERE attachment_id IN ({placeholders})",
+            attachment_ids,
+        ).fetchall()
+    )
+    missing_ids = [aid for aid in attachment_ids if aid not in existing]
+    if not missing_ids:
+        return existing
+
+    filename_by_id = {
+        a.attachment_id: a.filename for atts in attachments_by_msg.values() for a in atts
+    }
+    targets = [
+        exif.AttachmentTarget(attachment_id=aid, path=Path(filename_by_id[aid]).expanduser())
+        for aid in missing_ids
+        if filename_by_id.get(aid)
+    ]
+    new_places, failed_ids = exif.extract_places_for_attachments(targets)
+
+    if new_places:
+        index_con.executemany(
+            "INSERT OR IGNORE INTO attachment_place (attachment_id, place) VALUES (?, ?)",
+            list(new_places.items()),
+        )
+    if failed_ids:
+        index_con.executemany(
+            "INSERT OR IGNORE INTO attachment_retry (attachment_id, chunk_id) VALUES (?, ?)",
+            [(aid, chunk_id) for aid in failed_ids],
+        )
+    if new_places or failed_ids:
+        index_con.commit()
+
+    existing.update(new_places)
+    return existing
 
 
 def _write_batch(
@@ -248,7 +307,8 @@ def build_index(
             continue  # already durably written in a prior run
 
         attachments = source.fetch_attachments_for_messages(chat_con, chunk.msg_ids)
-        rendered = _render_chunk(chunk_id, chunk, messages_by_id, attachments, {})
+        places_by_attachment = _resolve_places(index_con, chunk_id, attachments)
+        rendered = _render_chunk(chunk_id, chunk, messages_by_id, attachments, places_by_attachment)
 
         if not calibrated:
             calibrated = True

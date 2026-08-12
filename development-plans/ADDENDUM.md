@@ -661,3 +661,85 @@ PLAN.md item 4); Grogu's own MCP client config still needs to be pointed
 at `seaglass-mcp` with the right environment variables set -- that's an
 action in Grogu's repo/config, not this one, and hasn't been done as
 part of this session.
+
+## 17. Phase 2 (completed retroactively): `index/exif.py` — GPS extraction + offline reverse-geocoding for `attachment_place`
+
+The last core module PLAN.md's Phase 2 called for was still unbuilt when
+Phase 6 wrapped up; built and wired in now.
+
+**Deviation from PLAN.md's suggested `exifread`/`pillow` pairing**:
+confirmed against real data that iMessage photo attachments are
+overwhelmingly HEIC (a scan of 500 recent real image attachments found
+essentially all were `.heic`/`.HEIC`), and neither stock Pillow nor
+`exifread` can decode HEIC at all -- `exifread` against a real HEIC file
+returned only 7 generic tags and no GPS data. Added **`pillow-heif`**
+(not in PLAN.md's dependency table) as a new dependency; it registers a
+HEIF opener for Pillow, after which `Image.getexif()` /
+`get_ifd(ExifTags.IFD.GPSInfo)` handles HEIC, JPEG, and PNG uniformly
+through one code path. `index/exif.py` therefore doesn't call `exifread`
+at all, despite it remaining an installed (now effectively unused)
+dependency -- harmless, cheap to prune in a future cleanup pass, not
+worth a disruptive removal now.
+
+**`extract_places_for_attachments()`** distinguishes three outcomes per
+attachment, which matters for `attachment_retry` bookkeeping (PLAN.md's
+own distinction): (1) opened fine, geotagged -> reverse-geocoded place
+string; (2) opened fine, no GPS tag -> silently absent from the result,
+*not* a failure (this is the common case: screenshots, memes, or
+Location Services simply off at capture time); (3) couldn't open/decode
+at all (missing file, corrupt data) -> recorded as a failure, feeding
+`attachment_retry` so a later pass can retry once/if the file reappears
+(e.g. after iCloud Photos finishes downloading originals -- directly
+relevant given this machine's ongoing iCloud backfill).
+
+**Reverse-geocoding uses a small hand-written ISO alpha-2 -> country-name
+map** (~15 common countries) rather than a `pycountry` dependency, since
+`reverse_geocoder` only returns the alpha-2 code and a full ISO country
+database is disproportionate for this narrow a need; an unmapped code
+falls back to the raw code string, still a usable (if less pretty)
+lexical signal.
+
+**`index/build.py` wiring** (`_resolve_places`): before rendering each
+chunk, looks up already-known `attachment_place` rows for that chunk's
+attachments (by primary key), and only calls `exif.py` for attachments
+not yet resolved -- persisting new rows (and any `attachment_retry`
+rows) immediately, independent of the chunk batch's own transaction.
+This is deliberately *not* folded into the same transaction as
+`_write_batch`: `attachment_place`/`attachment_retry` writes are
+idempotent by primary key (`INSERT OR IGNORE`), so a crash between an
+exif-resolution commit and the owning chunk batch's commit just means a
+restart re-does one cheap SELECT lookup, never a re-decode of an
+already-resolved photo -- the expensive part (HEIC decode + reverse
+geocode) is never repeated.
+
+**Validated against real data**: a scan of 500 recent real image
+attachments found ~17% carried usable GPS EXIF tags; `reverse_geocoder`
+correctly resolved real coordinates to real places (e.g. a Catalina
+Island coordinate -> "[REDACTED_LOCATION]"). Ran a full
+800-chunk real build with the wiring active (17.0s, comparable per-chunk
+overhead to the pre-geo 500-chunk baseline from earlier sessions):
+found and correctly geocoded 3 real geotagged attachments in that
+window (Coronado CA, Leavenworth WA x2, zero failures), and confirmed
+via a direct FTS5 `MATCH` query that "Leavenworth" is indexed in the
+correct chunks' lexical bodies -- proving the place name reaches
+`format_lexical`'s media placeholder and is retrievable, exactly as
+PLAN.md's design intends.
+
+**Tests**: `tests/test_exif.py` (9 tests) -- synthetic JPEGs with
+hand-written GPS EXIF tags (encoded via the same DMS + hemisphere-ref
+scheme real cameras/phones use), covering DMS conversion, round-tripping
+known coordinates, the three-outcome distinction above, and empty input.
+`tests/test_build.py` gained a new `TestAttachmentPlaceIntegration`
+class (2 tests) confirming the full build-time wiring: a geotagged
+synthetic attachment ends up in `attachment_place` *and* is retrievable
+via FTS5 `MATCH` on its place text, while a missing attachment file ends
+up in `attachment_retry` and never in `attachment_place`.
+
+Full suite: **161 passed** (2 integration tests deselected by default).
+
+**Not yet done**: `exifread` is now dead weight in `pyproject.toml`
+(kept rather than pruned mid-session, to avoid an unrelated dependency
+removal alongside the exif.py work); the small country-name map will
+need occasional manual extension if a code outside its ~15 entries
+shows up in a real corpus (falls back gracefully to the raw code, not a
+correctness bug, just a cosmetic gap).

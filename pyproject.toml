@@ -15,6 +15,7 @@ dependencies = [
     "rapidfuzz",
     "dateparser",
     "pillow",
+    "pillow-heif",
     "exifread",
     "reverse_geocoder",
     "pytypedstream",

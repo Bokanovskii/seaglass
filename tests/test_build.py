@@ -179,3 +179,68 @@ class TestBuildIndex:
             (q.tobytes(),),
         ).fetchall()
         assert len(rows) > 0
+
+
+class TestAttachmentPlaceIntegration:
+    """Phase 2 exif.py wiring: a geotagged attachment on disk should end
+    up reverse-geocoded into attachment_place and inlined into the
+    chunk's lexical body, without ever touching body_semantic.
+    """
+
+    def test_geotagged_attachment_populates_attachment_place_and_lexical_body(self, tmp_path):
+        from PIL import Image
+        from PIL.ExifTags import IFD
+
+        chat_db_path = _build_fixture_chat_db(tmp_path, n_chats=1, n_messages_per_chat=1)
+        con = sqlite3.connect(chat_db_path)
+        photo_path = tmp_path / "IMG_0001.jpg"
+        img = Image.new("RGB", (4, 4), color="red")
+        exif = img.getexif()
+        gps_ifd = exif.get_ifd(IFD.GPSInfo)
+        gps_ifd[1] = "N"
+        gps_ifd[2] = (37.0, 46.0, 26.4)
+        gps_ifd[3] = "W"
+        gps_ifd[4] = (122.0, 25.0, 9.6)
+        exif[IFD.GPSInfo] = gps_ifd
+        img.save(photo_path, exif=exif)
+
+        con.execute("INSERT INTO attachment (ROWID, filename) VALUES (1, ?)", (str(photo_path),))
+        con.execute("INSERT INTO message_attachment_join (message_id, attachment_id) VALUES (1, 1)")
+        con.commit()
+        con.close()
+
+        index_db_path = tmp_path / "index.db"
+        build_index(chat_db_path, index_db_path, embedding_model=FakeEmbeddingModel())
+
+        con = open_index_db(index_db_path)
+        place_row = con.execute("SELECT place FROM attachment_place WHERE attachment_id = 1").fetchone()
+        assert place_row is not None
+        assert "United States" in place_row[0]
+
+        lexical_match = con.execute(
+            "SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH ?",
+            (f'"{place_row[0]}"',),
+        ).fetchall()
+        assert len(lexical_match) > 0
+
+    def test_missing_attachment_file_recorded_in_attachment_retry(self, tmp_path):
+        chat_db_path = _build_fixture_chat_db(tmp_path, n_chats=1, n_messages_per_chat=1)
+        con = sqlite3.connect(chat_db_path)
+        con.execute(
+            "INSERT INTO attachment (ROWID, filename) VALUES (1, ?)",
+            (str(tmp_path / "does_not_exist.jpg"),),
+        )
+        con.execute("INSERT INTO message_attachment_join (message_id, attachment_id) VALUES (1, 1)")
+        con.commit()
+        con.close()
+
+        index_db_path = tmp_path / "index.db"
+        build_index(chat_db_path, index_db_path, embedding_model=FakeEmbeddingModel())
+
+        con = open_index_db(index_db_path)
+        retry_row = con.execute(
+            "SELECT attachment_id FROM attachment_retry WHERE attachment_id = 1"
+        ).fetchone()
+        assert retry_row is not None
+        place_row = con.execute("SELECT * FROM attachment_place WHERE attachment_id = 1").fetchone()
+        assert place_row is None
