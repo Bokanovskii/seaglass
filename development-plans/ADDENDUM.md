@@ -823,3 +823,68 @@ texts"`, `"[REDACTED_TOPIC]"`, `"[REDACTED_TOPIC]
 "typed into a search box" register. Still awaiting the user's human
 review pass (unchanged from §18 -- this only fixes question *style*, not
 the review step itself).
+
+## 20. First real end-to-end scoring run: golden set reviewed, recall@50/@12/@final measured
+
+Per the user's instruction, treated all 32 draft candidates in
+`data/golden-set-review/candidates_for_review.jsonl` as reviewed and
+accepted -- appended to `data/golden-set-review/golden.jsonl` (one
+initially landed in the rejected sidecar due to a batch-input timing
+artifact from auto-accepting via piped stdin; manually moved to golden
+since the user said "assume they are all reviewed and good to go").
+`golden.rejected.jsonl` is now empty.
+
+Ran `eval/score.py` against the real 3,000-chunk index + real
+chat_snapshot.db for the first time end to end:
+
+```
+category              n    r@50    r@12   r@fin    gap1    gap2   kill
+exact_string           1    1.00    0.00    0.00   -1.00    0.00   0.00
+media_geo             19    0.84    0.74    0.58   -0.11   -0.16   0.00
+person_filtered        5    0.80    0.80    0.80    0.00    0.00   0.00
+time_filtered          6    0.83    0.67    0.83   -0.17    0.17   0.17
+topical                1    1.00    0.00    0.00   -1.00    0.00   0.00
+--------------------------------------------------------------------------
+OVERALL               32    0.84    0.69    0.62   -0.16   -0.06   0.03
+recall@50 95% Wilson CI: [0.68, 0.93]  n=32
+by nn_band (recall@final): Q1 0.56  Q2 0.62  Q3 1.00  Q4 0.29   <- Q2 is the honest number
+```
+
+Reading this (EVALUATION.md §8.3's report shape):
+- **recall@50 = 0.84** [0.68, 0.93] -- the fused retrieval stage (before
+  rerank/aggregation) finds the right chunk in the top-50 candidates
+  84% of the time. Wide CI because n=32 is still small (this is a
+  32-question dev-split slice, not the full ~300-target golden set
+  EVALUATION.md scopes for).
+- **gap1 (r@12 - r@50) is consistently negative** (-0.16 overall) --
+  the rerank stage is *losing* recall between top-50 and top-12 more
+  than it's fixing ranking errors. This is the single most actionable
+  signal here: worth investigating whether the reranker or the
+  aggregate_sessions top-12 cutoff is too aggressive, once the golden
+  set is bigger.
+- **gap2 (r@final - r@12) is small and mixed** (-0.06 overall,
+  slightly positive for time_filtered) -- session aggregation/expansion
+  isn't losing much beyond what rerank already lost, and even recovers
+  a little for time-filtered queries (context window helps there).
+- **exact_string and topical (n=1 each) hit r@50=1.0 but r@12=r@final=0**
+  -- with n=1 per category this is not a reliable signal, just a
+  reminder that categories need far more than 1-5 samples each before
+  their per-category numbers mean anything (EVALUATION.md's ~300 target
+  addresses this; this run is a first real smoke-test slice, not the
+  final eval).
+- **by-nn_band recall@final**: Q3 (1.00) and Q4 (0.29) diverge sharply
+  from Q2's 0.62 "honest number" framing in the report itself --
+  consistent with EVALUATION.md §3.3's expectation that the hardest
+  band (highest nn_distance) is where real retrieval failures
+  concentrate, and the easiest band is closer to lookup than genuine
+  recall.
+- **kill_rate is near-zero (0.03 overall)** -- the pre-rerank candidate
+  filter essentially never discards the true positive outright; the
+  loss visible in gap1 happens after that filter, at rerank/cutoff time.
+
+Net takeaway for a first pass at n=32: retrieval fundamentals work (0.84
+recall into top-50), but the rerank-to-top-12 step is the biggest source
+of loss and the most promising next place to invest tuning effort --
+this should be revisited once the golden set is grown toward
+EVALUATION.md's ~300-question target, since single-digit-n per category
+numbers here are indicative, not conclusive.
