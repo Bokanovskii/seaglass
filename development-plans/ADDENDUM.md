@@ -136,6 +136,56 @@ currently in `message`, on top of the corpus itself still growing. Treat
 both the total-message-count *and* the `chat_message_join` coverage ratio as
 signals to watch for backfill settling (see updated §7).
 
+## 8. Phase 0 spike resolved: `sqlite-vec` constrained KNN works
+
+**This was flagged as the single highest-risk architectural bet** ("If
+constrained KNN is unsupported, the architecture's headline advantage
+collapses" — `PLAN.md` §6 Phase 0). Spiked directly against the installed
+`sqlite-vec` 0.1.9:
+
+```
+rowid IN (SELECT id FROM candidates) AND embedding MATCH vec_int8(?) AND k = 200
+```
+
+**Works correctly** (every returned row was inside the candidate set) and is
+**fast**:
+
+| Corpus size | Filter selectivity | Constrained KNN | Unconstrained KNN (k=200) |
+|---|---|---|---|
+| 100,000 | ~14% (1/7) | 8.5 ms | 33.5 ms |
+| 500,000 | 2% | ~26 ms | 159 ms |
+
+**One gotcha worth recording**, since it cost some debugging time: a plain
+`bytes` blob produced by `sqlite_vec.serialize_int8(...)` is ambiguous to
+this version of the extension and gets misinterpreted as float32
+(`"expected int8, but a float32 vector was provided"`) unless it is
+explicitly wrapped in SQL: `vec_int8(?)` on both insert and query. `PLAN.md`
+§5's example SQL doesn't show this wrapper — add it when Phase 3/4 code is
+written, e.g.:
+
+```sql
+INSERT INTO chunks_vec(rowid, embedding) VALUES (?, vec_int8(?))
+...
+WHERE embedding MATCH vec_int8(?) AND k = 200
+```
+
+**Conclusion:** the "free exact pre-filtering" thesis in `PLAN.md` §3/§4
+holds. Full KNN at the plan's ~1.25M-chunk estimate would extrapolate to
+roughly 400ms unconstrained (already over the <1s budget on this stage
+alone) — constrained KNN is not just an optimization, it's necessary to hit
+the latency target at all. Proceeding with the plan's brute-force + exact
+pre-filter design as written, with the `vec_int8()` wrapping noted above.
+
+## 9. Decision: proceed with implementation despite ongoing backfill
+
+Per explicit direction (2026-08-12): don't wait for iCloud backfill to
+settle. The ingestion flow (Phase 2/3/7) will be built to tolerate a
+partial, moving corpus from the start rather than treating that as a
+precondition, and a full re-index is an accepted, cheap escape hatch if
+early chunking/embedding runs turn out to need redoing once backfill
+settles. The historical-insert sync fix in §4 remains necessary work, not
+optional, given this.
+
 ## 7. Sequencing decision (supersedes old §5 numbering)
 
 Given the backfill is substantial and ongoing, and the user was unavailable
@@ -156,3 +206,67 @@ correctable) is:
   a day or two apart, **and** the `chat_message_join` coverage ratio
   (`count(distinct message_id) from chat_message_join` / `count(*) from
   message` restricted to `associated_message_type = 0`) approaching ~100%.
+
+## 10. Phase 0 risk resolved: `mlx-embeddings` does NOT load the cross-encoder reranker directly — fixed with a custom loader
+
+PLAN.md assumes `mlx-embeddings` handles "embeddings AND cross-encoder
+reranking" directly (§4 dependency list, §6 Phase 3/4). This was flagged in
+the original review as the most significant unvalidated risk and has now
+been spiked against the real, installed `mlx-embeddings==0.1.0`.
+
+**The embedding half holds exactly as planned.** `mlx_embeddings.load("BAAI/bge-small-en-v1.5")`
+loads cleanly, produces 384-dim L2-normalisable output, and batches fast
+(32 texts embedded in ~0.6s on this machine, effectively free per-message
+at ingestion scale).
+
+**The reranker half does not load out of the box.**
+`mlx_embeddings.load("cross-encoder/ms-marco-MiniLM-L-12-v2")` raises
+`ValueError: Received 201 parameters not in model`. Root cause: the
+checkpoint is a HF `BertForSequenceClassification` — weights are namespaced
+`bert.*` (encoder/pooler) plus a separate top-level `classifier.{weight,bias}`
+(a `Linear(384, 1)`) — while `mlx_embeddings.models.bert.Model` is built only
+for plain embedding-style BERT checkpoints (unprefixed encoder/pooler
+weights, no classifier head). `mlx-embeddings` 0.1.0 has no generic
+sequence-classification support and no explicit reranker/cross-encoder API
+(`load()` is the only entry point; nothing in `mlx_embeddings.utils.MODEL_REMAPPING`
+covers this).
+
+**Fix, spiked and working:** the encoder architecture underneath is
+identical to what `mlx_embeddings.models.bert.Model` already implements.
+`seaglass/search/rerank.py`'s `CrossEncoderReranker`:
+1. Downloads the checkpoint via `mlx_embeddings.utils.get_model_path` (same
+   HF Hub cache as `load()`).
+2. Reads `model.safetensors` directly (`safetensors.safe_open`, numpy
+   framework), strips the `bert.` prefix from encoder/pooler keys, skips
+   the non-parameter `bert.embeddings.position_ids` buffer, and separately
+   pulls out `classifier.weight`/`classifier.bias`.
+3. Loads the encoder/pooler weights into a plain `mlx_embeddings.models.bert.Model`
+   (`strict=True` — this now matches exactly).
+4. Applies the classifier manually: `logits = pooler_output @ classifier_w.T + classifier_b`.
+   The checkpoint's `config.json` declares
+   `"sbert_ce_default_activation_function": "torch.nn.modules.linear.Identity"`,
+   so raw logits (not a probability) are the correct score — matches
+   `sentence-transformers`' own `CrossEncoder` behavior for this checkpoint.
+
+**Validated end to end:** scored a clearly-relevant vs. clearly-irrelevant
+(query, candidate) pair — relevant scored −2.39 vs. irrelevant −10.19,
+correctly discriminating. Batched 50 (query, candidate) pairs at ~22ms warm
+(first call ~180ms, includes one-time compile/dispatch overhead) — inside
+PLAN.md's ~60ms reranker latency budget from its "Reranker sizing" table,
+on this machine.
+
+**Conclusion:** PLAN.md's "MLX consolidation" architecture (no PyTorch/MPS
+dependency anywhere in the query path) holds, but requires this
+project-specific loader rather than a bare `mlx_embeddings.load()` call.
+This is now implemented as `seaglass/search/rerank.py::CrossEncoderReranker`
+and `seaglass/index/embed.py::EmbeddingModel`, both lazy-loading (no network
+access at import time), with the quantisation math (`compute_calibration_absmax`,
+`quantize_int8`, matching PLAN.md §6 Phase 3's calibrated-absmax scheme
+exactly, including the "not `round(v * 127)`" warning) unit-tested, and the
+model-loading paths covered by a `pytest -m integration` smoke test (skipped
+by default since it needs network + real inference, but green as of this
+writing).
+
+**No PyTorch/transformers-model-loading dependency was added.** `transformers`
+is present only as `mlx-embeddings`' own tokenizer dependency (`AutoProcessor`/`AutoTokenizer`
+usage), not for model weights.

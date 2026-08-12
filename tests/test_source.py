@@ -16,6 +16,7 @@ from seaglass.imessage.source import (
     SchemaDriftError,
     apple_to_unix,
     assert_schema,
+    fetch_attachments_for_messages,
     iter_messages,
 )
 
@@ -170,3 +171,33 @@ class TestIterMessages:
         con.execute("INSERT INTO im.message_attachment_join(message_id, attachment_id) VALUES (1, 1)")
         messages = list(iter_messages(con))
         assert messages[0].has_attachment is True
+
+
+class TestFetchAttachmentsForMessages:
+    def test_returns_attachments_keyed_by_message_id(self):
+        con = _build_fixture_db()
+        con.execute("INSERT INTO im.attachment(ROWID, filename) VALUES (1, 'sunset.jpg')")
+        con.execute("INSERT INTO im.attachment(ROWID, filename) VALUES (2, 'IMG_0002.HEIC')")
+        con.execute("INSERT INTO im.message_attachment_join(message_id, attachment_id) VALUES (10, 1)")
+        con.execute("INSERT INTO im.message_attachment_join(message_id, attachment_id) VALUES (10, 2)")
+        result = fetch_attachments_for_messages(con, [10, 20])
+        assert 10 in result
+        assert 20 not in result
+        filenames = {a.filename for a in result[10]}
+        assert filenames == {"sunset.jpg", "IMG_0002.HEIC"}
+
+    def test_empty_input_returns_empty_dict(self):
+        con = _build_fixture_db()
+        assert fetch_attachments_for_messages(con, []) == {}
+
+    def test_batches_beyond_default_sqlite_variable_limit(self):
+        con = _build_fixture_db()
+        ids = list(range(1, 1200))
+        for mid in ids:
+            con.execute("INSERT INTO im.attachment(filename) VALUES (?)", (f"file{mid}.jpg",))
+            con.execute(
+                "INSERT INTO im.message_attachment_join(message_id, attachment_id) VALUES (?, last_insert_rowid())",
+                (mid,),
+            )
+        result = fetch_attachments_for_messages(con, ids)
+        assert len(result) == len(ids)

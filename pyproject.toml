@@ -20,6 +20,7 @@ dependencies = [
     "pytypedstream",
     "mcp",
     "numpy",
+    "safetensors",
 ]
 
 [project.optional-dependencies]
@@ -40,3 +41,7 @@ include = ["seaglass*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "integration: requires network access + real MLX model inference; skip with -m 'not integration'",
+]
+addopts = "-m 'not integration'"

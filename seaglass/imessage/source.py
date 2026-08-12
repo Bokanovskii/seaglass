@@ -25,7 +25,7 @@ from __future__ import annotations
 import dataclasses
 import sqlite3
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Dict, Iterable, Iterator, List, Optional
 
 from seaglass.imessage.attributedbody import decode_attributed_body
 
@@ -171,3 +171,37 @@ def iter_messages(con: sqlite3.Connection, chat_id: Optional[int] = None) -> Ite
             date_retracted=apple_to_unix(date_retracted) if date_retracted else None,
             has_attachment=bool(has_attachment),
         )
+
+
+@dataclasses.dataclass(frozen=True)
+class AttachmentRow:
+    attachment_id: int
+    message_id: int
+    filename: Optional[str]
+
+
+def fetch_attachments_for_messages(
+    con: sqlite3.Connection, msg_ids: Iterable[int]
+) -> Dict[int, List[AttachmentRow]]:
+    """Batch-fetch attachment rows for a set of message ROWIDs, keyed by
+    `message_id`. Used by index/render.py's `format_lexical` to build the
+    inline media placeholder. Batches to stay well under SQLite's default
+    999-variable limit for `IN (...)`.
+    """
+    ids = list(msg_ids)
+    result: Dict[int, List[AttachmentRow]] = {}
+    batch_size = 500
+    for start in range(0, len(ids), batch_size):
+        batch = ids[start : start + batch_size]
+        placeholders = ",".join("?" for _ in batch)
+        query = f"""
+            SELECT maj.message_id, a.ROWID, a.filename
+            FROM im.message_attachment_join maj
+            JOIN im.attachment a ON a.ROWID = maj.attachment_id
+            WHERE maj.message_id IN ({placeholders})
+        """
+        for message_id, attachment_id, filename in con.execute(query, batch):
+            result.setdefault(message_id, []).append(
+                AttachmentRow(attachment_id=attachment_id, message_id=message_id, filename=filename)
+            )
+    return result
