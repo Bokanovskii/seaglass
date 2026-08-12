@@ -32,6 +32,16 @@ MAX_SEMANTIC_TOKENS = 512
 _TOKEN_RE = re.compile(r"\S+")
 _URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 _DOMAIN_RE = re.compile(r"https?://(?:www\.)?([^/\s]+)", re.IGNORECASE)
+# U+FFFC OBJECT REPLACEMENT CHARACTER: Apple embeds this inline in
+# message.text at the position of an attachment. Our own [attachment]
+# placeholder already represents that -- leaving Apple's marker in too
+# would double up the signal (and is meaningless to both the embedder and
+# FTS on its own). Stripped from both renderings before anything else.
+_OBJECT_REPLACEMENT_RE = re.compile("\ufffc\\s*")
+
+
+def _strip_object_replacement(text: str) -> str:
+    return _OBJECT_REPLACEMENT_RE.sub("", text).strip()
 
 
 def approx_token_count(text: str) -> int:
@@ -129,8 +139,9 @@ def format_semantic(
     for msg in messages:
         label = _label_for(msg, speaker_labels)
         body_parts = []
-        if msg.text:
-            body_parts.append(_collapse_urls_to_domain(msg.text))
+        text = _strip_object_replacement(msg.text) if msg.text else ""
+        if text:
+            body_parts.append(_collapse_urls_to_domain(text))
         if msg.has_attachment:
             body_parts.append(_media_placeholder_semantic())
         if not body_parts:
@@ -161,8 +172,9 @@ def format_lexical(
     lines: List[str] = []
     for msg in messages:
         body_parts = []
-        if msg.text:
-            body_parts.append(msg.text)  # verbatim -- URLs untouched
+        text = _strip_object_replacement(msg.text) if msg.text else ""
+        if text:
+            body_parts.append(text)  # verbatim (minus the U+FFFC marker) -- URLs untouched
         attachments = attachments_by_msg.get(msg.rowid, [])
         if msg.has_attachment or attachments:
             body_parts.append(_media_placeholder_lexical(attachments, places_by_attachment))

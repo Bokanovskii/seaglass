@@ -87,6 +87,15 @@ class TestFormatSemantic:
         rendered = format_semantic(messages)
         assert "Lisbon" not in rendered
 
+    def test_object_replacement_character_stripped_alongside_attachment(self):
+        # Apple embeds U+FFFC inline in message.text at the attachment's
+        # position -- our own [attachment] placeholder already represents
+        # it, so the raw marker must not leak through and double up.
+        messages = [_msg(1, text="check this out \ufffc", has_attachment=True)]
+        rendered = format_semantic(messages)
+        assert "\ufffc" not in rendered
+        assert "[attachment]" in rendered
+
 
 class TestFormatLexical:
     def test_urls_kept_verbatim(self):
@@ -126,6 +135,11 @@ class TestFormatLexical:
         assert "tok0" in rendered
         assert "tok1999" in rendered
         assert len(rendered.split()) == 2000
+
+    def test_object_replacement_character_stripped(self):
+        messages = [_msg(1, text="see this \ufffc", has_attachment=True)]
+        rendered = format_lexical(messages)
+        assert "\ufffc" not in rendered
 
 
 class TestApproxTokenCount:

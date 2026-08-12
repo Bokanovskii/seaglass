@@ -270,3 +270,40 @@ writing).
 **No PyTorch/transformers-model-loading dependency was added.** `transformers`
 is present only as `mlx-embeddings`' own tokenizer dependency (`AutoProcessor`/`AutoTokenizer`
 usage), not for model weights.
+
+## 11. Phase 3 implemented: `index/build.py`, and a small real-data finding (U+FFFC leakage)
+
+`index/build.py` orchestrates extraction → chunking → both renderings →
+embedding → writing `index.db`, per PLAN.md §6 Phase 3: deterministic
+chunk ids (stable position counter over ascending `chat_id` then
+chronological order, so re-running against an unchanged snapshot
+reproduces identical ids), one transaction per batch covering `chunks` +
+`chunk_message` + `chunks_vec` then `chunks_fts` last, `meta.build_cursor`
+persisted only on commit, and a `int8_absmax`/`embed_version`/format
+versions calibration step run once against the first batch's rendered
+text. 22 new unit tests (synthetic chat.db fixture + a deterministic
+network-free fake embedding model) cover fresh builds, resume-after-crash
+(simulated via `limit_chunks`), and idempotent re-runs producing zero
+duplicate/colliding chunk ids.
+
+**Validated against real data.** Snapshotted the live (partially-backfilled)
+`chat.db` to `/tmp` per the "snapshot first" rule, ran `build_index` capped
+to a small `limit_chunks`, and inspected the decompressed `body_semantic`
+output directly. Chunking, overlap, role labelling (A/B/C for a group chat,
+Me/Them for DMs), URL-to-domain collapsing, and the bare `[attachment]`
+placeholder all render exactly as designed on real messages.
+
+**Small real-data finding, fixed:** Apple embeds `U+FFFC` (OBJECT
+REPLACEMENT CHARACTER) inline in `message.text` at the position of an
+attachment. Before this fix, that raw marker leaked through alongside our
+own `[attachment]` placeholder (e.g. `"[REDACTED_MESSAGE_TEXT]\ufffc
+[attachment]"`), doubling up meaningless signal in both renderings.
+`index/render.py` now strips `\ufffc` (plus surrounding whitespace) from
+`message.text` before either rendering runs. Regression-tested in
+`test_render.py`.
+
+**Not yet done:** `index/exif.py` (EXIF GPS + reverse geocoding) doesn't
+exist yet, so `build_index` always passes an empty `places_by_attachment`
+dict to `format_lexical` -- media placeholders currently render bare
+(`[attachment]`) with no place name or filename. Wiring EXIF in only
+changes `build.py`'s inputs to `_render_chunk`, not its structure.
