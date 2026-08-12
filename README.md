@@ -12,22 +12,26 @@ privacy boundary and its two consequences.
 
 ## Status
 
-Early implementation. See `development-plans/` for the design docs driving
-this build:
+Working end-to-end: index build, hybrid retrieval, reranking, session
+aggregation, and the MCP server are implemented and tested (see
+[`docs/architecture.html`](docs/architecture.html) for a detailed,
+interactive breakdown of every component — GitHub Pages isn't available on
+this private repo's plan, so download/open that file locally rather than
+following a live link). Grogu integrates with seaglass over MCP and prefers
+it over its legacy SQL `LIKE` fallback whenever seaglass is configured and
+reachable.
 
-- **`PLAN.md`** — the implementation plan (architecture, schema, phased build order).
+See `development-plans/` for the design docs driving this build:
+
+- **`PLAN.md`** — the implementation plan (architecture, schema, build order).
 - **`DESIGN-NOTES.md`** — why each decision was made, and what was tried and rejected.
 - **`EVALUATION.md`** — how retrieval quality, latency, and correctness are measured.
-- **`ADDENDUM.md`** — decisions and findings from the first review pass, including
-  a required change to the Phase 7 sync design driven by this machine's active
-  iCloud backfill.
+- **`ADDENDUM.md`** — running log of decisions and findings as the build progressed.
 
-**Current phase:** Phase 1 (extraction layer) in progress. Phase 0's
-capability preflight checks pass (`python -m seaglass.probe`); the
-volume/sizing spikes are intentionally deferred until iCloud backfill
-settles (see `ADDENDUM.md` §7) — this machine is a freshly set up Mac still
-catching up on message history, so message counts and other size estimates
-would be stale within days.
+There is currently no persistent daemon — each invocation loads the
+embedding model and reranker fresh and exits. This was a deliberate initial
+choice to measure real cold-start cost before building a daemon/shim; see
+the architecture reference's performance section for the measured numbers.
 
 ## Requirements
 
@@ -48,7 +52,7 @@ pip install -e ".[dev]"
 ## Development
 
 ```bash
-# Phase 0 capability preflight (safe to run anytime; read-only)
+# capability preflight (safe to run anytime; read-only)
 python -m seaglass.probe
 
 # unit tests (no live chat.db required)
@@ -57,18 +61,18 @@ python -m pytest tests/ -v
 
 ## Repository layout
 
-Mirrors `development-plans/PLAN.md` §7, adjusted to the actual package name:
-
 ```
 seaglass/
-  probe.py              # Phase 0 capability preflight (+ backfill-progress signal)
+  probe.py              # capability preflight (+ backfill-progress signal)
   imessage/
     source.py            # the ONLY module aware of Apple's chat.db schema
     attributedbody.py    # typedstream decoding for the attributedBody blob
     contacts.py           # PyObjC Contacts resolution
-  index/                 # chunking, embedding, build, sync (Phase 2-3, 7)
-  search/                # query parsing, retrieval, reranking (Phase 4)
-  eval/                  # golden set + evaluation harness (Phase 3.5, 8)
+  index/                 # chunking, embedding, build, sync
+  search/                # query parsing, retrieval, reranking
+  eval/                  # golden set + evaluation harness
 tests/
+docs/
+  architecture.html       # interactive architecture reference (see Status above)
 development-plans/       # design docs (see Status above)
 ```
