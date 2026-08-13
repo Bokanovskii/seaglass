@@ -564,7 +564,7 @@
 
     <section id="mcp">
       <h2><span class="num">08</span> MCP server surface</h2>
-      <p><code>seaglass/mcp_server.py</code> exposes three tools over stdio, single-process, guarded by
+      <p><code>seaglass/mcp_server.py</code> exposes four tools over stdio, single-process, guarded by
       a global lock (<code>_pipeline_lock</code>) since MLX has no cross-thread safety guarantee, plus
       a separate <code>_init_lock</code> around all lazy singleton getters (index connection, chat
       connection, embedding model, reranker, contact index).</p>
@@ -572,8 +572,33 @@
         <tr><th>Tool</th><th>Purpose</th><th>Key params</th></tr>
         <tr><td><code>search_messages</code></td><td>Ranked, hydrated conversation sessions with message-id citations for a topical/semantic query</td><td><code>query</code>, <code>max_sessions=8</code>, <code>redact=false</code></td></tr>
         <tr><td><code>get_conversation</code></td><td>Drill-down: raw messages from one <code>chat_id</code>, optionally centered on a timestamp</td><td><code>chat_id</code>, <code>around_ts</code>, <code>limit=50</code></td></tr>
-        <tr><td><code>index_status</code></td><td>Chunk/vector counts, configured DB paths, hydration/contacts availability — lets a caller sanity-check the index before trusting search results</td><td>—</td></tr>
+        <tr><td><code>index_status</code></td><td>Chunk/vector counts, configured DB paths, hydration/contacts availability, and how many messages have arrived since the index was built — lets a caller sanity-check the index before trusting search results</td><td>—</td></tr>
+        <tr><td><code>sync_index</code></td><td>Bring the index up to date with the live Messages database, by proxying to the running desktop app's build endpoint</td><td><code>wait=false</code></td></tr>
       </table>
+      <div class="callout fix">
+        <strong>Ranking lives in one place.</strong> The MCP server used to reimplement
+        retrieve → rerank → aggregate. Every ranking improvement made in the app therefore
+        skipped Grogu silently — the recency reservation and the recent-verbatim-match boost
+        both landed that way — so the same query answered differently depending on which door
+        it came in through, with the MCP answer being the worse one and nothing saying so. It
+        now delegates to the app's <code>SearchEngine</code>.
+      </div>
+      <div class="callout fix">
+        <strong>The running app answers when there is one.</strong> If the desktop app is up
+        and serving the same index, the MCP server proxies the query to it over loopback
+        instead of loading a second copy of the models — saving ~1&nbsp;GB of RSS and a
+        multi-second cold start. With no app running it falls back to its own lazy in-process
+        pipeline, so Grogu still works when seaglass is closed.
+      </div>
+      <div class="callout fix">
+        <strong>Results declare their freshness and their ordering.</strong> Every search
+        payload carries <code>index_stale</code> / <code>n_messages_since_index</code> (a
+        stale answer is otherwise indistinguishable from a complete one) and
+        <code>ordering</code>, which is <code>recent</code> for a time-ordered browse and
+        <code>relevance</code> otherwise — a caller honouring a limit needs to know whether
+        "first" means most relevant or most recent. The freshness read costs ~0.25s against
+        the live chat.db, so it is cached for 30s and invalidated after a build.
+      </div>
       <div class="callout fix">
         <strong>Behavior note:</strong> <code>get_conversation</code>'s <code>around_ts</code>
         path searches the whole chat by fetching cheap <code>(ROWID, date)</code> pairs, locating
@@ -597,8 +622,23 @@
       <code>LIKE</code> fallback path normalizes Apple-epoch timestamps to unix seconds so both paths
       return dates in the same format.</p>
       <p><code>grogu imessage status</code> reports whether seaglass is configured and reachable
-      (<code>seaglass: true/false</code>); <code>grogu imessage search</code> transparently uses
-      seaglass when available and falls back to SQL <code>LIKE</code> otherwise.</p>
+      (<code>seaglass: true/false</code>) along with the index's own freshness
+      (<code>seaglass_index.n_messages_since_index</code>); <code>grogu imessage search</code>
+      transparently uses seaglass when available and falls back to SQL <code>LIKE</code>
+      otherwise, warning on stderr when it does. A search against a lagging index prints a
+      staleness warning and points at <code>grogu imessage sync</code>.</p>
+      <div class="callout fix">
+        <strong>Person-and-recency queries.</strong> "latest from Adrian" is the most ordinary
+        thing anyone asks, and it was wrong in four independent ways: <code>from X</code> only
+        narrowed to <em>chats X is in</em>, so a group chat answered with someone else's
+        messages; the filler words "latest"/"recent"/"the last thing" were embedded, and the
+        noise vector decided the ranking; browse-mode pseudo-scores saturated the aggregation
+        sigmoid so the ranking silently became "whichever day has the most chunks"; and
+        chat.db stamps outgoing 1:1 messages with the <em>recipient's</em> handle_id, so a
+        handle filter kept both halves of the conversation. seaglass now resolves a sender
+        filter, narrows candidates to chunks that person actually spoke in, and routes
+        contentless queries to a time-ordered browse.
+      </div>
     </section>
 
     <section id="latency">
