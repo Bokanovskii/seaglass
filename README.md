@@ -76,3 +76,20 @@ docs/
   architecture.html       # interactive architecture reference (see Status above)
 development-plans/       # design docs (see Status above)
 ```
+
+## Desktop app
+
+Install the app extras in the same venv you already use for seaglass:
+
+```bash
+source .venv/bin/activate
+pip install -e ".[app,dev]"
+```
+
+Build an index first, then launch the desktop app:
+
+```bash
+seaglass-app --index-db /path/to/index.db --chat-db /path/to/chat.db
+```
+
+By default this opens a native `pywebview` window. Use `--browser` if you want a browser tab for debugging. On first run, the app shows a real warmup screen while it loads model weights, warms SQLite, and prepares contacts. If no index exists yet, you'll get a friendly prompt to run `seaglass build ...` first. If `chat.db` or Full Disk Access is unavailable, the app explains that hydration is limited and tells you how to fix it. If GitHub Copilot CLI is missing, search still works normally; only optional query assist stays off.

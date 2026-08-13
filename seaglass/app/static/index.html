@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>seaglass</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <div id="loading-screen" class="screen">
+    <div class="card">
+      <h1>seaglass</h1>
+      <p>Loading models once so every search is fast.</p>
+      <div class="progress"><div id="progress-bar"></div></div>
+      <ul id="warmup-steps"></ul>
+      <p id="loading-error" class="error hidden"></p>
+    </div>
+  </div>
+  <div id="app" class="hidden">
+    <header>
+      <div class="brand">🔍 seaglass</div>
+      <input id="query" placeholder="search messages…" />
+      <button id="search-button">Search</button>
+      <div class="assist-toggle">
+        <button data-assist="off" class="assist active">Off</button>
+        <button data-assist="auto" class="assist">Auto</button>
+        <button data-assist="force" class="assist">Force</button>
+      </div>
+    </header>
+    <main>
+      <aside>
+        <h2>Filters</h2>
+        <label>People</label>
+        <input id="people-input" placeholder="Add person" />
+        <div id="people-suggestions" class="suggestions"></div>
+        <div id="people-chips" class="chips"></div>
+        <label>Conversation</label>
+        <div class="radio-group">
+          <label><input type="radio" name="group" value="" checked>Any</label>
+          <label><input type="radio" name="group" value="false">1:1</label>
+          <label><input type="radio" name="group" value="true">Group</label>
+        </div>
+        <label>Chat</label>
+        <input id="chat-input" placeholder="Find conversation" />
+        <div id="chat-suggestions" class="suggestions"></div>
+        <label>Date range</label>
+        <div class="dates"><input id="date-from" type="date"><span>→</span><input id="date-to" type="date"></div>
+        <div class="presets">
+          <button data-days="7">7d</button>
+          <button data-days="30">30d</button>
+          <button data-days="90">90d</button>
+          <button data-days="365">1y</button>
+          <button data-days="">All</button>
+        </div>
+        <label><input id="has-media" type="checkbox"> Has media</label>
+        <button id="clear-filters">Clear all filters</button>
+      </aside>
+      <section>
+        <div id="assist-banner" class="banner hidden"></div>
+        <div id="results-meta"></div>
+        <div id="results"></div>
+      </section>
+    </main>
+    <div id="drawer" class="drawer hidden"><div id="drawer-content"></div></div>
+    <footer id="status-bar"></footer>
+  </div>
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>

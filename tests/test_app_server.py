@@ -1,0 +1,72 @@
+from __future__ import annotations
+
+from fastapi.testclient import TestClient
+
+from seaglass.app.server import create_app
+from seaglass.app.warmup import WarmupState
+
+
+class StubEngine:
+    def __init__(self):
+        self.contact_index = None
+        self.corpus_bounds = (0, 2000000000)
+
+    def health(self):
+        return {'warnings': []}
+
+    def status(self):
+        return {'n_chunks': 1, 'n_vectors': 1, 'n_chats': 1, 'hydration_available': True, 'n_messages_since_index': 0}
+
+    def search(self, text, filters, options):
+        return {'n_sessions': 1, 'n_results': 1, 'confidence': 'high', 'sessions': [{'chat_id': 1, 'day': '2024-01-01', 'score': 1.0, 'title': 'Alice Chen', 'is_group': False, 'participant_count': 1, 'participants': ['+15551234567'], 'messages': [{'message_id': 1, 'ts': 1.0, 'sender': 'Alice Chen', 'text': text, 'has_attachment': False}], 'context_messages': []}], 'effective_filters': {'semantic': text}, 'parse_source': 'deterministic', 'timings': {}, 'elapsed_s': 0.1}
+
+    def conversation(self, chat_id, around_ts, limit):
+        return {'chat_id': chat_id, 'title': 'Alice Chen', 'is_group': False, 'participants': ['+15551234567'], 'messages': []}
+
+    def suggest_contacts(self, q, limit=10):
+        return [{'display_name': 'Alice Chen', 'handles': ['+15551234567'], 'n_handles': 1, 'score': 1.0}]
+
+    def suggest_chats(self, q, limit=20):
+        return [{'chat_id': 1, 'title': 'Alice Chen', 'is_group': False, 'participant_count': 1, 'n_chunks': 1, 'last_ts': 1.0}]
+
+
+class StubConfig:
+    port = 8765
+    copilot_bin = None
+    def to_dict(self):
+        return {'port': self.port}
+
+
+def _client():
+    warmup = WarmupState(['open_index'])
+    with warmup.step('open_index'):
+        pass
+    warmup.set_ready()
+    app = create_app(StubEngine(), warmup, StubConfig(), 'token123')
+    return TestClient(app)
+
+
+def test_api_requires_token():
+    client = _client()
+    response = client.get('/api/health')
+    assert response.status_code == 401
+
+
+def test_api_rejects_bad_origin():
+    client = _client()
+    response = client.get('/api/health', headers={'Authorization': 'Bearer token123', 'Origin': 'https://evil.example', 'Host': '127.0.0.1:8765'})
+    assert response.status_code == 403
+
+
+def test_health_round_trip():
+    client = _client()
+    response = client.get('/api/health', headers={'Authorization': 'Bearer token123', 'Host': '127.0.0.1:8765'})
+    assert response.status_code == 200
+    assert response.json()['state'] == 'READY'
+
+
+def test_search_round_trip():
+    client = _client()
+    response = client.post('/api/search', headers={'Authorization': 'Bearer token123', 'Host': '127.0.0.1:8765'}, json={'query': 'lease', 'filters': {}, 'options': {}, 'assist': 'off', 'request_id': 'abc'})
+    assert response.status_code == 200
+    assert response.json()['request_id'] == 'abc'

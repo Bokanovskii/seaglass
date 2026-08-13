@@ -1,0 +1,26 @@
+:root { color-scheme: light dark; font-family: -apple-system, BlinkMacSystemFont, sans-serif; }
+body { margin: 0; background: #111827; color: #f9fafb; }
+header, footer { padding: 12px 16px; background: rgba(17,24,39,.95); position: sticky; z-index: 2; }
+header { top: 0; display: flex; gap: 12px; align-items: center; }
+main { display: grid; grid-template-columns: 280px 1fr; min-height: calc(100vh - 120px); }
+aside { padding: 16px; border-right: 1px solid #374151; display: flex; flex-direction: column; gap: 10px; }
+section { padding: 16px; }
+input, button { border-radius: 8px; border: 1px solid #4b5563; padding: 10px; background: #1f2937; color: inherit; }
+button { cursor: pointer; }
+.screen { min-height: 100vh; display: grid; place-items: center; }
+.card { width: min(720px, 92vw); background: #1f2937; border: 1px solid #374151; border-radius: 16px; padding: 24px; }
+.progress { height: 10px; background: #111827; border-radius: 999px; overflow: hidden; }
+#progress-bar { height: 100%; width: 0; background: linear-gradient(90deg, #60a5fa, #34d399); }
+.hidden { display: none !important; }
+.error { color: #fca5a5; }
+.banner { padding: 12px; border-radius: 10px; background: #1d4ed8; margin-bottom: 12px; }
+.result-card { border: 1px solid #374151; border-radius: 12px; padding: 12px; margin-bottom: 12px; background: #1f2937; }
+.message { margin: 6px 0; white-space: pre-wrap; }
+.context details { opacity: .7; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip { background: #2563eb; padding: 4px 8px; border-radius: 999px; }
+.suggestions { display: flex; flex-direction: column; gap: 4px; }
+.suggestion { padding: 6px 8px; border: 1px solid #374151; border-radius: 8px; }
+.drawer { position: fixed; top: 0; right: 0; width: min(480px, 100vw); height: 100vh; background: #111827; border-left: 1px solid #374151; overflow: auto; padding: 16px; }
+.assist.active { background: #2563eb; }
+@media (max-width: 900px) { main { grid-template-columns: 1fr; } aside { border-right: 0; border-bottom: 1px solid #374151; } }
