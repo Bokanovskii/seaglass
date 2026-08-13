@@ -21,7 +21,7 @@ class ChatMetadataCache:
         self._by_chat_id = by_chat_id
 
     @classmethod
-    def build(cls, chat_con, present_chat_ids: Optional[set[int]] = None) -> "ChatMetadataCache":
+    def build(cls, chat_con, present_chat_ids: Optional[set[int]] = None, contact_index=None) -> "ChatMetadataCache":
         chats = chat_con.execute(
             """
             SELECT c.ROWID, c.style, h.id
@@ -48,7 +48,7 @@ class ChatMetadataCache:
             participants = tuple(participants_by_chat.get(chat_id, []))
             participant_count = len(participants)
             is_group = classify_chat(style, participant_count)
-            title = format_chat_title(participants, chat_identifier)
+            title = format_chat_title(participants, chat_identifier, contact_index)
             by_chat_id[chat_id] = ChatMetadata(
                 chat_id=chat_id,
                 is_group=is_group,
@@ -72,9 +72,13 @@ def classify_chat(style: Optional[int], participant_count: int) -> bool:
     return participant_count > 1
 
 
-def format_chat_title(participants: tuple[str, ...], chat_identifier: Optional[str]) -> str:
+def format_chat_title(participants: tuple[str, ...], chat_identifier: Optional[str], contact_index=None) -> str:
     if participants:
-        return ", ".join(participants)
+        names = []
+        for handle in participants:
+            name = contact_index.resolve_handle(handle) if contact_index is not None else None
+            names.append(name or handle)
+        return ", ".join(names)
     if chat_identifier:
         return chat_identifier
     return "Unknown conversation"

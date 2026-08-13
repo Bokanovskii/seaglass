@@ -67,15 +67,15 @@ class SearchEngine:
             if self.chat_db:
                 self.chat_con = connect_readonly(Path(self.chat_db))
                 self.chat_con = self.chat_con if getattr(self.chat_con, 'execute', None) else self.chat_con
-        with progress('build_chatmeta'):
-            present_chat_ids = {row[0] for row in self.index_con.execute('SELECT DISTINCT chat_id FROM chunks')}
-            self.chatmeta = ChatMetadataCache.build(self.chat_con, present_chat_ids) if self.chat_con else ChatMetadataCache({})
         with progress('load_contacts'):
             try:
                 self.contact_index = ContactIndex.load()
             except ContactsUnavailableError as exc:
                 self.warnings.append('Contacts unavailable — sender names will show raw handles')
                 self.contact_index = None
+        with progress('build_chatmeta'):
+            present_chat_ids = {row[0] for row in self.index_con.execute('SELECT DISTINCT chat_id FROM chunks')}
+            self.chatmeta = ChatMetadataCache.build(self.chat_con, present_chat_ids, contact_index=self.contact_index) if self.chat_con else ChatMetadataCache({})
         with progress('warm_sqlite'):
             self.index_con.execute('SELECT COUNT(*), SUM(LENGTH(body_semantic)) FROM chunks').fetchone()
             self.index_con.execute('SELECT COUNT(*) FROM chunks_vec').fetchone()

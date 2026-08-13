@@ -34,3 +34,33 @@ def test_chatmeta_cache_builds_titles_and_group_flags(tmp_path):
     assert cache.get(1).title == '+15551234567'
     assert cache.get(1).is_group is False
     assert cache.get(2).is_group is True
+
+
+def test_chatmeta_cache_resolves_titles_via_contact_index(tmp_path):
+    from seaglass.imessage.contacts import Contact, ContactIndex
+
+    chat_db = build_fixture_chat_db(
+        tmp_path,
+        [
+            {'chat_id': 1, 'handles': ['+15551234567'], 'messages': [('hello', 700000000, False, 0)]},
+        ],
+    )
+    con = connect_readonly(chat_db)
+    contact_index = ContactIndex([Contact(identifier='abc', display_name='Alice Chen', handles=('+15551234567',))])
+    cache = ChatMetadataCache.build(con, contact_index=contact_index)
+    assert cache.get(1).title == 'Alice Chen'
+
+
+def test_chatmeta_cache_falls_back_to_handle_when_contact_unresolved(tmp_path):
+    from seaglass.imessage.contacts import Contact, ContactIndex
+
+    chat_db = build_fixture_chat_db(
+        tmp_path,
+        [
+            {'chat_id': 1, 'handles': ['+15559999999'], 'messages': [('hello', 700000000, False, 0)]},
+        ],
+    )
+    con = connect_readonly(chat_db)
+    contact_index = ContactIndex([Contact(identifier='abc', display_name='Alice Chen', handles=('+15551234567',))])
+    cache = ChatMetadataCache.build(con, contact_index=contact_index)
+    assert cache.get(1).title == '+15559999999'

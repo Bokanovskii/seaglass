@@ -76,7 +76,11 @@ async function pollHealth() {
     return;
   }
   els.progressBar.style.width = `${Math.round((health.progress || 0) * 100)}%`;
-  els.warmupSteps.innerHTML = (health.steps || []).map(step => `<li>${symbolFor(step.state)} ${step.name} <span>${step.elapsed_s?.toFixed?.(2) || step.elapsed_s || 0}s</span></li>`).join('');
+  els.warmupSteps.innerHTML = (health.steps || []).map(step => {
+    const stepState = step.state || 'pending';
+    const elapsed = step.elapsed_s?.toFixed?.(2) ?? step.elapsed_s ?? 0;
+    return `<li class="step step-${escapeHtml(stepState)}"><span class="step-icon">${symbolFor(stepState)}</span><span class="step-name">${escapeHtml(step.name || '')}</span><span class="step-time">${escapeHtml(elapsed)}s</span></li>`;
+  }).join('');
   if (health.error) {
     els.loadingError.textContent = health.error;
     els.loadingError.classList.remove('hidden');
@@ -132,11 +136,14 @@ function symbolFor(state) {
 
 async function refreshStatus() {
   const status = await api('/api/status');
-  const stale = status.n_messages_since_index ? ` · ⚠ ${status.n_messages_since_index} msgs since last index build` : '';
-  els.statusBar.textContent = `${status.hydration_available ? '●' : '◌'} Ready · ${status.n_chunks} chunks · ${status.n_chats} chats${stale}`;
+  const stale = status.n_messages_since_index
+    ? `<span class="status-sep">·</span><span class="status-stale">⚠ ${status.n_messages_since_index.toLocaleString()} msgs since last index build</span>`
+    : '';
+  els.statusBar.innerHTML = `<span class="status-dot${status.hydration_available ? '' : ' is-off'}"></span><span>Ready</span><span class="status-sep">·</span><span>${Number(status.n_chunks || 0).toLocaleString()} chunks</span><span class="status-sep">·</span><span>${Number(status.n_chats || 0).toLocaleString()} chats</span>${stale}`;
   if (status.n_messages_since_index > 0) {
     els.syncBanner.classList.remove('hidden');
-    els.syncBanner.innerHTML = `${status.n_messages_since_index} new message${status.n_messages_since_index === 1 ? '' : 's'} since the index was last built. <button id="sync-now">Sync now</button>`;
+    const plural = status.n_messages_since_index === 1 ? '' : 's';
+    els.syncBanner.innerHTML = `<span class="banner-icon">${iconSvg('i-refresh')}</span><span class="banner-text"><strong>${status.n_messages_since_index.toLocaleString()} new message${plural}</strong> since the index was last built.</span><span class="banner-actions"><button id="sync-now" class="btn btn-sm btn-primary">Sync now</button></span>`;
     document.getElementById('sync-now').onclick = syncNow;
   } else {
     els.syncBanner.classList.add('hidden');
@@ -147,10 +154,10 @@ async function syncNow() {
   try {
     await api('/api/index/build', {method: 'POST'});
   } catch (err) {
-    els.syncBanner.textContent = err.message;
+    els.syncBanner.innerHTML = `<span class="banner-icon">${iconSvg('i-refresh')}</span><span class="banner-text">${escapeHtml(err.message)}</span>`;
     return;
   }
-  els.syncBanner.textContent = 'Syncing… this may take a while.';
+  els.syncBanner.innerHTML = `<span class="banner-icon">${iconSvg('i-refresh')}</span><span class="banner-text">Syncing… this may take a while.</span>`;
   pollHealth();
 }
 
@@ -168,10 +175,16 @@ function buildFilters() {
 
 async function search() {
   state.requestId = crypto.randomUUID();
-  const payload = await api('/api/search', {
-    method: 'POST',
-    body: JSON.stringify({ query: els.query.value, filters: buildFilters(), options: {}, assist: state.assist, request_id: state.requestId })
-  });
+  setBusy(true);
+  let payload;
+  try {
+    payload = await api('/api/search', {
+      method: 'POST',
+      body: JSON.stringify({ query: els.query.value, filters: buildFilters(), options: {}, assist: state.assist, request_id: state.requestId })
+    });
+  } finally {
+    setBusy(false);
+  }
   if (payload.request_id !== state.requestId) return;
   renderResults(payload);
   if (payload.assist_token) {
@@ -180,11 +193,27 @@ async function search() {
   }
 }
 
+function setBusy(busy) {
+  els.searchButton.classList.toggle('is-busy', busy);
+  els.searchButton.disabled = busy;
+  els.results.classList.toggle('is-busy', busy);
+}
+
+function iconSvg(name, className = 'icon') {
+  return `<svg class="${className}" aria-hidden="true"><use href="#${name}"></use></svg>`;
+}
+
 function renderResults(payload) {
   state.results = payload.sessions || [];
-  els.resultsMeta.textContent = `${payload.effective_filters.semantic || els.query.value} · ${payload.n_sessions} sessions · ${payload.n_results} msgs · ${payload.elapsed_s}s`;
+  const term = payload.effective_filters.semantic || els.query.value;
+  els.resultsMeta.innerHTML = [
+    term ? `<span class="meta-query">${escapeHtml(term)}</span>` : '',
+    `<span class="meta-pill">${payload.n_sessions} session${payload.n_sessions === 1 ? '' : 's'}</span>`,
+    `<span class="meta-pill">${payload.n_results} msg${payload.n_results === 1 ? '' : 's'}</span>`,
+    `<span class="meta-pill">${payload.elapsed_s}s</span>`,
+  ].filter(Boolean).join('');
   if (!payload.sessions?.length) {
-    els.results.innerHTML = `<div class="result-card">No messages match your filters. Try removing a filter.</div>`;
+    els.results.innerHTML = `<div class="empty-state"><div class="empty-icon">${iconSvg('i-search')}</div><div class="empty-title">No matching messages</div><p class="empty-hint">Nothing matched this search and the filters you have applied. Try loosening a filter, widening the date range, or rephrasing the query.</p></div>`;
     return;
   }
   els.results.innerHTML = payload.sessions.map((session, index) => renderSession(session, index)).join('');
@@ -193,12 +222,45 @@ function renderResults(payload) {
 
 function renderSession(session, index) {
   const hits = (session.messages || []).map(renderMessage).join('');
-  const context = (session.context_messages || []).map(renderMessage).join('');
-  return `<article class="result-card" data-index="${index}"><h3>${escapeHtml(session.title || `Chat ${session.chat_id}`)} · ${session.day} · score ${Number(session.score || 0).toFixed(2)}</h3><div>${hits}</div><div class="context"><details><summary>± surrounding context</summary>${context}</details></div><button data-chat-id="${session.chat_id}" data-around-ts="${session.messages?.[0]?.ts || ''}">Open full conversation ↗</button></article>`;
+  const contextMessages = session.context_messages || [];
+  const context = contextMessages.map(renderMessage).join('');
+  const score = Number(session.score || 0);
+  const scoreWidth = Math.max(6, Math.min(100, Math.round(score * 100)));
+  const title = escapeHtml(session.title || `Chat ${session.chat_id}`);
+  const groupBadge = session.is_group ? `<span class="meta-pill">${iconSvg('i-people', 'icon icon-sm')} ${session.participant_count || ''}</span>` : '';
+  const contextBlock = context
+    ? `<div class="context"><details><summary>Surrounding context <span class="meta-pill">${contextMessages.length}</span></summary><div class="context-body">${context}</div></details></div>`
+    : '';
+  return `<article class="result-card" data-index="${index}">`
+    + `<header class="card-head"><span class="card-title">${title}</span>${groupBadge}<span class="card-day">${escapeHtml(session.day || '')}</span>`
+    + `<span class="score-pill" title="relevance score"><span class="score-bar"><i style="width:${scoreWidth}%"></i></span>${score.toFixed(2)}</span></header>`
+    + `<div class="card-hits">${hits}</div>`
+    + contextBlock
+    + `<div class="card-foot-row"><button class="btn btn-sm" data-chat-id="${session.chat_id}" data-around-ts="${session.messages?.[0]?.ts || ''}">${iconSvg('i-arrow-out', 'icon icon-sm')} Open full conversation</button></div>`
+    + `</article>`;
 }
 
 function renderMessage(message) {
-  return `<div class="message"><strong>${escapeHtml(message.sender || 'Me')}</strong> ${formatTime(message.ts)} ${message.has_attachment ? '📎' : ''}<br>${highlight(message.text || '')}</div>`;
+  const isMe = message.is_from_me || !message.sender;
+  const sender = message.sender || 'Me';
+  const clip = message.has_attachment ? `<span class="msg-clip" title="has attachment">${iconSvg('i-clip', 'icon icon-sm')}</span>` : '';
+  return `<div class="msg${isMe ? ' msg-me' : ''}">`
+    + `<span class="msg-avatar" style="--avatar-h:${hueFor(sender)}" aria-hidden="true">${escapeHtml(initialsFor(sender))}</span>`
+    + `<div class="msg-body"><div class="msg-head"><span class="msg-sender">${escapeHtml(sender)}</span><span class="msg-time">${formatTime(message.ts)}</span>${clip}</div>`
+    + `<div class="msg-text">${highlight(message.text || '')}</div></div></div>`;
+}
+
+function initialsFor(name) {
+  const parts = String(name).trim().split(/\s+/).filter(Boolean);
+  if (!parts.length) return '?';
+  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
+  return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
+}
+
+function hueFor(name) {
+  let hash = 0;
+  for (const char of String(name)) hash = (hash * 31 + char.charCodeAt(0)) % 360;
+  return hash;
 }
 
 function formatTime(ts) {
@@ -222,7 +284,7 @@ async function pollAssist(tokenValue) {
   }
   if (result.status === 'ready') {
     els.assistBanner.classList.remove('hidden');
-    els.assistBanner.innerHTML = `Copilot read this as: ${escapeHtml(describeAssist(result))} <button id="apply-assist">Apply</button> <button id="dismiss-assist">Dismiss</button>`;
+    els.assistBanner.innerHTML = `<span class="banner-icon">${iconSvg('i-sparkle')}</span><span class="banner-text">Copilot read this as <span class="assist-parse">${escapeHtml(describeAssist(result))}</span></span><span class="banner-actions"><button id="apply-assist" class="btn btn-sm btn-primary">Apply</button><button id="dismiss-assist" class="btn btn-sm btn-ghost">Dismiss</button></span>`;
     document.getElementById('apply-assist').onclick = () => applyAssist(tokenValue);
     document.getElementById('dismiss-assist').onclick = () => els.assistBanner.classList.add('hidden');
   }
@@ -253,12 +315,16 @@ async function openConversation(event) {
   if (button.dataset.aroundTs) params.set('around_ts', button.dataset.aroundTs);
   const payload = await api(`/api/conversation?${params.toString()}`);
   els.drawer.classList.remove('hidden');
-  els.drawerContent.innerHTML = `<button id="close-drawer">Close</button><h2>${escapeHtml(payload.title || `Chat ${payload.chat_id}`)}</h2>${payload.messages.map(renderMessage).join('')}`;
+  const count = payload.messages.length;
+  const subtitle = payload.is_group
+    ? `Group · ${(payload.participants || []).length || ''} people · ${count} messages`
+    : `${count} messages`;
+  els.drawerContent.innerHTML = `<header class="drawer-head"><div class="drawer-titles"><div class="drawer-title">${escapeHtml(payload.title || `Chat ${payload.chat_id}`)}</div><div class="drawer-sub">${escapeHtml(subtitle)}</div></div><button id="close-drawer" class="icon-btn" aria-label="Close conversation" title="Close (Esc)">${iconSvg('i-close', 'icon')}</button></header><div class="drawer-messages">${payload.messages.map(renderMessage).join('')}</div>`;
   document.getElementById('close-drawer').onclick = () => els.drawer.classList.add('hidden');
 }
 
 function renderPeopleChips() {
-  els.peopleChips.innerHTML = state.people.map((person, index) => `<button class="chip" data-index="${index}">${escapeHtml(person.display_name)} ×</button>`).join('');
+  els.peopleChips.innerHTML = state.people.map((person, index) => `<button class="chip" data-index="${index}" title="Remove ${escapeHtml(person.display_name)}">${escapeHtml(person.display_name)}<span class="chip-x" aria-hidden="true">×</span></button>`).join('');
   els.peopleChips.querySelectorAll('[data-index]').forEach(button => button.addEventListener('click', () => {
     state.people.splice(Number(button.dataset.index), 1);
     renderPeopleChips();
@@ -269,7 +335,7 @@ async function suggestPeople() {
   const query = els.peopleInput.value.trim();
   if (!query) { els.peopleSuggestions.innerHTML = ''; return; }
   const suggestions = await api(`/api/contacts/suggest?q=${encodeURIComponent(query)}&limit=10`);
-  els.peopleSuggestions.innerHTML = suggestions.map((item, index) => `<button class="suggestion" data-index="${index}">${escapeHtml(item.display_name)} · ${item.n_handles} handle${item.n_handles === 1 ? '' : 's'}</button>`).join('');
+  els.peopleSuggestions.innerHTML = suggestions.map((item, index) => `<button class="suggestion" data-index="${index}"><span class="s-title">${escapeHtml(item.display_name)}</span><span class="s-meta">${item.n_handles} handle${item.n_handles === 1 ? '' : 's'}</span></button>`).join('');
   els.peopleSuggestions.querySelectorAll('[data-index]').forEach(button => button.onclick = () => {
     const item = suggestions[Number(button.dataset.index)];
     state.people.push(item);
@@ -282,7 +348,7 @@ async function suggestPeople() {
 async function suggestChats() {
   const query = els.chatInput.value.trim();
   const suggestions = await api(`/api/chats/suggest?q=${encodeURIComponent(query)}&limit=20`);
-  els.chatSuggestions.innerHTML = suggestions.map((item, index) => `<button class="suggestion" data-index="${index}">${escapeHtml(item.title)} · ${item.is_group ? 'group' : '1:1'}</button>`).join('');
+  els.chatSuggestions.innerHTML = suggestions.map((item, index) => `<button class="suggestion" data-index="${index}"><span class="s-title">${escapeHtml(item.title)}</span><span class="s-meta">${item.is_group ? 'group' : '1:1'}</span></button>`).join('');
   els.chatSuggestions.querySelectorAll('[data-index]').forEach(button => button.onclick = () => {
     state.selectedChat = suggestions[Number(button.dataset.index)];
     els.chatInput.value = state.selectedChat.title;
@@ -338,6 +404,14 @@ els.peopleInput.addEventListener('input', debounce(suggestPeople, 150));
 els.chatInput.addEventListener('input', debounce(suggestChats, 150));
 document.getElementById('clear-filters').onclick = clearFilters;
 document.querySelectorAll('.presets button').forEach(button => button.onclick = () => applyPreset(button.dataset.days));
+document.querySelectorAll('[data-drawer-close]').forEach(el => el.addEventListener('click', () => els.drawer.classList.add('hidden')));
+document.addEventListener('click', event => {
+  const target = event.target;
+  if (!(target instanceof Element) || !target.closest('.combo')) {
+    els.peopleSuggestions.innerHTML = '';
+    els.chatSuggestions.innerHTML = '';
+  }
+});
 
 function debounce(fn, delay) {
   let handle;
