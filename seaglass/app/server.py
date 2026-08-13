@@ -229,6 +229,7 @@ def create_app(engine, warmup_state, config, token: str):
                 return
 
             def _rewarm():
+                engine.invalidate_freshness()
                 warmup_state.state = 'STARTING'
                 warmup_state.error = None
                 for step in warmup_state.steps:

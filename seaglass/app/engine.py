@@ -59,6 +59,7 @@ class SearchEngine:
         # Cached read-only handle on the *live* chat.db (see status()).
         self._live_chat_con: sqlite3.Connection | None = None
         self._live_chat_lock = threading.RLock()
+        self._freshness_cache: tuple[float, float | None, int] | None = None
         self.embedding_model: EmbeddingModel | None = None
         self.reranker: CrossEncoderReranker | None = None
         self.contact_index: ContactIndex | None = None
@@ -143,7 +144,7 @@ class SearchEngine:
         n_vectors = self.index_con.execute('SELECT COUNT(*) FROM chunks_vec').fetchone()[0]
         n_chats = self.index_con.execute('SELECT COUNT(DISTINCT chat_id) FROM chunks').fetchone()[0]
         most_recent_chunk_ts = self.index_con.execute('SELECT MAX(end_ts) FROM chunks').fetchone()[0]
-        chat_db_max_ts, newer_messages = self._live_chat_freshness(most_recent_chunk_ts)
+        chat_db_max_ts, newer_messages = self._cached_freshness(most_recent_chunk_ts)
         return {
             'n_chunks': n_chunks,
             'n_vectors': n_vectors,
@@ -202,6 +203,10 @@ class SearchEngine:
             return self._live_chat_con
 
     def _close_live_chat_connection(self) -> None:
+        # The cached reading belongs to the connection being dropped: it
+        # was taken from a db that is being closed, repointed, or has just
+        # errored, so it must not outlive it.
+        self._freshness_cache = None
         with self._live_chat_lock:
             if self._live_chat_con is not None:
                 try:
@@ -209,6 +214,26 @@ class SearchEngine:
                 except sqlite3.Error:
                     pass
                 self._live_chat_con = None
+
+    # Reading the live chat.db costs ~0.25s, which is comparable to a
+    # whole browse query -- too much to pay on every search, but staleness
+    # is only interesting at human timescales, so a short cache makes it
+    # free for callers that want it on every result.
+    FRESHNESS_TTL_S = 30.0
+
+    def invalidate_freshness(self) -> None:
+        """Drop the cached staleness reading -- call after a build, or the
+        app reports "N messages behind" for up to a TTL after syncing."""
+        self._freshness_cache = None
+
+    def _cached_freshness(self, most_recent_chunk_ts: float | None) -> tuple[float | None, int]:
+        now = time.time()
+        cached = self._freshness_cache
+        if cached is not None and now - cached[0] < self.FRESHNESS_TTL_S:
+            return cached[1], cached[2]
+        chat_db_max_ts, newer = self._live_chat_freshness(most_recent_chunk_ts)
+        self._freshness_cache = (now, chat_db_max_ts, newer)
+        return chat_db_max_ts, newer
 
     def _live_chat_freshness(self, most_recent_chunk_ts: float | None) -> tuple[float | None, int]:
         """(max message ts in the live chat.db as unix seconds, count of
@@ -440,7 +465,15 @@ class SearchEngine:
                 session['participant_count'] = meta.participant_count
                 session['participants'] = list(meta.participants)
 
+        most_recent_chunk_ts = self.index_con.execute('SELECT MAX(end_ts) FROM chunks').fetchone()[0]
+        _, newer_messages = self._cached_freshness(most_recent_chunk_ts)
         payload.update({
+            # Every caller that reads a result should be able to see that
+            # the answer was drawn from an index missing the last N
+            # messages, without a second round trip. Grogu in particular
+            # answers "what did X just say" from this.
+            'n_messages_since_index': int(newer_messages),
+            'index_stale': bool(newer_messages),
             'offset': offset,
             'total_sessions': total_sessions,
             'has_more': offset + options.max_sessions < total_sessions,

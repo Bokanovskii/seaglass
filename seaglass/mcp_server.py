@@ -276,6 +276,16 @@ def _get_engine():
                 from seaglass.app.engine import SearchEngine
 
                 _engine = SearchEngine(index_db="", chat_db=None)
+    # Staleness must be judged against the *live* chat.db. Without this the
+    # engine falls back to the snapshot, which is by definition exactly as
+    # stale as the index, so every result claims to be up to date.
+    if not _engine.chat_db_source:
+        try:
+            from seaglass.app.config import load_config
+
+            _engine.chat_db_source = load_config().chat_db_source
+        except Exception:  # noqa: BLE001 - no config is not a search failure
+            pass
     _engine.index_con = _get_index_con()
     _engine.chat_con = _get_chat_con()
     _engine.embedding_model = _get_embedding_model()
@@ -504,11 +514,8 @@ def _staleness(most_recent_chunk_ts) -> dict:
     """
     result = {"n_messages_since_index": 0, "live_chat_readable": False, "stale": False}
     try:
-        from seaglass.app.config import load_config
-
-        engine = _get_engine()
-        engine.chat_db_source = load_config().chat_db_source
-        _, newer = engine._live_chat_freshness(most_recent_chunk_ts)
+        engine = _get_engine()  # already points at the live chat.db
+        _, newer = engine._cached_freshness(most_recent_chunk_ts)
     except Exception as error:  # noqa: BLE001 - usually Full Disk Access
         result["live_chat_error"] = str(error)
         return result

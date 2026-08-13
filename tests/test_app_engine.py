@@ -198,3 +198,31 @@ def test_status_reports_live_chat_readability(tmp_path, monkeypatch):
     status = engine.status()
     assert status['live_chat_readable'] is False
     assert status['n_messages_since_index'] == 0
+
+
+def test_freshness_is_cached_between_calls(tmp_path, monkeypatch):
+    # Reading the live chat.db costs ~0.25s -- roughly a whole query -- so
+    # it must not be paid on every search.
+    engine = _snapshot_and_live(tmp_path, monkeypatch, [('new', APPLE_EPOCH_START + 5000)])
+    engine.invalidate_freshness()  # the helper may already have primed it
+    calls = []
+    original = engine._live_chat_freshness
+    engine._live_chat_freshness = lambda ts: (calls.append(ts), original(ts))[1]
+
+    engine.status()
+    engine.status()
+    assert len(calls) == 1
+
+
+def test_freshness_cache_is_dropped_after_a_build(tmp_path, monkeypatch):
+    # Otherwise the app keeps reporting "N messages behind" for a whole
+    # TTL after the user has just synced -- the one moment they are looking.
+    engine = _snapshot_and_live(tmp_path, monkeypatch, [('new', APPLE_EPOCH_START + 5000)])
+    engine.status()
+    engine.invalidate_freshness()
+    calls = []
+    original = engine._live_chat_freshness
+    engine._live_chat_freshness = lambda ts: (calls.append(ts), original(ts))[1]
+
+    engine.status()
+    assert len(calls) == 1
