@@ -259,3 +259,37 @@ class TestReserveRecentSlots:
         all_ids = [row[0] for row in con.execute("SELECT id FROM chunks").fetchall()]
         fused = [RetrievalResult(chunk_id=cid, rrf_score=1.0 / (i + 1)) for i, cid in enumerate(all_ids)]
         assert reserve_recent_slots(con, fused, all_ids, top_k=len(all_ids) + 10, slots=3) == fused
+
+
+class TestParticipantResolutionUsesAuthorship:
+    def _db(self):
+        import sqlite3
+
+        con = sqlite3.connect(':memory:')
+        con.executescript(
+            """
+            ATTACH DATABASE ':memory:' AS im;
+            CREATE TABLE im.handle (ROWID INTEGER PRIMARY KEY, id TEXT);
+            CREATE TABLE im.chat_handle_join (chat_id INTEGER, handle_id INTEGER);
+            CREATE TABLE im.message (ROWID INTEGER PRIMARY KEY, handle_id INTEGER, is_from_me INTEGER);
+            CREATE TABLE im.chat_message_join (chat_id INTEGER, message_id INTEGER);
+            INSERT INTO im.handle VALUES (1, '+1555');
+            -- roster knows chat 2 only; the person actually wrote in chat 1
+            INSERT INTO im.chat_handle_join VALUES (2, 1);
+            INSERT INTO im.message VALUES (10, 1, 0);
+            INSERT INTO im.chat_message_join VALUES (1, 10);
+            """
+        )
+        return con
+
+    def test_a_chat_missing_from_the_roster_is_still_found(self):
+        # chat.db's roster omitted a 3,614-message group's participants,
+        # which prefiltered that person's busiest chat out of their results.
+        from seaglass.search.retrieve import resolve_participant_chat_ids
+
+        assert resolve_participant_chat_ids(self._db(), ['+1555']) == {1, 2}
+
+    def test_no_handles_means_no_chats(self):
+        from seaglass.search.retrieve import resolve_participant_chat_ids
+
+        assert resolve_participant_chat_ids(self._db(), []) == set()

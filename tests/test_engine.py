@@ -103,41 +103,106 @@ class TestSenderFilterExcludesMyOwnMessages:
 
 
 class TestBrowseKeepsTheNewestHits:
-    def _session(self, n):
+    def _sessions(self, *sizes, base=0):
         from seaglass.search.hydrate import HydratedMessage, HydratedSession
 
-        return HydratedSession(
-            chat_id=1, day='d', score=1.0,
-            hit_messages=[
-                HydratedMessage(message_id=i, ts=float(i), is_from_me=False, sender='A',
-                                text=f'm{i}', has_attachment=False, handle='+1555')
-                for i in range(n)
-            ],
-            context_messages=[],
-        )
+        sessions = []
+        mid = base
+        for chat_id, size in enumerate(sizes, start=1):
+            messages = []
+            for _ in range(size):
+                mid += 1
+                messages.append(
+                    HydratedMessage(message_id=mid, ts=float(mid), is_from_me=False,
+                                    sender='A', text=f'm{mid}', has_attachment=False,
+                                    handle='+1555')
+                )
+            sessions.append(
+                HydratedSession(chat_id=chat_id, day=f'd{chat_id}', score=1.0,
+                                hit_messages=messages, context_messages=[])
+            )
+        return sessions
 
-    def test_a_long_session_is_trimmed_to_its_newest_hits(self):
-        from seaglass.app.engine import BROWSE_HITS_PER_SESSION, _newest_hits_only
-
-        kept = _newest_hits_only([self._session(30)])[0]
-        assert [m.message_id for m in kept.hit_messages] == list(
-            range(30 - BROWSE_HITS_PER_SESSION, 30)
-        )
-
-    def test_hits_stay_in_reading_order(self):
+    def test_hits_come_back_newest_first(self):
+        # The payload declares `ordering: recent`; a caller reading the top
+        # must get the latest message, not the oldest of the newest day.
         from seaglass.app.engine import _newest_hits_only
 
-        kept = _newest_hits_only([self._session(30)])[0]
-        assert kept.hit_messages == sorted(kept.hit_messages, key=lambda m: m.ts)
+        kept = _newest_hits_only(self._sessions(30), per_session=10)[0]
+        assert [m.message_id for m in kept.hit_messages] == list(range(30, 20, -1))
+
+    def test_the_budget_is_global_not_per_session(self):
+        # Per-session allocation cut 15 of the 20 most recent messages in
+        # favour of older ones from a week ago (recall@20 was 0.64).
+        from seaglass.app.engine import _newest_hits_only
+
+        # Session 2 holds the newest 25 messages; session 1 the oldest 25.
+        sessions = self._sessions(25, 25)
+        kept = _newest_hits_only(sessions, budget=20)
+        assert sum(len(s.hit_messages) for s in kept) == 20
+        newest = [m.message_id for s in kept for m in s.hit_messages]
+        assert set(newest) == set(range(31, 51))
+
+    def test_a_session_that_wins_no_budget_is_dropped(self):
+        from seaglass.app.engine import _newest_hits_only
+
+        kept = _newest_hits_only(self._sessions(10, 10), budget=5)
+        assert [s.chat_id for s in kept] == [2]
 
     def test_the_trimmed_messages_become_context_not_losses(self):
         from seaglass.app.engine import _newest_hits_only
 
-        kept = _newest_hits_only([self._session(30)])[0]
+        kept = _newest_hits_only(self._sessions(30), per_session=10)[0]
         assert len(kept.hit_messages) + len(kept.context_messages) == 30
 
-    def test_a_short_session_is_untouched(self):
+    def test_a_short_session_keeps_every_hit(self):
         from seaglass.app.engine import _newest_hits_only
 
-        session = self._session(4)
-        assert _newest_hits_only([session])[0] is session
+        kept = _newest_hits_only(self._sessions(4), per_session=10)[0]
+        assert len(kept.hit_messages) == 4
+
+
+class TestFirstPersonFilter:
+    def _session(self):
+        from seaglass.search.hydrate import HydratedMessage, HydratedSession
+
+        messages = [
+            HydratedMessage(message_id=1, ts=1.0, is_from_me=True, sender=None,
+                            text='mine', has_attachment=False, handle='+1555'),
+            HydratedMessage(message_id=2, ts=2.0, is_from_me=False, sender='K',
+                            text='theirs', has_attachment=False, handle='+1555'),
+        ]
+        return [HydratedSession(chat_id=1, day='d', score=1.0,
+                                hit_messages=messages, context_messages=[])]
+
+    def test_it_keeps_only_my_messages(self):
+        from seaglass.app.engine import _filter_by_from_me
+
+        kept = _filter_by_from_me(self._session(), True)[0]
+        assert [m.message_id for m in kept.hit_messages] == [1]
+
+    def test_the_other_side_becomes_context_not_a_loss(self):
+        from seaglass.app.engine import _filter_by_from_me
+
+        kept = _filter_by_from_me(self._session(), True)[0]
+        assert [m.message_id for m in kept.context_messages] == [2]
+
+
+class TestBrowseOrdersSessionsByRecency:
+    def test_sessions_come_back_newest_first(self):
+        from seaglass.app.engine import _newest_hits_only
+        from seaglass.search.hydrate import HydratedMessage, HydratedSession
+
+        def session(chat_id, stamps):
+            messages = [
+                HydratedMessage(message_id=int(t), ts=float(t), is_from_me=False,
+                                sender='A', text='x', has_attachment=False, handle='+1')
+                for t in stamps
+            ]
+            return HydratedSession(chat_id=chat_id, day='d', score=1.0,
+                                   hit_messages=messages, context_messages=[])
+
+        kept = _newest_hits_only([session(1, [10, 11]), session(2, [20, 21])])
+        kept.sort(key=lambda s: max(m.ts for m in s.hit_messages), reverse=True)
+        assert [s.chat_id for s in kept] == [2, 1]
+        assert [m.ts for s in kept for m in s.hit_messages] == [21, 20, 11, 10]

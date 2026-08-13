@@ -59,21 +59,35 @@ class RetrievalResult:
 
 
 def resolve_participant_chat_ids(chat_con, handle_ids: Sequence[str]) -> Set[int]:
-    """"with X" semantics: chat_ids where any of these handles is a
-    CURRENT member (chat_handle_join), per PLAN.md §6 Phase 4.
+    """"with X" semantics: chat_ids where these handles are a member.
+
+    Membership is the union of two sources, not just `chat_handle_join`.
+    That table is chat.db's *current* roster and it is not complete: on this
+    machine a 3,614-message SMS group listed none of its long-standing
+    participants, so "messages from Sachu" prefiltered his busiest chat
+    away and answered from the scraps that survived. Someone who wrote
+    messages in a chat was in that chat, whatever the roster says.
     """
     if not handle_ids:
         return set()
     placeholders = ",".join("?" for _ in handle_ids)
-    query = f"""
+    roster = f"""
         SELECT DISTINCT chj.chat_id
         FROM im.chat_handle_join chj
         JOIN im.handle h ON h.ROWID = chj.handle_id
         WHERE h.id IN ({placeholders})
     """
-    return {row[0] for row in chat_con.execute(query, list(handle_ids))}
-
-
+    authored = f"""
+        SELECT DISTINCT cmj.chat_id
+        FROM im.message m
+        JOIN im.handle h ON h.ROWID = m.handle_id
+        JOIN im.chat_message_join cmj ON cmj.message_id = m.ROWID
+        WHERE h.id IN ({placeholders}) AND m.is_from_me = 0
+    """
+    params = list(handle_ids)
+    found = {row[0] for row in chat_con.execute(roster, params)}
+    found |= {row[0] for row in chat_con.execute(authored, params)}
+    return found
 
 
 def resolve_group_chat_ids(chat_con, is_group: bool) -> Set[int]:

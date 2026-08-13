@@ -35,6 +35,21 @@ _PARTICIPANT_PATTERN = re.compile(
 # *wrote*. The participant filter above only narrows to chats they are in,
 # so "messages from Jakie last week" answered with a group chat Jakie is in
 # and showed someone else's messages -- a confident, wrong answer.
+# First person. "what did I say about the lease" is a sender filter too,
+# and without one it answered with whatever the other person said back --
+# confidently, and about the right topic, which is what made it hard to
+# spot.
+_SELF_PATTERNS = [
+    re.compile(r"\b(?:did\s+)?i\s+(?:say|send|sent|said|tell|told|text|texted|write|wrote|ask|asked|mention|mentioned)\b", re.I),
+    re.compile(r"\b(?:messages?|texts?|things?)\s+i\s+(?:sent|said|wrote|texted)\b", re.I),
+    re.compile(r"\bmy\s+(?:messages?|texts?|replies|reply)\b", re.I),
+    re.compile(r"\bfrom\s+me\b", re.I),
+]
+
+# "I" is capitalised like a name, so the sender patterns below would hand it
+# to the contact index and fuzzy-match a real person.
+_NOT_A_NAME = frozenset({"i", "me", "you", "we", "they", "who", "someone", "anyone"})
+
 _SENDER_PATTERNS = [
     re.compile(r"\bfrom\s+([A-Z][\w'-]*(?:\s+[A-Z][\w'-]*)?)"),
     re.compile(r"\b([A-Z][\w'-]*(?:\s+[A-Z][\w'-]*)?)\s+(?:sent|said|says|texted|wrote|mentioned)\b"),
@@ -118,6 +133,9 @@ class ParsedQuery:
     date_from: Optional[float] = None  # unix seconds, inclusive, padded
     date_to: Optional[float] = None
     has_media: bool = False
+    # True: only my own messages ("what did I say about X"). False: only the
+    # other side's. None: either.
+    from_me: Optional[bool] = None
     is_group: Optional[bool] = None
     chat_ids: Optional[List[int]] = None
 
@@ -251,11 +269,26 @@ def _extract_senders(
     matched: List[str] = []
     for pattern in _SENDER_PATTERNS:
         for match in pattern.finditer(text):
+            if match.group(1).strip().lower() in _NOT_A_NAME:
+                continue
             found = contact_index.handle_ids_for_names(match.group(1), threshold=PEOPLE_FUZZY_THRESHOLD)
             if found:
                 handle_ids.extend(found)
                 matched.append(match.group(0))
     return handle_ids, matched
+
+
+def _mentions_another_sender(text: str) -> bool:
+    return any(
+        match.group(1).strip().lower() not in _NOT_A_NAME
+        for pattern in _SENDER_PATTERNS
+        for match in pattern.finditer(text)
+    )
+
+
+def _extract_self_sender(text: str):
+    matched = [m.group(0) for pattern in _SELF_PATTERNS for m in pattern.finditer(text)]
+    return (True if matched else None), matched
 
 
 def parse_query(text: str, contact_index: Optional[ContactIndex] = None) -> ParsedQuery:
@@ -267,6 +300,13 @@ def parse_query(text: str, contact_index: Optional[ContactIndex] = None) -> Pars
     date_from, date_to, date_substrings = _extract_date_range(text)
     people_participant, people_substrings = _extract_participants(text, contact_index)
     people_sender, sender_substrings = _extract_senders(text, contact_index)
+    from_me, self_substrings = _extract_self_sender(text)
+    # "what did Kaya say when I asked about the lease" names someone else;
+    # their name is the stronger signal, so the self filter yields -- even
+    # when the name resolves to no contact, since the query is still about
+    # them rather than about me.
+    if people_sender or _mentions_another_sender(text):
+        from_me, self_substrings = None, []
     # A named sender is necessarily a participant, and narrowing candidate
     # chunks to their chats is what makes the sender filter cheap.
     for handle in people_sender:
@@ -274,7 +314,7 @@ def parse_query(text: str, contact_index: Optional[ContactIndex] = None) -> Pars
             people_participant.append(handle)
 
     residual = text
-    for substring in date_substrings + people_substrings + sender_substrings:
+    for substring in date_substrings + people_substrings + sender_substrings + self_substrings:
         residual = residual.replace(substring, " ")
     residual = re.sub(r"\s+", " ", residual).strip()
     # Removing "last week" from "texts from last week" leaves "texts from",
@@ -294,4 +334,5 @@ def parse_query(text: str, contact_index: Optional[ContactIndex] = None) -> Pars
         date_from=date_from,
         date_to=date_to,
         has_media=has_media,
+        from_me=from_me,
     )

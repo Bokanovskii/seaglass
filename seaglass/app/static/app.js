@@ -638,8 +638,12 @@ function applyHitClamping() {
 }
 
 function renderSession(session, index) {
-  const hits = (session.messages || []).map(renderMessage).join('');
-  const contextMessages = session.context_messages || [];
+  // Sort for display rather than trusting the payload's order: a recency
+  // result is ordered newest-first (so a caller reading the top gets the
+  // latest message), but a conversation only reads correctly oldest-first.
+  const byTime = (a, b) => (a.ts || 0) - (b.ts || 0);
+  const hits = (session.messages || []).slice().sort(byTime).map(renderMessage).join('');
+  const contextMessages = (session.context_messages || []).slice().sort(byTime);
   const context = contextMessages.map(renderMessage).join('');
   const score = Number(session.score || 0);
   const scoreWidth = Math.max(6, Math.min(100, Math.round(score * 100)));

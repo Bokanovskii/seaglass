@@ -234,3 +234,26 @@ class TestContentlessQueries:
     def test_contractions_are_filler_too(self):
         parsed = parse_query("what's the last thing Kaya sent me", contact_index=_StubContacts())
         assert parsed.semantic == ''
+
+
+class TestFirstPersonSender:
+    def test_what_did_i_say_filters_to_me(self):
+        parsed = parse_query('what did I say about the lease')
+        assert parsed.from_me is True
+        assert 'lease' in parsed.semantic
+
+    def test_my_messages_filters_to_me(self):
+        assert parse_query('my messages about dinner').from_me is True
+
+    def test_a_named_sender_wins_over_the_pronoun(self):
+        # "what did Kaya say when I asked about rent" is about Kaya.
+        parsed = parse_query('what did Kaya say when I asked about rent')
+        assert parsed.from_me is None
+
+    def test_a_plain_question_is_not_a_self_filter(self):
+        assert parse_query('what did we decide about dinner').from_me is None
+
+    def test_the_pronoun_is_never_treated_as_a_contact_name(self):
+        # "I" is capitalised like a name and was fuzzy-matched to contacts.
+        parsed = parse_query('what did I say about rent')
+        assert parsed.people_sender == []

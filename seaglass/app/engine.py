@@ -17,6 +17,7 @@ from seaglass.index.embed import EmbeddingModel
 from seaglass.search.conversation import fetch_conversation
 from seaglass.search.format import format_search_result
 from seaglass.search.hydrate import hydrate_sessions
+from seaglass.mlxmem import release_mlx_cache
 from seaglass.search.parse import ParsedQuery, parse_query
 from seaglass.search.rank import (
     RERANK_TOP_K,
@@ -120,6 +121,13 @@ class SearchEngine:
             self.reranker.score([('warmup', 'warmup')])
         with progress('dummy_search'):
             self.search('dinner plans', SearchFilters(), SearchOptions(max_sessions=1))
+        with progress('release_cache'):
+            # Warmup's batches set MLX's high-water mark, and its buffer
+            # cache keeps that mark for the life of the process -- on a
+            # 16 GB laptop that is memory the app holds but never uses
+            # again. The build path already does this; the query path,
+            # which is the one that stays running, did not.
+            release_mlx_cache()
 
     def health(self) -> dict:
         return {'warnings': list(self.warnings), 'corpus_bounds': self.corpus_bounds}
@@ -220,6 +228,17 @@ class SearchEngine:
     # is only interesting at human timescales, so a short cache makes it
     # free for callers that want it on every result.
     FRESHNESS_TTL_S = 30.0
+
+    def _freshness_fields(self) -> dict:
+        """Every caller that reads a result should be able to see that the
+        answer was drawn from an index missing the last N messages, without
+        a second round trip. Grogu answers "what did X just say" from this."""
+        most_recent_chunk_ts = self.index_con.execute('SELECT MAX(end_ts) FROM chunks').fetchone()[0]
+        _, newer_messages = self._cached_freshness(most_recent_chunk_ts)
+        return {
+            'n_messages_since_index': int(newer_messages),
+            'index_stale': bool(newer_messages),
+        }
 
     def invalidate_freshness(self) -> None:
         """Drop the cached staleness reading -- call after a build, or the
@@ -342,6 +361,13 @@ class SearchEngine:
                 'next_offset': max(0, options.offset),
                 'effective_filters': _effective_filters(parsed),
                 'parse_source': 'deterministic',
+                # An empty result must have the same shape as a full one, or
+                # every consumer needs two code paths and the one it reaches
+                # least often is the one that breaks. Staleness matters most
+                # here: "no results" and "no results *yet*" are different
+                # answers.
+                **self._freshness_fields(),
+                'ordering': 'recent' if not parsed.semantic.strip() else 'relevance',
                 'timings': timings,
                 'elapsed_s': round(time.time() - t0, 2),
                 'candidate_count': 0 if candidate_ids is None else len(candidate_ids),
@@ -436,12 +462,30 @@ class SearchEngine:
                 # without this a group chat answers with someone else's
                 # messages.
                 hydrated = _filter_by_sender(hydrated, parsed.people_sender)
+            elif parsed.from_me is not None:
+                hydrated = _filter_by_from_me(hydrated, parsed.from_me)
             if not parsed.semantic.strip():
                 # Browsing: the whole day's chunks are "hits", and they are
                 # chronological, so a caller reading the first few gets the
                 # *oldest* messages of the most recent day -- the opposite
                 # of what "latest from Adrian" asked for.
-                hydrated = _newest_hits_only(hydrated)
+                # The budget is what the caller asked for -- max_sessions
+                # sessions' worth -- not what the day-grouping happens to
+                # produce. Deriving it from the session count meant "what
+                # did Kaya say yesterday" returned 10 of yesterday's 40
+                # messages purely because they all landed on one day.
+                hydrated = _newest_hits_only(
+                    hydrated, budget=BROWSE_HITS_PER_SESSION * max(1, options.max_sessions)
+                )
+                # Sessions are day-groups scored by chunk recency, which is
+                # close to but not the same as "newest first": two chats on
+                # the same day could come back in either order, so a caller
+                # reading the top of a `recent` result saw an older message
+                # than the one below it.
+                hydrated.sort(
+                    key=lambda session: max(m.ts for m in session.hit_messages),
+                    reverse=True,
+                )
             # A session whose hit chunk hydrates to nothing -- every message
             # in it a system row (a group rename, a shared-location start),
             # deleted since the snapshot, or filtered out above -- still
@@ -465,15 +509,8 @@ class SearchEngine:
                 session['participant_count'] = meta.participant_count
                 session['participants'] = list(meta.participants)
 
-        most_recent_chunk_ts = self.index_con.execute('SELECT MAX(end_ts) FROM chunks').fetchone()[0]
-        _, newer_messages = self._cached_freshness(most_recent_chunk_ts)
         payload.update({
-            # Every caller that reads a result should be able to see that
-            # the answer was drawn from an index missing the last N
-            # messages, without a second round trip. Grogu in particular
-            # answers "what did X just say" from this.
-            'n_messages_since_index': int(newer_messages),
-            'index_stale': bool(newer_messages),
+            **self._freshness_fields(),
             # 'recent' means the result is time-ordered, not relevance-
             # ordered, so a caller taking the first N gets the newest
             # messages rather than the oldest of the newest day.
@@ -573,6 +610,30 @@ class SearchEngine:
         return payload
 
 
+def _filter_by_from_me(sessions, from_me: bool):
+    """Keep only hit messages on one side of the conversation.
+
+    "what did I say about the lease" was answered with what the *other*
+    person said back -- on topic, so it read as a correct answer.
+    """
+    return _keep_hits(sessions, lambda message: bool(message.is_from_me) is from_me)
+
+
+def _keep_hits(sessions, predicate):
+    kept = []
+    for session in sessions:
+        hits = [message for message in session.hit_messages if predicate(message)]
+        if not hits:
+            continue
+        hit_ids = {message.message_id for message in hits}
+        context = [
+            message for message in session.hit_messages + session.context_messages
+            if message.message_id not in hit_ids
+        ]
+        kept.append(replace(session, hit_messages=hits, context_messages=context))
+    return kept
+
+
 def _filter_by_sender(sessions, handles):
     """Keep only hit messages written by one of `handles`."""
     wanted = {handle.lower() for handle in handles}
@@ -625,10 +686,18 @@ def _chunks_containing_sender(index_con, chat_con, parsed, candidate_ids):
     # under either unit.
     where = [f'h.id IN ({placeholders})', 'm.is_from_me = 0']
     params: list = list(handles) + [SENDER_MESSAGE_LOOKBACK]
+    # The join to chat_message_join is what makes the lookback window mean
+    # anything. chat.db here holds 109,665 messages from one contact of
+    # which only 180 are linked to a chat -- the rest are orphaned rows
+    # from a partial iCloud sync. Without the join, the newest 20,000 rows
+    # are all unlinked, no chunk contains them, and the narrowing silently
+    # fails open to "any chunk in her chats" -- which is how a search for
+    # her returned six messages out of a possible twenty.
     message_ids = [
         row[0]
         for row in chat_con.execute(
             'SELECT m.ROWID FROM message m JOIN handle h ON m.handle_id = h.ROWID '
+            'JOIN chat_message_join cmj ON cmj.message_id = m.ROWID '
             f'WHERE {" AND ".join(where)} ORDER BY m.date DESC LIMIT ?',
             params,
         )
@@ -656,21 +725,42 @@ def _chunks_containing_sender(index_con, chat_con, parsed, candidate_ids):
     return chunk_ids
 
 
-def _newest_hits_only(sessions, limit: int = BROWSE_HITS_PER_SESSION):
-    """Keep each session's newest `limit` hits, in reading order."""
+def _newest_hits_only(sessions, per_session: int = BROWSE_HITS_PER_SESSION, budget=None):
+    """Keep the newest hits overall, newest-first, and drop what is left.
+
+    The budget is allocated *globally* rather than per session. Allocating
+    it per session meant "recent messages from Kaya" returned the 10 newest
+    messages of each of 8 days -- so when the newest day held 25 of the 20
+    most recent messages, 15 of them were cut in favour of older ones from
+    a week ago. Recall over the 20 newest messages was 0.64 for exactly
+    this reason.
+
+    Hits come back newest-first because the payload declares
+    `ordering: recent`: a caller honouring a limit reads from the top, and
+    an LLM reading the JSON reads from the top too. Display code that wants
+    a readable conversation sorts by timestamp itself (see app.js), which
+    it should do regardless of what the wire format happens to hand it.
+    """
+    if budget is None:
+        budget = per_session * len(sessions) if sessions else 0
+    budget = max(budget, 0)
+    ranked = sorted(
+        ((message, index) for index, session in enumerate(sessions) for message in session.hit_messages),
+        key=lambda pair: pair[0].ts,
+        reverse=True,
+    )
+    keep_ids = {message.message_id for message, _ in ranked[:budget]}
+
     trimmed = []
     for session in sessions:
-        if len(session.hit_messages) <= limit:
-            trimmed.append(session)
+        hits = [m for m in session.hit_messages if m.message_id in keep_ids]
+        hits.sort(key=lambda m: m.ts, reverse=True)
+        dropped = [m for m in session.hit_messages if m.message_id not in keep_ids]
+        if not hits:
             continue
-        by_age = sorted(session.hit_messages, key=lambda m: m.ts, reverse=True)
-        hits = sorted(by_age[:limit], key=lambda m: m.ts)
-        hit_ids = {m.message_id for m in hits}
-        context = [
-            m for m in session.hit_messages + session.context_messages
-            if m.message_id not in hit_ids
-        ]
-        trimmed.append(replace(session, hit_messages=hits, context_messages=context))
+        trimmed.append(
+            replace(session, hit_messages=hits, context_messages=dropped + list(session.context_messages))
+        )
     return trimmed
 
 
@@ -681,6 +771,7 @@ def _effective_filters(parsed: ParsedQuery) -> dict:
         'date_from': parsed.date_from,
         'date_to': parsed.date_to,
         'has_media': parsed.has_media,
+        'from_me': getattr(parsed, 'from_me', None),
         'is_group': getattr(parsed, 'is_group', None),
         'chat_ids': getattr(parsed, 'chat_ids', None),
         'semantic': parsed.semantic,
