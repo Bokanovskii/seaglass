@@ -8,7 +8,7 @@ const token = (() => {
 })();
 
 const state = {
-  assist: 'off',
+  assist: 'auto',
   people: [],
   selectedChat: null,
   requestId: null,
@@ -390,7 +390,7 @@ document.querySelectorAll('.assist').forEach(button => button.onclick = () => {
 });
 els.searchButton.onclick = search;
 els.query.addEventListener('keydown', event => {
-  if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') search();
+  if (event.key === 'Enter') search();
   if (event.key === 'Escape') els.drawer.classList.add('hidden');
 });
 document.addEventListener('keydown', event => {
