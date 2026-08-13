@@ -7,7 +7,10 @@ and test_rank.py do for the underlying pipeline pieces.
 
 from __future__ import annotations
 
+import json
 import types
+
+import pytest
 
 from seaglass.imessage.source import connect_readonly
 from seaglass.index.build import build_index, open_index_db
@@ -30,6 +33,13 @@ class FakeReranker:
 
 
 APPLE_EPOCH_START = 700000000
+
+
+@pytest.fixture(autouse=True)
+def no_running_app(monkeypatch):
+    """Never let a desktop app that happens to be running on the dev
+    machine answer for the pipeline under test."""
+    monkeypatch.setattr(mcp_server, "_running_app_lock", lambda: None)
 
 
 def _fixture(tmp_path):
@@ -93,9 +103,13 @@ def test_search_messages_no_results_when_fused_empty(tmp_path, monkeypatch):
     # relying on a genuinely-empty index.db (retrieve() treats a *never
     # built* index, i.e. no meta.int8_absmax at all, as a hard error --
     # a distinct condition from "built index, zero matches").
-    monkeypatch.setattr(mcp_server, "retrieve", lambda *a, **k: [])
+    # Patched on the engine, not on this module: ranking is the engine's
+    # now, so that is where retrieval happens.
+    monkeypatch.setattr("seaglass.app.engine.retrieve", lambda *a, **k: [])
 
-    payload = mcp_server.search_messages("anything at all")
+    # A contentful query: a filler-only one ("anything at all") never
+    # reaches retrieve() -- it browses by recency instead.
+    payload = mcp_server.search_messages("dinner reservation")
     assert payload["n_sessions"] == 0
     assert payload["confidence"] == "none"
 
@@ -234,3 +248,67 @@ def test_resolve_path_falls_back_to_app_config(monkeypatch, tmp_path):
 def test_resolve_path_prefers_env_var(monkeypatch):
     monkeypatch.setenv("SEAGLASS_INDEX_DB", "/tmp/explicit.db")
     assert mcp_server._resolve_path("SEAGLASS_INDEX_DB", lambda c: 'ignored') == "/tmp/explicit.db"
+
+
+def test_search_prefers_the_running_app(monkeypatch, tmp_path):
+    """A running app already holds the models and a warm cache; loading a
+    second copy here to recompute an answer it can give over loopback costs
+    ~1GB and a multi-second cold start."""
+    monkeypatch.setattr(mcp_server, "_running_app_lock", lambda: {"port": 1, "token": "t"})
+    monkeypatch.setattr(mcp_server, "_resolve_path", lambda *a, **k: None)
+    calls = []
+
+    def fake_urlopen(request, timeout=None):
+        calls.append(request.full_url)
+        body = (
+            {"index_ready": True, "index_db": "/x/index.db"}
+            if request.full_url.endswith("/api/status")
+            else {"n_sessions": 1, "sessions": [], "timings": {"parse": 0.1}}
+        )
+        return _FakeResponse(body)
+
+    monkeypatch.setattr(mcp_server, "urlopen", fake_urlopen)
+    payload = mcp_server.search_messages("dinner")
+
+    assert payload["n_sessions"] == 1
+    assert "timings" not in payload  # UI-only field, stripped
+    assert any(url.endswith("/api/search") for url in calls)
+
+
+def test_search_ignores_an_app_serving_a_different_index(monkeypatch, tmp_path):
+    """Answering from a different corpus than the caller configured would be
+    worse than being slow."""
+    monkeypatch.setattr(mcp_server, "_running_app_lock", lambda: {"port": 1, "token": "t"})
+    monkeypatch.setattr(mcp_server, "_resolve_path", lambda *a, **k: "/configured/index.db")
+    monkeypatch.setattr(
+        mcp_server,
+        "urlopen",
+        lambda request, timeout=None: _FakeResponse({"index_ready": True, "index_db": "/other/index.db"}),
+    )
+
+    assert mcp_server._search_via_running_app("dinner", max_sessions=8, redact=False) is None
+
+
+def test_search_ignores_an_app_that_is_not_ready(monkeypatch):
+    monkeypatch.setattr(mcp_server, "_running_app_lock", lambda: {"port": 1, "token": "t"})
+    monkeypatch.setattr(
+        mcp_server,
+        "urlopen",
+        lambda request, timeout=None: _FakeResponse({"index_ready": False}),
+    )
+
+    assert mcp_server._search_via_running_app("dinner", max_sessions=8, redact=False) is None
+
+
+class _FakeResponse:
+    def __init__(self, body):
+        self._body = json.dumps(body).encode()
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False

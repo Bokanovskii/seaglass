@@ -5,6 +5,8 @@ as test_contacts.py).
 
 from __future__ import annotations
 
+import datetime as dt
+
 import time
 
 from seaglass.imessage.contacts import Contact, ContactIndex
@@ -118,13 +120,117 @@ class TestSemanticResidual:
         assert "Alice Chen" not in parsed.semantic
         assert "lisbon" in parsed.semantic.lower()
 
-    def test_residual_never_empty(self):
-        # An entirely-filter query (hypothetically) must still leave
-        # something for the embedder/FTS -- fail open, never fail closed.
+    def test_filter_only_query_leaves_nothing_to_embed(self):
+        # "march 2024" is a *time*, not a topic. Embedding the leftover
+        # words would rank on the noise vector of a date; an empty semantic
+        # routes the engine to its recency browse instead.
         parsed = parse_query("march 2024")
-        assert parsed.semantic.strip() != ""
+        assert parsed.semantic.strip() == ""
 
     def test_raw_is_preserved_unmodified(self):
         text = "photos from Alice in march 2024"
         parsed = parse_query(text)
         assert parsed.raw == text
+
+
+class TestRelativeRanges:
+    """A phrase naming a *span* of time must produce that span.
+
+    dateparser resolves "last month" to a single instant a month ago, which
+    the +/- pad then turns into a six-day window around an arbitrary day in
+    the middle of it -- so "golf last month" searched six days, found
+    nothing, and looked like a retrieval failure rather than a parsing one.
+    """
+
+    @staticmethod
+    def _span_days(query):
+        parsed = parse_query(query)
+        assert parsed.date_from is not None, query
+        return (parsed.date_to - parsed.date_from) / 86400.0
+
+    def test_last_month_spans_a_month(self):
+        assert 28 <= self._span_days('golf last month') <= 32
+
+    def test_last_week_spans_a_week(self):
+        assert 6.5 <= self._span_days('texts from last week') <= 8
+
+    def test_last_year_spans_a_year(self):
+        assert 360 <= self._span_days('stuff last year') <= 370
+
+    def test_this_week_is_understood(self):
+        # Previously produced no date filter at all.
+        assert 6.5 <= self._span_days('plans this week') <= 8
+
+    def test_named_day_is_one_day_and_does_not_run_into_the_future(self):
+        parsed = parse_query('anything yesterday')
+        assert 0.9 <= (parsed.date_to - parsed.date_from) / 86400.0 <= 1.1
+        assert parsed.date_to <= time.time() + 1
+
+    def test_named_month_spans_the_month(self):
+        parsed = parse_query('photos from March 2024')
+        assert dt.datetime.fromtimestamp(parsed.date_from).strftime('%Y-%m-%d') == '2024-03-01'
+        assert 28 <= (parsed.date_to - parsed.date_from) / 86400.0 <= 32
+
+    def test_ambiguous_month_words_are_still_not_dates(self):
+        # The bare-modal guard must survive the new month handling.
+        assert parse_query('may i borrow the car').date_from is None
+        assert parse_query('march madness bracket').date_from is None
+
+    def test_range_phrase_is_removed_from_the_semantic_residual(self):
+        parsed = parse_query('texts from last week')
+        # 'texts' is filler, not a topic -- nothing to embed, so browse.
+        assert parsed.semantic == ''
+
+    def test_explicit_day_count(self):
+        assert 3 <= self._span_days('dinner in the past 3 days') <= 4.5
+
+
+class _StubContacts:
+    """Minimal ContactIndex stand-in: one contact, two handles."""
+
+    def handle_ids_for_names(self, name, threshold=None):
+        return ['+15550001111', 'kaya@example.com'] if name.lower() == 'kaya' else []
+
+    def resolve_handle(self, handle):
+        return 'Kaya'
+
+
+class TestSenderExtraction:
+    def test_from_someone_is_a_sender_filter_not_just_a_participant_one(self):
+        # The bug this guards: "messages from Jakie" narrowed to chats Jakie
+        # is in and then answered with a *different* person's messages.
+        parsed = parse_query('messages from Kaya', contact_index=_StubContacts())
+        assert parsed.people_sender == ['+15550001111', 'kaya@example.com']
+
+    def test_a_sender_is_also_a_participant(self):
+        # Chunk candidates can only be narrowed by chat, so the sender must
+        # appear in the participant filter or there is nothing to filter.
+        parsed = parse_query('latest from Kaya', contact_index=_StubContacts())
+        assert set(parsed.people_sender) <= set(parsed.people_participant)
+
+    def test_past_tense_phrasing_names_the_sender(self):
+        for text in ('what did Kaya say', 'the last thing Kaya sent me', 'Kaya texted about it'):
+            parsed = parse_query(text, contact_index=_StubContacts())
+            assert parsed.people_sender, text
+
+    def test_with_someone_is_not_a_sender_filter(self):
+        # "conversation with Kaya" wants both halves of the exchange.
+        parsed = parse_query('conversation with Kaya', contact_index=_StubContacts())
+        assert parsed.people_sender == []
+        assert parsed.people_participant
+
+
+class TestContentlessQueries:
+    def test_recency_words_alone_route_to_browse(self):
+        for text in ('recent messages from Kaya', 'latest from Kaya', 'what did Kaya say recently'):
+            parsed = parse_query(text, contact_index=_StubContacts())
+            assert parsed.semantic == '', text
+
+    def test_a_real_topic_still_searches(self):
+        for text in ('what did Kaya say about dinner', 'the last thing Kaya sent about golf'):
+            parsed = parse_query(text, contact_index=_StubContacts())
+            assert parsed.semantic.strip() != '', text
+
+    def test_contractions_are_filler_too(self):
+        parsed = parse_query("what's the last thing Kaya sent me", contact_index=_StubContacts())
+        assert parsed.semantic == ''

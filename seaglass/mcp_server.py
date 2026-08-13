@@ -52,6 +52,7 @@ file / launchd plist yet, per the above deviation):
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import sys
@@ -60,6 +61,8 @@ import time
 import zstandard
 from pathlib import Path
 from typing import List, Optional
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
 from mcp.server import MCPServer
 
@@ -102,6 +105,7 @@ _embedding_model: Optional[EmbeddingModel] = None
 _reranker: Optional[CrossEncoderReranker] = None
 _contact_index: Optional[ContactIndex] = None
 _contact_index_attempted = False
+_engine = None  # seaglass.app.engine.SearchEngine, built lazily
 
 # The MCP SDK dispatches sync tool functions via a thread pool (not one
 # fixed thread per session), so any lazy-init global here can race:
@@ -245,12 +249,136 @@ def search_messages(
         return _search_messages_impl(query, max_sessions=max_sessions, redact=redact)
 
 
+def _strip_ui_fields(payload: dict) -> dict:
+    """Drop fields that only mean something to the desktop UI."""
+    for key in ("timings", "parse_source", "request_id", "candidate_count"):
+        payload.pop(key, None)
+    return payload
+
+
+def _get_engine():
+    """The desktop app's SearchEngine, borrowing this module's connections.
+
+    Ranking used to be reimplemented here -- retrieve, rerank, aggregate --
+    which meant every ranking improvement made in the app silently skipped
+    Grogu. The recency reservation and the recent-verbatim-match boost both
+    landed that way, so the same query answered differently depending on
+    which door it came in through, with the MCP answer being the worse of
+    the two and nothing saying so.
+
+    The handles are rebound on every call rather than captured once,
+    because they are created lazily (and swapped wholesale by tests).
+    """
+    global _engine
+    if _engine is None:
+        with _init_lock:
+            if _engine is None:
+                from seaglass.app.engine import SearchEngine
+
+                _engine = SearchEngine(index_db="", chat_db=None)
+    _engine.index_con = _get_index_con()
+    _engine.chat_con = _get_chat_con()
+    _engine.embedding_model = _get_embedding_model()
+    _engine.reranker = _get_reranker()
+    _engine.contact_index = _get_contact_index()
+    return _engine
+
+
+def _running_app_lock() -> Optional[dict]:
+    """Connection details for a live desktop app, if one is running."""
+    try:
+        from seaglass.app.config import LOCK_PATH
+
+        lock = json.loads(Path(LOCK_PATH).read_text())
+        os.kill(int(lock["pid"]), 0)  # signal 0: liveness check only
+    except Exception:  # noqa: BLE001 - no app, stale lock, or unreadable
+        return None
+    return lock
+
+
+def _search_via_running_app(query: str, *, max_sessions: int, redact: bool) -> Optional[dict]:
+    """Answer from the already-running desktop app, if there is one.
+
+    The app holds the embedding model, the cross-encoder and a warm SQLite
+    cache. Loading a second copy in this process costs about a gigabyte of
+    memory and several seconds of cold start to compute an answer that
+    already exists a few milliseconds away over loopback -- and it does it
+    on the first Grogu search after every reboot, which is precisely when
+    someone is waiting.
+
+    Returns None (never raises) if there is no app, it isn't ready yet, or
+    it is serving a different index than this process is configured for --
+    every one of which means the in-process pipeline should answer instead.
+    """
+    lock = _running_app_lock()
+    if lock is None:
+        return None
+    base = f"http://127.0.0.1:{lock['port']}"
+    headers = {
+        "Authorization": f"Bearer {lock['token']}",
+        "Host": f"127.0.0.1:{lock['port']}",
+        "Content-Type": "application/json",
+    }
+
+    def _call(path: str, body: Optional[dict] = None, timeout: float = 5.0):
+        request = Request(
+            base + path,
+            data=None if body is None else json.dumps(body).encode(),
+            headers=headers,
+            method="GET" if body is None else "POST",
+        )
+        with urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode())
+
+    try:
+        status = _call("/api/status")
+        if not status.get("index_ready"):
+            return None
+        # Answering from a different corpus than the caller configured
+        # would be worse than being slow.
+        wanted = _resolve_path("SEAGLASS_INDEX_DB", lambda c: c.index_db)
+        if wanted and status.get("index_db") and Path(status["index_db"]) != Path(wanted):
+            return None
+        payload = _call(
+            "/api/search",
+            {
+                "query": query,
+                "filters": {},
+                "options": {"max_sessions": max_sessions, "redact": redact},
+                "assist": "off",
+            },
+            timeout=120.0,
+        )
+    except Exception as error:  # noqa: BLE001 - the local pipeline is the fallback
+        _log(f"running app unavailable ({error}); answering in-process")
+        return None
+    _log("answered from the running Seaglass app")
+    return payload
+
+
 def _search_messages_impl(query: str, *, max_sessions: int, redact: bool) -> dict:
     t0 = time.time()
-    index_con = _get_index_con()
-    chat_con = _get_chat_con()
-    contact_index = _get_contact_index()
 
+    payload = _search_via_running_app(query, max_sessions=max_sessions, redact=redact)
+    if payload is not None:
+        return _strip_ui_fields(payload)
+
+    chat_con = _get_chat_con()
+
+    if chat_con is not None:
+        from seaglass.app.engine import SearchOptions
+        from seaglass.app.filters import SearchFilters
+
+        payload = _get_engine().search(
+            query, SearchFilters(), SearchOptions(max_sessions=max_sessions, redact=redact)
+        )
+        return _strip_ui_fields(payload)
+
+    # No chat.db to hydrate from: fall back to un-hydrated chunk previews
+    # rather than failing the tool call outright. This path can't use the
+    # engine, which has nothing to show without message bodies.
+    index_con = _get_index_con()
+    contact_index = _get_contact_index()
     parsed = parse_query(query, contact_index=contact_index)
     model = _get_embedding_model()
     fused = retrieve(index_con, parsed, model, chat_con=chat_con, fused_top_k=50)
@@ -269,7 +397,7 @@ def _search_messages_impl(query: str, *, max_sessions: int, redact: bool) -> dic
     sessions = aggregate_sessions(ranked, max_sessions=max_sessions)
     expand_sessions(index_con, sessions)
 
-    if chat_con is None:
+    if True:
         # No chat.db configured -- degrade to un-hydrated chunk previews
         # rather than failing the tool call outright.
         dctx = zstandard.ZstdDecompressor()
@@ -293,10 +421,7 @@ def _search_messages_impl(query: str, *, max_sessions: int, redact: bool) -> dic
             "elapsed_s": round(time.time() - t0, 2),
         }
 
-    hydrated = hydrate_sessions(index_con, chat_con, sessions, contact_index=contact_index)
-    payload = format_search_result(hydrated, max_sessions=max_sessions, redact=redact)
-    payload["elapsed_s"] = round(time.time() - t0, 2)
-    return payload
+
 
 
 @server.tool()
@@ -325,14 +450,26 @@ def get_conversation(chat_id: int, around_ts: Optional[float] = None, limit: int
 
 @server.tool()
 def index_status() -> dict:
-    """Report the current index's chunk/vector counts and configured
-    paths, so a caller can tell whether the index exists, is stale, or
-    is missing hydration support before trusting search_messages.
+    """Report index size, freshness and hydration support.
+
+    Freshness is the part that matters to a caller: the index is a
+    snapshot, so anything said since the last build is simply invisible to
+    search. Reporting only chunk counts (as this once did) meant a caller
+    could not distinguish "she never mentioned it" from "she mentioned it
+    after the last sync", which are opposite answers. `n_messages_since_index`
+    is that gap; `stale` is the same thing as a yes/no.
     """
     status: dict = {
-        "index_db": os.environ.get("SEAGLASS_INDEX_DB"),
-        "chat_db": os.environ.get("SEAGLASS_CHAT_DB"),
+        "index_db": _resolve_path("SEAGLASS_INDEX_DB", lambda c: c.index_db),
+        "chat_db": _resolve_path("SEAGLASS_CHAT_DB", lambda c: c.chat_db),
     }
+
+    live = _app_status()
+    if live is not None:
+        live["stale"] = bool(live.get("n_messages_since_index"))
+        live["served_by"] = "app"
+        return live
+
     try:
         index_con = _get_index_con()
     except RuntimeError as exc:
@@ -347,11 +484,115 @@ def index_status() -> dict:
             "n_chunks": n_chunks,
             "n_vectors": n_vectors,
             "most_recent_chunk_date_end": max_date,
+            "most_recent_chunk_ts": max_date,
             "hydration_available": _get_chat_con() is not None,
             "contacts_available": _get_contact_index() is not None,
+            "served_by": "mcp",
         }
     )
+    status.update(_staleness(max_date))
     return status
+
+
+def _staleness(most_recent_chunk_ts) -> dict:
+    """How many messages have arrived since the index was last built.
+
+    Delegated to the engine rather than reimplemented: it reads the *live*
+    chat.db (the snapshot is by definition as stale as the index) and it
+    already handles chat.db's seconds-or-nanoseconds `date` column, which
+    is exactly the sort of detail a second copy gets subtly wrong.
+    """
+    result = {"n_messages_since_index": 0, "live_chat_readable": False, "stale": False}
+    try:
+        from seaglass.app.config import load_config
+
+        engine = _get_engine()
+        engine.chat_db_source = load_config().chat_db_source
+        _, newer = engine._live_chat_freshness(most_recent_chunk_ts)
+    except Exception as error:  # noqa: BLE001 - usually Full Disk Access
+        result["live_chat_error"] = str(error)
+        return result
+    result.update(
+        {"n_messages_since_index": int(newer), "live_chat_readable": True, "stale": bool(newer)}
+    )
+    return result
+
+
+def _app_status() -> Optional[dict]:
+    """The running desktop app's own status, if there is one."""
+    lock = _running_app_lock()
+    if lock is None:
+        return None
+    try:
+        request = Request(
+            f"http://127.0.0.1:{lock['port']}/api/status",
+            headers={
+                "Authorization": f"Bearer {lock['token']}",
+                "Host": f"127.0.0.1:{lock['port']}",
+            },
+        )
+        with urlopen(request, timeout=5.0) as response:
+            return json.loads(response.read().decode())
+    except Exception:  # noqa: BLE001 - fall back to reading the files directly
+        return None
+
+
+@server.tool()
+def sync_index(wait: bool = False) -> dict:
+    """Bring the search index up to date with messages sent since it was
+    last built.
+
+    Call this when `index_status` reports `stale`: anything said after the
+    last build is invisible to `search_messages`, which is indistinguishable
+    from it never having been said. A sync re-snapshots chat.db and indexes
+    only what is new. Pass `wait=true` to block until it finishes (minutes
+    for a large backlog); otherwise it returns immediately and progress can
+    be polled with `index_status`.
+    """
+    lock = _running_app_lock()
+    if lock is None:
+        return {
+            "started": False,
+            "detail": (
+                "Syncing needs the Seaglass app running -- open it and it will "
+                "sync, or call this again once it is open."
+            ),
+        }
+    headers = {
+        "Authorization": f"Bearer {lock['token']}",
+        "Host": f"127.0.0.1:{lock['port']}",
+        "Content-Type": "application/json",
+    }
+    base = f"http://127.0.0.1:{lock['port']}"
+
+    def _call(path, method="GET", timeout=10.0):
+        request = Request(base + path, data=b"{}" if method == "POST" else None,
+                          headers=headers, method=method)
+        with urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode())
+
+    try:
+        _call("/api/index/build", method="POST")
+    except HTTPError as error:
+        if error.code == 409:
+            return {"started": False, "detail": "A sync is already running."}
+        return {"started": False, "detail": str(error)}
+    except Exception as error:  # noqa: BLE001
+        return {"started": False, "detail": str(error)}
+
+    if not wait:
+        return {"started": True, "detail": "Sync started; poll index_status."}
+
+    deadline = time.time() + 1800
+    while time.time() < deadline:
+        time.sleep(2.0)
+        try:
+            state = _call("/api/index/build")
+        except Exception:  # noqa: BLE001 - a restart mid-build is not a failure
+            continue
+        if not state.get("running"):
+            return {"started": True, "finished": True, "state": state}
+    return {"started": True, "finished": False, "detail": "Still running after 30 minutes."}
 
 
 def main() -> None:

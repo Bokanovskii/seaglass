@@ -8,6 +8,7 @@ must never be the single point of failure ("fail open").
 from __future__ import annotations
 
 import dataclasses
+import datetime as dt
 import re
 from typing import List, Optional, Tuple
 
@@ -29,6 +30,37 @@ _MEDIA_KEYWORDS = {"photo", "photos", "picture", "pictures", "pic", "pics",
 _PARTICIPANT_PATTERN = re.compile(
     r"\b(?i:from|with)\s+([A-Z][\w'-]*(?:\s+[A-Z][\w'-]*)?)"
 )
+
+# "from Kaya" and "what did Vamski say" ask for messages Kaya/Vamski
+# *wrote*. The participant filter above only narrows to chats they are in,
+# so "messages from Jakie last week" answered with a group chat Jakie is in
+# and showed someone else's messages -- a confident, wrong answer.
+_SENDER_PATTERNS = [
+    re.compile(r"\bfrom\s+([A-Z][\w'-]*(?:\s+[A-Z][\w'-]*)?)"),
+    re.compile(r"\b([A-Z][\w'-]*(?:\s+[A-Z][\w'-]*)?)\s+(?:sent|said|says|texted|wrote|mentioned)\b"),
+    re.compile(r"\bdid\s+([A-Z][\w'-]*(?:\s+[A-Z][\w'-]*)?)\s+(?:say|send|text|write|mention)\b"),
+]
+
+# Words that describe *which* messages are wanted rather than what they
+# are about. A residual made only of these ("recent messages", "latest",
+# "the last thing") has nothing to embed: the vector is noise, and it
+# decides the ranking. Such a query means "the newest ones", which is a
+# sort, not a search.
+_FILLER_WORDS = frozenset(
+    """a all an and any anything are as at be by did do does for from get give had has have
+    he her him his i in is it its latest me mention mentioned message messages most my new
+    newest of on or our recent recently say said says send sent show similar so some stuff
+    text texted texts that the these thing things this those to told tell up us was we were
+    what whats when where
+    which who whose with write wrote you your last""".split()
+)
+
+
+def _is_contentless(residual: str) -> bool:
+    # Apostrophes are stripped so "what's" reads as the filler "whats"
+    # rather than as a topic word.
+    words = [w.replace("'", "") for w in re.findall(r"[a-zA-Z']+", residual.lower())]
+    return bool(words) and all(word in _FILLER_WORDS for word in words if word)
 
 DATE_PAD_DAYS = 3
 PEOPLE_FUZZY_THRESHOLD = 85.0  # rapidfuzz score, 0-100; prefer no filter to a wrong one
@@ -82,6 +114,7 @@ class ParsedQuery:
     raw: str
     semantic: str  # the residual passed to the embedder/FTS
     people_participant: List[str] = dataclasses.field(default_factory=list)
+    people_sender: List[str] = dataclasses.field(default_factory=list)  # who wrote it
     date_from: Optional[float] = None  # unix seconds, inclusive, padded
     date_to: Optional[float] = None
     has_media: bool = False
@@ -94,10 +127,84 @@ def _extract_media_filter(text: str) -> bool:
     return bool(words & _MEDIA_KEYWORDS)
 
 
+# Phrases that name a *span* of time, not a point in it. dateparser
+# resolves "last month" to a single instant a month ago, which the padding
+# below then turns into a six-day window around some arbitrary day in the
+# middle of that month -- so "messages from Vamski about golf last month"
+# searched six days and found nothing. These are matched first, and only
+# what they don't cover falls through to dateparser.
+_RANGE_PATTERNS = [
+    (re.compile(r"\btoday\b", re.I), "day", 0),
+    (re.compile(r"\byesterday\b", re.I), "day", 1),
+    (re.compile(r"\b(?:this|the past|past|last) week\b", re.I), "days", 7),
+    (re.compile(r"\b(?:this|the past|past|last) month\b", re.I), "days", 31),
+    (re.compile(r"\b(?:this|the past|past|last) year\b", re.I), "days", 366),
+    (re.compile(r"\b(?:the past|past|last) (\d+) days?\b", re.I), "days", None),
+    (re.compile(r"\b(?:the past|past|last) (\d+) weeks?\b", re.I), "weeks", None),
+    (re.compile(r"\b(?:the past|past|last) (\d+) months?\b", re.I), "months", None),
+    (re.compile(r"\brecently\b", re.I), "days", 30),
+    (re.compile(r"\b(\d+) days? ago\b", re.I), "day", None),
+]
+
+_MONTHS = ["january", "february", "march", "april", "may", "june", "july",
+           "august", "september", "october", "november", "december"]
+_MONTH_PATTERN = re.compile(
+    r"\b(" + "|".join(_MONTHS) + r")\b(?:\s+(\d{4}))?", re.I
+)
+
+
+def _extract_month_range(text: str):
+    """A named month is the whole month.
+
+    Without this "what happened in July" became a six-day window around
+    some day in July, which is a stranger answer than either "all of July"
+    or "no date filter at all".
+    """
+    match = _MONTH_PATTERN.search(text)
+    if match is None:
+        return None
+    if not _looks_like_a_real_date_match(match.group(0), text):
+        return None  # bare "may"/"march" as ordinary words
+    now = dt.datetime.now()
+    month = _MONTHS.index(match.group(1).lower()) + 1
+    year = int(match.group(2)) if match.group(2) else now.year
+    if match.group(2) is None and month > now.month:
+        year -= 1  # the most recent past occurrence, not a future one
+    start = dt.datetime(year, month, 1)
+    end = dt.datetime(year + (month == 12), (month % 12) + 1, 1)
+    return start.timestamp(), min(end.timestamp(), now.timestamp()), [match.group(0)]
+
+
+def _extract_range_phrase(text: str):
+    """A (date_from, date_to, substrings) span for a relative range phrase."""
+    now = dt.datetime.now()
+    for pattern, unit, amount in _RANGE_PATTERNS:
+        match = pattern.search(text)
+        if match is None:
+            continue
+        if amount is None:
+            amount = int(match.group(1))
+        if unit == "day":
+            # A named day is that whole calendar day, not a window around
+            # its midnight -- "yesterday" used to run three days into the
+            # future.
+            day = (now - dt.timedelta(days=amount)).replace(hour=0, minute=0, second=0, microsecond=0)
+            return day.timestamp(), (day + dt.timedelta(days=1)).timestamp(), [match.group(0)]
+        days = {"days": 1, "weeks": 7, "months": 31}[unit] * amount
+        start = (now - dt.timedelta(days=days)).replace(hour=0, minute=0, second=0, microsecond=0)
+        # Ends now, not at some padded point in the future.
+        return start.timestamp(), now.timestamp(), [match.group(0)]
+    return None
+
+
 def _extract_date_range(text: str) -> Tuple[Optional[float], Optional[float], List[str]]:
     """Returns (date_from, date_to, matched_substrings), or (None, None, [])
     if nothing plausible was found.
     """
+    span = _extract_range_phrase(text) or _extract_month_range(text)
+    if span is not None:
+        return span
+
     results = search_dates(text, settings={"PREFER_DATES_FROM": "past"})
     if not results:
         return None, None, []
@@ -134,6 +241,23 @@ def _extract_participants(
     return handle_ids, matched
 
 
+def _extract_senders(
+    text: str, contact_index: Optional[ContactIndex]
+) -> Tuple[List[str], List[str]]:
+    """Handles for people named as the *author* of the wanted messages."""
+    if contact_index is None:
+        return [], []
+    handle_ids: List[str] = []
+    matched: List[str] = []
+    for pattern in _SENDER_PATTERNS:
+        for match in pattern.finditer(text):
+            found = contact_index.handle_ids_for_names(match.group(1), threshold=PEOPLE_FUZZY_THRESHOLD)
+            if found:
+                handle_ids.extend(found)
+                matched.append(match.group(0))
+    return handle_ids, matched
+
+
 def parse_query(text: str, contact_index: Optional[ContactIndex] = None) -> ParsedQuery:
     """Parse a free-text query into structured filters plus a semantic
     residual. Extracted substrings are removed from the residual; anything
@@ -142,15 +266,30 @@ def parse_query(text: str, contact_index: Optional[ContactIndex] = None) -> Pars
     has_media = _extract_media_filter(text)
     date_from, date_to, date_substrings = _extract_date_range(text)
     people_participant, people_substrings = _extract_participants(text, contact_index)
+    people_sender, sender_substrings = _extract_senders(text, contact_index)
+    # A named sender is necessarily a participant, and narrowing candidate
+    # chunks to their chats is what makes the sender filter cheap.
+    for handle in people_sender:
+        if handle not in people_participant:
+            people_participant.append(handle)
 
     residual = text
-    for substring in date_substrings + people_substrings:
+    for substring in date_substrings + people_substrings + sender_substrings:
         residual = residual.replace(substring, " ")
     residual = re.sub(r"\s+", " ", residual).strip()
+    # Removing "last week" from "texts from last week" leaves "texts from",
+    # whose dangling preposition is noise to both the embedder and FTS.
+    residual = re.sub(r"\b(?:from|with|in|on|at|about|during|since)\s*$", "", residual, flags=re.I).strip()
+
+    if _is_contentless(residual):
+        # Nothing left to match on -- browse the newest messages that pass
+        # the filters instead of embedding filler.
+        residual = ""
 
     return ParsedQuery(
         raw=text,
-        semantic=residual or text,  # never emit an empty residual
+        semantic=residual,
+        people_sender=people_sender,
         people_participant=people_participant,
         date_from=date_from,
         date_to=date_to,

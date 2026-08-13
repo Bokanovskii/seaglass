@@ -33,7 +33,33 @@ def _redact(text: Optional[str]) -> Optional[str]:
     return text
 
 
-def _format_message(message: HydratedMessage, redact: bool) -> dict:
+_WORD_RE = re.compile(r"[\w']+")
+
+# Words too common to tell a matching message from its neighbours; without
+# this every message containing "the" scores as a match.
+_STOPWORDS = frozenset(
+    """a an and are as at be but by can did do does for from had has have he her him his
+    how i if in into is it its me my no not of on or our so that the their them then there
+    these they this to up was we were what when where which who will with would you your""".split()
+)
+
+
+def query_terms(query: str) -> frozenset:
+    """Content words from a query, for marking which messages matched."""
+    return frozenset(
+        word for word in _WORD_RE.findall((query or "").lower())
+        if word not in _STOPWORDS and len(word) > 1
+    )
+
+
+def _match_score(text: Optional[str], terms: frozenset) -> int:
+    if not terms or not text:
+        return 0
+    found = {word for word in _WORD_RE.findall(text.lower())}
+    return len(terms & found)
+
+
+def _format_message(message: HydratedMessage, redact: bool, terms: frozenset = frozenset()) -> dict:
     return {
         "message_id": message.message_id,
         "ts": message.ts,
@@ -42,16 +68,22 @@ def _format_message(message: HydratedMessage, redact: bool) -> dict:
         "text": _redact(message.text) if redact else message.text,
         "has_attachment": message.has_attachment,
         "attachment_kind": message.attachment_kind,
+        # How many of the query's content words this message contains.
+        # A chunk is a ~22-message window, so every message in it is
+        # returned as a "hit" -- without this a caller reading the first
+        # few gets the matched message's neighbours instead of the match,
+        # which for a one-line answer is the whole result.
+        "match_score": _match_score(message.text, terms),
     }
 
 
-def _format_session(session: HydratedSession, redact: bool) -> dict:
+def _format_session(session: HydratedSession, redact: bool, terms: frozenset = frozenset()) -> dict:
     return {
         "chat_id": session.chat_id,
         "day": session.day,
         "score": session.score,
-        "messages": [_format_message(m, redact) for m in session.hit_messages],
-        "context_messages": [_format_message(m, redact) for m in session.context_messages],
+        "messages": [_format_message(m, redact, terms) for m in session.hit_messages],
+        "context_messages": [_format_message(m, redact, terms) for m in session.context_messages],
     }
 
 
@@ -60,12 +92,14 @@ def format_search_result(
     *,
     max_sessions: Optional[int] = None,
     redact: bool = False,
+    query: str = "",
 ) -> dict:
     """Shape hydrated sessions into the tool-result payload. `max_sessions`
     truncates (sessions already arrive best-first, by summed rerank
     score); `redact` strips phone numbers/emails from every message body
     and sender field.
     """
+    terms = query_terms(query)
     truncated = sessions if max_sessions is None else sessions[:max_sessions]
     n_results = sum(len(s.hit_messages) for s in truncated)
     return {
@@ -74,5 +108,5 @@ def format_search_result(
         # thin retrieval (0-1 sessions, or a lone weak match) should read
         # differently to the calling model than a rich multi-session hit
         "confidence": "high" if len(truncated) >= 3 else ("low" if truncated else "none"),
-        "sessions": [_format_session(s, redact) for s in truncated],
+        "sessions": [_format_session(s, redact, terms) for s in truncated],
     }

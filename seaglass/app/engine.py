@@ -4,7 +4,7 @@ import sqlite3
 import threading
 import time
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -271,6 +271,15 @@ class SearchEngine:
 
         prefilter_started = time.time()
         candidate_ids = build_candidate_chunk_ids(self.index_con, parsed, chat_con=self.chat_con)
+        if parsed.people_sender and self.chat_con is not None:
+            # Narrow to chunks the named person actually spoke in. Without
+            # this, "latest from Adrian" browses the newest chunks of the
+            # busy group chats he belongs to, the sender filter then drops
+            # every one of them, and a person who simply posts less often
+            # than the rest of the group returns no results at all.
+            candidate_ids = _chunks_containing_sender(
+                self.index_con, self.chat_con, parsed, candidate_ids
+            )
         timings['prefilter'] = round(time.time() - prefilter_started, 4)
 
         if not parsed.semantic.strip():
@@ -353,14 +362,25 @@ class SearchEngine:
         else:
             ids = recency_ranked(self.index_con, candidate_ids)[: options.fused_top_k]
             rows = self._chunk_rows(ids)
-        # Descending pseudo-scores keep the newest-first order through
-        # aggregation, whose sigmoid is monotonic.
         ordered_chunks = [
             RankedChunk(chunk_id=cid, chat_id=chat_id, start_ts=start_ts, rerank_score=float(len(rows) - i))
             for i, (cid, chat_id, start_ts) in enumerate(rows)
         ]
         timings['browse'] = round(time.time() - aggregate_started, 4)
         ordered = order_sessions(ordered_chunks, head_size=options.max_sessions, recent_slots=0)
+        # Descending pseudo-scores do *not* survive aggregation: it sums a
+        # sigmoid of each chunk's score, and a pseudo-score of even ~20
+        # saturates the sigmoid at 1.0. Every chunk then contributes an
+        # identical 1.0, so the ranking became "whichever day has the most
+        # chunks" -- "latest from Adrian" answered with a busy day three
+        # weeks earlier. Browsing means newest-first, so say so directly.
+        newest_chunk_ts = {cid: start_ts for cid, _chat_id, start_ts in rows}
+        ordered.sort(
+            key=lambda session: max(
+                (newest_chunk_ts.get(cid, 0.0) for cid in session.hit_chunk_ids), default=0.0
+            ),
+            reverse=True,
+        )
         return self._finish(ordered, options, timings, t0, candidate_ids, parsed, aggregate_started)
 
     def _chunk_rows(self, ids):
@@ -385,7 +405,29 @@ class SearchEngine:
         hydrate_started = time.time()
         if self.chat_con is not None:
             hydrated = hydrate_sessions(self.index_con, self.chat_con, sessions, contact_index=self.contact_index)
-            payload = format_search_result(hydrated, max_sessions=options.max_sessions, redact=options.redact)
+            if parsed.people_sender:
+                # "messages from Jakie" asks for what Jakie wrote. Chunk
+                # candidates can only be narrowed to *chats* they are in, so
+                # without this a group chat answers with someone else's
+                # messages.
+                hydrated = _filter_by_sender(hydrated, parsed.people_sender)
+            if not parsed.semantic.strip():
+                # Browsing: the whole day's chunks are "hits", and they are
+                # chronological, so a caller reading the first few gets the
+                # *oldest* messages of the most recent day -- the opposite
+                # of what "latest from Adrian" asked for.
+                hydrated = _newest_hits_only(hydrated)
+            # A session whose hit chunk hydrates to nothing -- every message
+            # in it a system row (a group rename, a shared-location start),
+            # deleted since the snapshot, or filtered out above -- still
+            # scores and still takes one of the result slots, rendering as
+            # an empty card with only context around a match that is not
+            # there.
+            hydrated = [session for session in hydrated if session.hit_messages]
+            payload = format_search_result(
+                hydrated, max_sessions=options.max_sessions, redact=options.redact,
+                query=parsed.semantic,
+            )
         else:
             payload = {'n_sessions': 0, 'n_results': 0, 'confidence': 'unhydrated', 'sessions': []}
         timings['hydrate'] = round(time.time() - hydrate_started, 4)
@@ -494,9 +536,111 @@ class SearchEngine:
         return payload
 
 
+def _filter_by_sender(sessions, handles):
+    """Keep only hit messages written by one of `handles`."""
+    wanted = {handle.lower() for handle in handles}
+    kept = []
+    for session in sessions:
+        hits = [
+            message for message in session.hit_messages
+            # `is_from_me` is essential: in a 1:1 chat, chat.db stamps
+            # *outgoing* messages with the other party's handle_id too, so
+            # matching on the handle alone keeps both halves of the
+            # conversation and "from Kaya" answers with my own messages.
+            if not message.is_from_me
+            and message.handle is not None
+            and message.handle.lower() in wanted
+        ]
+        if not hits:
+            continue
+        # Demote the rest to context so the surrounding conversation stays
+        # readable without competing for the top of the result.
+        hit_ids = {message.message_id for message in hits}
+        context = [
+            message for message in session.hit_messages + session.context_messages
+            if message.message_id not in hit_ids
+        ]
+        kept.append(replace(session, hit_messages=hits, context_messages=context))
+    return kept
+
+
+BROWSE_HITS_PER_SESSION = 10
+
+# How far back to look for a named sender's own messages when narrowing
+# candidates. Generous enough that a quiet participant in a busy chat is
+# still found, bounded so the lookup stays a single indexed scan.
+SENDER_MESSAGE_LOOKBACK = 20_000
+
+
+def _chunks_containing_sender(index_con, chat_con, parsed, candidate_ids):
+    """Restrict `candidate_ids` to chunks holding a message *written by*
+    one of `parsed.people_sender`. Returns the original set unchanged if
+    the lookup finds nothing, so a filter that cannot be resolved fails
+    open rather than silently emptying the result.
+    """
+    handles = list(parsed.people_sender)
+    if not handles:
+        return candidate_ids
+    placeholders = ','.join('?' for _ in handles)
+    # No date clause here: chat.db's `date` is seconds on older systems and
+    # nanoseconds on Big Sur+, and the date filter is already encoded in
+    # `candidate_ids` via the chunks table. Ordering newest-first is safe
+    # under either unit.
+    where = [f'h.id IN ({placeholders})', 'm.is_from_me = 0']
+    params: list = list(handles) + [SENDER_MESSAGE_LOOKBACK]
+    message_ids = [
+        row[0]
+        for row in chat_con.execute(
+            'SELECT m.ROWID FROM message m JOIN handle h ON m.handle_id = h.ROWID '
+            f'WHERE {" AND ".join(where)} ORDER BY m.date DESC LIMIT ?',
+            params,
+        )
+    ]
+    if not message_ids:
+        return candidate_ids
+
+    chunk_ids: set = set()
+    for start in range(0, len(message_ids), 900):  # SQLite variable limit
+        batch = message_ids[start: start + 900]
+        marks = ','.join('?' for _ in batch)
+        chunk_ids.update(
+            row[0]
+            for row in index_con.execute(
+                f'SELECT DISTINCT chunk_id FROM chunk_message WHERE msg_id IN ({marks})',
+                batch,
+            )
+        )
+    if not chunk_ids:
+        return candidate_ids
+    if candidate_ids is not None:
+        chunk_ids &= set(candidate_ids)
+        if not chunk_ids:
+            return candidate_ids
+    return chunk_ids
+
+
+def _newest_hits_only(sessions, limit: int = BROWSE_HITS_PER_SESSION):
+    """Keep each session's newest `limit` hits, in reading order."""
+    trimmed = []
+    for session in sessions:
+        if len(session.hit_messages) <= limit:
+            trimmed.append(session)
+            continue
+        by_age = sorted(session.hit_messages, key=lambda m: m.ts, reverse=True)
+        hits = sorted(by_age[:limit], key=lambda m: m.ts)
+        hit_ids = {m.message_id for m in hits}
+        context = [
+            m for m in session.hit_messages + session.context_messages
+            if m.message_id not in hit_ids
+        ]
+        trimmed.append(replace(session, hit_messages=hits, context_messages=context))
+    return trimmed
+
+
 def _effective_filters(parsed: ParsedQuery) -> dict:
     return {
         'people_participant': list(parsed.people_participant),
+        'people_sender': list(parsed.people_sender),
         'date_from': parsed.date_from,
         'date_to': parsed.date_to,
         'has_media': parsed.has_media,

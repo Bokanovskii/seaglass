@@ -108,7 +108,7 @@ def _cmd_search(args: argparse.Namespace) -> int:
         return 0
 
     hydrated = hydrate_sessions(index_con, chat_con, sessions, contact_index=contact_index)
-    payload = format_search_result(hydrated, max_sessions=args.show, redact=args.redact)
+    payload = format_search_result(hydrated, max_sessions=args.show, redact=args.redact, query=parsed.semantic)
     elapsed = time.time() - t0
     print(f"{payload['n_sessions']} sessions ({payload['n_results']} messages), "
           f"confidence={payload['confidence']}, in {elapsed:.2f}s\n")

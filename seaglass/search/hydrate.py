@@ -36,6 +36,9 @@ class HydratedMessage:
     # ...). Attachment-only messages have no text at all, so without this
     # the client has nothing to render but an empty bubble.
     attachment_kind: Optional[str] = None
+    # Raw chat.db handle of the author, kept alongside the resolved display
+    # name so callers can filter by *who wrote it* without re-resolving.
+    handle: Optional[str] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -211,6 +214,7 @@ def _hydrate_chunks(
                 text=text,
                 has_attachment=bool(has_attachment),
                 attachment_kind=kind,
+                handle=handle,
             )
         )
     return messages
