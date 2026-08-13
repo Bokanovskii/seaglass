@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import contextlib
 import sqlite3
 import statistics
 import sys
@@ -33,7 +34,9 @@ from typing import Callable, Dict, List, Optional, Sequence
 from seaglass.app.engine import SearchEngine, SearchOptions
 from seaglass.app.filters import SearchFilters
 from seaglass.imessage.source import APPLE_EPOCH_UNIX, NS_VS_S_THRESHOLD
-from seaglass.search.parse import parse_query
+from seaglass.imessage.contacts import ContactIndex
+from seaglass.imessage.source import connect_readonly
+from seaglass.search.parse import ParsedQuery, parse_query
 
 # --------------------------------------------------------------------------
 # Oracle: the correct answer set, straight from chat.db
@@ -319,24 +322,125 @@ def score_against_oracle(
 # --------------------------------------------------------------------------
 
 
-def run_case(engine: SearchEngine, oracle: Oracle, case: Case, max_sessions: int = 8,
-             index_horizon: Optional[float] = None, index_con=None) -> Result:
-    parsed = parse_query(case.query, contact_index=engine.contact_index)
+class Corpus:
+    """The databases and contact list the harness needs to *judge* an
+    answer: the oracle, the index horizon, and the names the suite is
+    generated from. Deliberately model-free -- none of this needs an
+    embedder, and loading one here is what made the harness compete with
+    the thing it was measuring.
+    """
+
+    def __init__(self, index_db: str, chat_db: str, chat_db_source: Optional[str] = None):
+        self.index_con = sqlite3.connect(f"file:{index_db}?mode=ro", uri=True)
+        self.chat_con = connect_readonly(Path(chat_db))
+        # The oracle reads the *live* chat.db when there is one: an oracle
+        # bounded by the same snapshot the index was built from can never
+        # observe staleness, which is one of the failures the suite exists
+        # to tell apart.
+        self.oracle_con = (
+            sqlite3.connect(f"file:{chat_db_source}?mode=ro&immutable=1", uri=True)
+            if chat_db_source else self.chat_con
+        )
+        self.oracle = Oracle(self.oracle_con)
+        self.index_horizon = self.index_con.execute("SELECT MAX(end_ts) FROM chunks").fetchone()[0]
+        try:
+            self.contact_index = ContactIndex.load()
+        except Exception:  # noqa: BLE001 - names are for generating cases, not judging them
+            self.contact_index = None
+
+
+class AppSearcher:
+    """Ask the running desktop app, over the same loopback path Grogu uses.
+
+    This is the whole point of not warning and walking away: the app
+    already holds the models, so reusing it costs no memory, contends with
+    nothing, and -- more usefully -- measures the code path that actually
+    answers a user's query in production, rather than a second copy of the
+    engine that only the harness ever runs.
+    """
+
+    name = "running app"
+
+    def __init__(self, max_sessions: int = 8):
+        self.max_sessions = max_sessions
+
+    @staticmethod
+    def available() -> bool:
+        from seaglass.mcp_server import _running_app_lock
+
+        return _running_app_lock() is not None
+
+    def search(self, query: str) -> dict:
+        from seaglass.mcp_server import _search_via_running_app
+
+        payload = _search_via_running_app(
+            query, max_sessions=self.max_sessions, redact=False
+        )
+        if payload is None:
+            raise RuntimeError("the running app stopped answering mid-run")
+        return payload
+
+
+class EngineSearcher:
+    """Load our own engine. Correct when no app is running, and the only
+    way to measure a cold start."""
+
+    name = "in-process engine"
+
+    def __init__(self, index_db, chat_db, chat_db_source=None, max_sessions: int = 8):
+        self.engine = SearchEngine(index_db, chat_db, chat_db_source=chat_db_source)
+        self.engine.warmup(progress=lambda _name: contextlib.nullcontext())
+        self.max_sessions = max_sessions
+
+    def search(self, query: str) -> dict:
+        return self.engine.search(
+            query, SearchFilters(), SearchOptions(max_sessions=self.max_sessions)
+        )
+
+
+def parsed_from_payload(payload: dict, query: str, contact_index=None) -> ParsedQuery:
+    """Recover what the engine decided the query meant.
+
+    Re-parsing locally would test the harness's copy of the parser, not the
+    one that produced this answer -- and against the running app they can
+    be different builds. `effective_filters` is the engine saying what it
+    did, so judge it on that.
+    """
+    filters = payload.get("effective_filters")
+    if not filters:
+        return parse_query(query, contact_index=contact_index)
+    return ParsedQuery(
+        raw=query,
+        semantic=filters.get("semantic") or "",
+        people_participant=list(filters.get("people_participant") or []),
+        people_sender=list(filters.get("people_sender") or []),
+        date_from=filters.get("date_from"),
+        date_to=filters.get("date_to"),
+        has_media=bool(filters.get("has_media")),
+        is_group=filters.get("is_group"),
+        chat_ids=filters.get("chat_ids"),
+        from_me=filters.get("from_me"),
+    )
+
+
+def run_case(searcher, corpus: Corpus, case: Case) -> Result:
     started = time.time()
     try:
-        payload = engine.search(
-            case.query, SearchFilters(), SearchOptions(max_sessions=max_sessions)
-        )
+        payload = searcher.search(case.query)
     except Exception as error:  # noqa: BLE001 - a crash is a result, not a stop
+        parsed = parse_query(case.query, contact_index=corpus.contact_index)
         return Result(case, {}, parsed, time.time() - started, error=repr(error))
     elapsed = time.time() - started
+    parsed = parsed_from_payload(payload, case.query, corpus.contact_index)
     return Result(
         case,
         payload,
         parsed,
         elapsed,
-        properties=check_properties(case, payload, parsed, oracle),
-        oracle=score_against_oracle(parsed, payload, oracle, index_horizon, index_con),
+        properties=check_properties(case, payload, parsed, corpus.oracle),
+        oracle=score_against_oracle(
+            parsed, payload, corpus.oracle, corpus.index_horizon, corpus.index_con
+        ),
     )
 
 
@@ -406,6 +510,8 @@ def _pass_rate(rows: Sequence[Result]) -> Optional[float]:
 
 
 def print_report(report: dict) -> None:
+    if report.get("target"):
+        print(f"\nanswered by: {report['target']}")
     print(f"\n{'class':<22}{'n':>4}{'err':>5}{'pass':>8}{'p50':>8}{'p95':>8}")
     for cls, row in report["classes"].items():
         print(
@@ -436,43 +542,41 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--suite", default=None, help="path to a JSON suite; default is built in")
     parser.add_argument("--only", default=None, help="run one class")
     parser.add_argument("--json-out", default=None)
+    parser.add_argument(
+        "--target", choices=("auto", "app", "in-process"), default="auto",
+        help="auto: reuse the running app if there is one, else load an engine",
+    )
+    parser.add_argument("--max-sessions", type=int, default=8)
     args = parser.parse_args(argv)
 
     from seaglass.eval.suites import build_suite
 
-    # A running app holds its own copy of the embedding and rerank models.
-    # Two copies on one machine contend for memory and GPU, and a rerank
-    # that takes 2.6s alone took 96s alongside the app -- so latency
-    # gathered this way says nothing about the product.
-    lock = Path.home() / ".seaglass" / "app.lock"
-    if lock.exists():
-        print(
-            "WARNING: Seaglass appears to be running (~/.seaglass/app.lock).\n"
-            "         Quality numbers are still valid; latency numbers are not.\n",
-            file=sys.stderr,
+    corpus = Corpus(args.index_db, args.chat_db, args.chat_db_source)
+
+    # Reuse the app's engine when the app is running. Loading a second copy
+    # of the models beside it costs a gigabyte and makes both slower: a
+    # rerank that takes 2.6s alone took 96s alongside the app, which made
+    # every latency number meaningless. Reusing it also measures the path
+    # that actually answers a user's query.
+    use_app = args.target == "app" or (args.target == "auto" and AppSearcher.available())
+    if use_app:
+        searcher = AppSearcher(max_sessions=args.max_sessions)
+        if not AppSearcher.available():
+            print("No running app to target (--target app).", file=sys.stderr)
+            return 2
+    else:
+        searcher = EngineSearcher(
+            args.index_db, args.chat_db, args.chat_db_source, max_sessions=args.max_sessions
         )
+    print(f"target: {searcher.name}", file=sys.stderr)
 
-    engine = SearchEngine(args.index_db, args.chat_db, chat_db_source=args.chat_db_source)
-    engine.warmup(progress=lambda name: __import__("contextlib").nullcontext())
-    # The oracle reads the *live* chat.db when one is configured: an oracle
-    # bounded by the same snapshot the index was built from can never
-    # observe staleness, which is one of the failures the suite exists to
-    # separate out.
-    oracle_con = engine.chat_con
-    if args.chat_db_source:
-        oracle_con = sqlite3.connect(f"file:{args.chat_db_source}?mode=ro&immutable=1", uri=True)
-    oracle = Oracle(oracle_con)
-    index_horizon = engine.index_con.execute("SELECT MAX(end_ts) FROM chunks").fetchone()[0]
-
-    cases = build_suite(engine, path=Path(args.suite) if args.suite else None)
+    cases = build_suite(corpus, path=Path(args.suite) if args.suite else None)
     if args.only:
         cases = [c for c in cases if c.cls == args.only]
 
-    results = [
-        run_case(engine, oracle, case, index_horizon=index_horizon, index_con=engine.index_con)
-        for case in cases
-    ]
+    results = [run_case(searcher, corpus, case) for case in cases]
     report = summarize(results)
+    report["target"] = searcher.name
     print_report(report)
     if args.json_out:
         Path(args.json_out).write_text(json.dumps(report, indent=2))

@@ -210,17 +210,40 @@ payload: the engine ranked badly, the message arrived after the last build, or
 the message was never indexed at all. They need opposite fixes, and only the
 first is a ranking problem.
 
-### On latency
+### On latency, and on not competing with the thing you are measuring
 
-Only `p50` is trustworthy here. `p95` showed 100–950s outliers on a 16 GB
-laptop — including on filter-only queries that run no models at all, which is
-proof they are machine stalls rather than engine cost. The same queries run in
-1–3s in isolation. The harness now warns when the app is running, since two
-copies of the models contend for memory: a rerank that takes 2.6s alone took
-96s alongside the app. Latency belongs in a quiet, dedicated run.
+The first runs showed 100-950s p95 outliers, including on filter-only queries
+that run no models at all. The cause was the harness itself: it loaded its own
+embedder and cross-encoder alongside the app's, and two copies on a 16 GB
+laptop contend badly enough that a rerank taking 2.6s alone took 96s beside the
+app.
 
-Warm p50 by class: `person_date` 0.06s, `person_recency` 0.07s, `person_only`
-0.10s, `date_only` 0.55s, `lexical` 0.95s, `topical` 2.87s.
+Warning about it was the wrong fix. `mcp_server` already answers Grogu from the
+running app over loopback precisely so it never loads a second copy, and the
+harness now does the same: `--target auto` reuses the running app if there is
+one, and only loads an engine when there is not. That is better than avoiding
+contention. It measures **the path that actually answers a user's query**,
+rather than a second copy of the engine that only the harness ever runs.
+
+The difference is not subtle:
+
+| | own engine | reusing the app |
+|---|---|---|
+| 136 cases, wall clock | ~11 min | **92s** |
+| worst p95 in any class | 956s | **2.0s** |
+| memory | a second ~1 GB copy | none |
+
+Warm p50 through the app: `person_date` 0.04s, `person_recency` 0.14s,
+`person_only` 0.18s, `lexical` 0.79s, `person_topical` 1.10s, `topical` 1.20s.
+
+Use `--target in-process` deliberately -- to measure a cold start, or to test a
+working copy the app is not running. Judging is model-free either way: the
+oracle, the index horizon and the generated cases all come from SQLite alone.
+
+One further consequence: properties are checked against the payload's own
+`effective_filters` rather than a local re-parse. Re-parsing would test the
+harness's copy of the parser instead of the one that produced the answer --
+and against a running app those can be different builds.
 
 ### Still open
 
