@@ -191,6 +191,7 @@ def iter_pending_chunks(
     index_con: sqlite3.Connection,
     *,
     chunker_kwargs: Optional[dict] = None,
+    stale_ids_out: Optional[List[int]] = None,
 ) -> Iterator[PendingChunk]:
     """Per chat, re-derive the chat's current chunk list from chat.db and
     diff it against what's already committed in `chunks` for that
@@ -202,6 +203,19 @@ def iter_pending_chunks(
     lets a sync correctly pick up new messages that got merged into an
     already-committed chat's tail chunk, instead of silently skipping
     them because their *position* was already <= some global cursor.
+
+    **Id ordering invariant.** Ids are handed out in ascending order
+    across positions (existing ids are read `ORDER BY c.id`, and brand-new
+    ids come from a counter starting above `MAX(id)`), and positions are
+    chronological, so "within a chat, `ORDER BY id` == chronological
+    order" holds even after an iCloud backfill of *older* messages
+    rewrites every position in a chat. `search/rank.py::attach_context`
+    depends on exactly that.
+
+    If `stale_ids_out` is provided, chunk ids that are no longer backed by
+    any current chunk position are appended to it (see
+    `_prune_stale_chunks`) -- collected here rather than in a second pass
+    so re-chunking the whole corpus isn't done twice.
     """
     chunker_kwargs = chunker_kwargs or {}
     next_id = (index_con.execute("SELECT MAX(id) FROM chunks").fetchone()[0] or 0) + 1
@@ -212,6 +226,18 @@ def iter_pending_chunks(
             "SELECT DISTINCT chat_id FROM im.chat_message_join ORDER BY chat_id"
         )
     ]
+    if stale_ids_out is not None:
+        # Whole conversations deleted from chat.db are never visited by
+        # the loop below, so their chunks would otherwise linger forever
+        # (and keep surfacing deleted messages in search results).
+        placeholders = ",".join("?" for _ in chat_ids) or "NULL"
+        stale_ids_out.extend(
+            row[0]
+            for row in index_con.execute(
+                f"SELECT id FROM chunks WHERE chat_id NOT IN ({placeholders})", chat_ids
+            )
+        )
+
     for chat_id in chat_ids:
         messages = list(source.iter_messages(chat_con, chat_id=chat_id))
         if not messages:
@@ -254,6 +280,37 @@ def iter_pending_chunks(
             else:
                 yield PendingChunk(fresh, messages_by_id, next_id, is_rewrite=False)
                 next_id += 1
+
+        if stale_ids_out is not None and len(fresh_chunks) < len(existing_msg_ids_by_position):
+            # The chat shrank (messages deleted in Messages.app, which
+            # iCloud propagates). Positions past the end of the current
+            # chunk list are orphans referencing messages that no longer
+            # exist -- drop them so deleted content stops being
+            # searchable.
+            stale_ids_out.extend(
+                row_id for row_id, _ in existing_msg_ids_by_position[len(fresh_chunks):]
+            )
+
+
+def _prune_stale_chunks(index_con: sqlite3.Connection, stale_ids: Sequence[int]) -> int:
+    """Delete chunks that no longer correspond to any live chunk position
+    (deleted conversations, or chats that shrank), across all four tables,
+    in one transaction. Returns the number of chunks removed.
+    """
+    if not stale_ids:
+        return 0
+    index_con.execute("BEGIN")
+    try:
+        for chunk_id in stale_ids:
+            index_con.execute("DELETE FROM chunks WHERE id = ?", (chunk_id,))
+            index_con.execute("DELETE FROM chunk_message WHERE chunk_id = ?", (chunk_id,))
+            index_con.execute("DELETE FROM chunks_vec WHERE rowid = ?", (chunk_id,))
+            index_con.execute("DELETE FROM chunks_fts WHERE rowid = ?", (chunk_id,))
+        index_con.execute("COMMIT")
+    except Exception:
+        index_con.execute("ROLLBACK")
+        raise
+    return len(stale_ids)
 
 
 def _render_chunk(
@@ -458,8 +515,11 @@ def build_index(
     # the sample target is reached or the corpus runs out, then
     # calibrate once and flush everything buffered so far.
     pending_calibration: List[RenderedChunk] = []
+    stale_ids: List[int] = []
 
-    for pending in iter_pending_chunks(chat_con, index_con, chunker_kwargs=chunker_kwargs):
+    for pending in iter_pending_chunks(
+        chat_con, index_con, chunker_kwargs=chunker_kwargs, stale_ids_out=stale_ids
+    ):
         chunk, messages_by_id, chunk_id = pending.chunk, pending.messages_by_id, pending.id
 
         attachments = source.fetch_attachments_for_messages(chat_con, chunk.msg_ids)
@@ -514,6 +574,12 @@ def build_index(
             batch = batch[batch_size:]
         _flush(batch, embedding_model, index_con, compressor)
         chunks_written += len(batch)
+
+    # Only prune after a complete pass -- a run cut short by limit_chunks
+    # stopped early, so `stale_ids` is not yet a complete picture of what
+    # is genuinely orphaned.
+    if limit_chunks is None:
+        _prune_stale_chunks(index_con, stale_ids)
 
     return chunks_written
 

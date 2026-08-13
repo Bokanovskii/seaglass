@@ -268,6 +268,129 @@ class TestBuildIndex:
         third = build_index(chat_db_path, index_db_path, embedding_model=model)
         assert third == 0
 
+    def test_icloud_backfill_of_older_messages_is_indexed_and_keeps_id_order_chronological(
+        self, tmp_path
+    ):
+        """iCloud backfill (older messages arriving into an already-indexed
+        chat, e.g. on a freshly set up Mac still syncing history) shifts
+        every chunk boundary in that chat, not just the tail. All of it
+        must get indexed -- and critically, `search/rank.py::attach_context`
+        assumes that within a chat, `ORDER BY id` equals chronological
+        order. Assert that invariant survives a backfill, since ids are
+        now allocated per-position rather than as one global run.
+        """
+        chat_db_path = _build_fixture_chat_db(tmp_path, n_chats=2, n_messages_per_chat=5)
+        index_db_path = tmp_path / "index.db"
+        model = FakeEmbeddingModel()
+        assert build_index(chat_db_path, index_db_path, embedding_model=model) > 0
+
+        # Backfill messages OLDER than everything already indexed for chat
+        # 1, separated by a big gap so they form their own leading chunks.
+        chat_con = sqlite3.connect(chat_db_path)
+        apple_epoch_seconds_start = 700000000
+        for i, rowid in enumerate((200, 201, 202)):
+            date = apple_epoch_seconds_start - 10 * 86400 + i * 30  # ~10 days earlier
+            chat_con.execute(
+                "INSERT INTO message (ROWID, text, attributedBody, date, date_edited, "
+                "date_retracted, is_from_me, handle_id, associated_message_type) "
+                "VALUES (?, ?, NULL, ?, NULL, NULL, 0, 1, 0)",
+                (rowid, f"chat 1 backfilled old message {i}", date),
+            )
+            chat_con.execute(
+                "INSERT INTO chat_message_join (chat_id, message_id) VALUES (1, ?)", (rowid,)
+            )
+        chat_con.commit()
+        chat_con.close()
+
+        assert build_index(chat_db_path, index_db_path, embedding_model=model) > 0
+
+        con = open_index_db(index_db_path)
+        msg_ids = {
+            row[0]
+            for row in con.execute(
+                "SELECT cm.msg_id FROM chunk_message cm JOIN chunks c ON c.id = cm.chunk_id "
+                "WHERE c.chat_id = 1"
+            )
+        }
+        assert {200, 201, 202} <= msg_ids, "backfilled older messages must be indexed"
+
+        # The ORDER BY id == chronological invariant rank.py relies on.
+        for (chat_id,) in con.execute("SELECT DISTINCT chat_id FROM chunks"):
+            start_timestamps = [
+                row[0]
+                for row in con.execute(
+                    "SELECT start_ts FROM chunks WHERE chat_id = ? ORDER BY id", (chat_id,)
+                )
+            ]
+            assert start_timestamps == sorted(start_timestamps), (
+                f"chat {chat_id}: ORDER BY id must stay chronological after backfill"
+            )
+
+        # No stale/duplicate rows left behind in any derived table.
+        assert con.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] == (
+            con.execute("SELECT COUNT(*) FROM chunks_vec").fetchone()[0]
+        )
+        assert con.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] == (
+            con.execute("SELECT COUNT(*) FROM chunks_fts").fetchone()[0]
+        )
+        assert build_index(chat_db_path, index_db_path, embedding_model=model) == 0
+
+    def test_deleted_messages_are_pruned_from_the_index(self, tmp_path):
+        """Messages deleted in Messages.app (which iCloud propagates) must
+        stop being searchable -- otherwise the index keeps serving content
+        the user deliberately deleted.
+        """
+        chat_db_path = _build_fixture_chat_db(tmp_path, n_chats=2, n_messages_per_chat=30)
+        index_db_path = tmp_path / "index.db"
+        model = FakeEmbeddingModel()
+        # Give chat 2 a second chunk by adding a far-later burst (the
+        # chunker splits on time gaps), so pruning a *whole* deleted chat
+        # exercises multi-chunk removal.
+        chat_con = sqlite3.connect(chat_db_path)
+        for i, rowid in enumerate((200, 201, 202)):
+            chat_con.execute(
+                "INSERT INTO message (ROWID, text, attributedBody, date, date_edited, "
+                "date_retracted, is_from_me, handle_id, associated_message_type) "
+                "VALUES (?, ?, NULL, ?, NULL, NULL, 0, 1, 0)",
+                (rowid, f"chat 2 later message {i}", 700000000 + 10 * 86400 + i * 30),
+            )
+            chat_con.execute(
+                "INSERT INTO chat_message_join (chat_id, message_id) VALUES (2, ?)", (rowid,)
+            )
+        chat_con.commit()
+        chat_con.close()
+        assert build_index(chat_db_path, index_db_path, embedding_model=model) > 0
+
+        con = open_index_db(index_db_path)
+        chat2_chunks_before = con.execute(
+            "SELECT COUNT(*) FROM chunks WHERE chat_id = 2"
+        ).fetchone()[0]
+        assert chat2_chunks_before > 1, "need a multi-chunk chat for this test to be meaningful"
+
+        # Delete chat 2 entirely, and trim chat 1 down to its first message.
+        chat_con = sqlite3.connect(chat_db_path)
+        chat_con.execute("DELETE FROM chat_message_join WHERE chat_id = 2")
+        chat_con.execute("DELETE FROM message WHERE ROWID > 1 AND ROWID <= 30")
+        chat_con.execute("DELETE FROM chat_message_join WHERE chat_id = 1 AND message_id > 1")
+        chat_con.commit()
+        chat_con.close()
+
+        build_index(chat_db_path, index_db_path, embedding_model=model)
+
+        con = open_index_db(index_db_path)
+        assert con.execute("SELECT COUNT(*) FROM chunks WHERE chat_id = 2").fetchone()[0] == 0
+        assert con.execute("SELECT COUNT(*) FROM chunks WHERE chat_id = 1").fetchone()[0] == 1
+
+        # Derived tables must be pruned in lockstep -- no orphan vec/fts rows.
+        total = con.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+        assert con.execute("SELECT COUNT(*) FROM chunks_vec").fetchone()[0] == total
+        assert con.execute("SELECT COUNT(*) FROM chunks_fts").fetchone()[0] == total
+        orphan_membership = con.execute(
+            "SELECT COUNT(*) FROM chunk_message cm "
+            "LEFT JOIN chunks c ON c.id = cm.chunk_id WHERE c.id IS NULL"
+        ).fetchone()[0]
+        assert orphan_membership == 0
+
     def test_int8_embeddings_are_retrievable_via_constrained_knn(self, tmp_path):
         chat_db_path = _build_fixture_chat_db(tmp_path, n_chats=1, n_messages_per_chat=4)
         index_db_path = tmp_path / "index.db"

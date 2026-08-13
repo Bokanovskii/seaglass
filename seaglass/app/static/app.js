@@ -253,7 +253,29 @@ function buildFilters() {
   };
 }
 
+function hasActiveFilters() {
+  const filters = buildFilters();
+  return Boolean(
+    filters.people_handles.length
+    || filters.is_group !== null
+    || filters.chat_ids
+    || filters.date_from
+    || filters.date_to
+    || filters.has_media
+  );
+}
+
 async function search() {
+  // An empty query with *no* filters has nothing to rank by, so the
+  // backend returns an arbitrary slice of the corpus -- confusing. Empty
+  // query *with* filters is legitimate though (browse a person/date
+  // range), so only the completely-empty case is short-circuited.
+  if (!els.query.value.trim() && !hasActiveFilters()) {
+    state.results = [];
+    els.resultsMeta.innerHTML = '';
+    els.results.innerHTML = `<div class="empty-state"><div class="empty-icon">${iconSvg('i-search')}</div><div class="empty-title">Search your messages</div><p class="empty-hint">Type what you're looking for — a topic, a phrase, a plan someone mentioned — or narrow things down with the filters on the left.</p></div>`;
+    return;
+  }
   state.requestId = crypto.randomUUID();
   setBusy(true);
   let payload;
@@ -452,6 +474,18 @@ function clearFilters() {
   document.querySelector('input[name="group"][value=""]').checked = true;
 }
 
+// `<input type="date">` values are bare calendar dates with no timezone,
+// and buildFilters() interprets them as LOCAL midnight/end-of-day. So the
+// presets must emit local calendar dates too -- toISOString() emits UTC,
+// which west of UTC shifts both ends of the range forward a day (at 7pm
+// PDT, "last 7 days" produced a range ending *tomorrow*).
+function toLocalDateInputValue(date) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
 function applyPreset(days) {
   if (!days) {
     els.dateFrom.value = '';
@@ -460,8 +494,8 @@ function applyPreset(days) {
   }
   const end = new Date();
   const start = new Date(Date.now() - Number(days) * 86400 * 1000);
-  els.dateFrom.value = start.toISOString().slice(0, 10);
-  els.dateTo.value = end.toISOString().slice(0, 10);
+  els.dateFrom.value = toLocalDateInputValue(start);
+  els.dateTo.value = toLocalDateInputValue(end);
 }
 
 function escapeHtml(value) {

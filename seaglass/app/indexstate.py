@@ -16,6 +16,9 @@ import threading
 import time
 from pathlib import Path
 
+# Cap the snapshot's WAL so it can't outgrow the database it journals.
+_WAL_SIZE_LIMIT_BYTES = 64 * 1024 * 1024
+
 
 class IndexBuildState:
     """Thread-safe progress tracker for an in-app index build/sync run.
@@ -55,6 +58,41 @@ class IndexBuildState:
         with self._lock:
             for key, value in kwargs.items():
                 setattr(self, key, value)
+
+
+def _checkpoint_snapshot_wal(dest_con: sqlite3.Connection) -> None:
+    """Collapse the snapshot's write-ahead log back into the main db file.
+
+    `sqlite3.backup()` copies the *whole* source db (every page) each time
+    we sync, and the snapshot inherits WAL journalling from the live
+    chat.db. Meanwhile the running app holds long-lived reader connections
+    on the snapshot (search hydration), which prevents SQLite's automatic
+    checkpoint-on-last-close from ever firing. The net effect is that each
+    sync appends another full copy of the database to `-wal`, which grows
+    without bound -- observed at 8.5GB against a 655MB db.
+
+    Readers only block a TRUNCATE checkpoint while a read transaction is
+    actually open, so retry briefly, then fall back to a PASSIVE
+    checkpoint (which at least lets the existing WAL space be reused
+    rather than extended). `journal_size_limit` is a standing backstop so
+    the file is trimmed on any future checkpoint too.
+    """
+    try:
+        dest_con.execute(f'PRAGMA journal_size_limit = {_WAL_SIZE_LIMIT_BYTES}')
+    except sqlite3.Error:
+        return
+    for _ in range(5):
+        try:
+            busy, _, _ = dest_con.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()
+        except sqlite3.Error:
+            return
+        if busy == 0:
+            return
+        time.sleep(0.5)
+    try:
+        dest_con.execute('PRAGMA wal_checkpoint(PASSIVE)')
+    except sqlite3.Error:
+        pass
 
 
 def _count_chunks(index_db_path: Path) -> int | None:
@@ -110,6 +148,7 @@ def run_build(
             try:
                 with dest_con:
                     src_con.backup(dest_con)
+                _checkpoint_snapshot_wal(dest_con)
             finally:
                 dest_con.close()
         finally:
