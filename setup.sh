@@ -9,14 +9,16 @@
 #   2. Installs seaglass + the desktop app extras into it.
 #   3. Runs the capability preflight (seaglass.probe) so problems like
 #      missing Full Disk Access are caught early with a clear message.
-#   4. Snapshots your live chat.db to a local, safe, read-only copy
-#      (never touches or locks the live Messages database).
-#   5. Builds an index.db from that snapshot (first run only — safe to
-#      re-run any time to pick up new messages).
-#   6. Launches the desktop app.
+#   4. Launches the desktop app.
 #
-# Safe to re-run: existing venvs/snapshots/indexes are reused, and the
-# index build resumes from where it left off rather than starting over.
+# Building the search index (which reads and embeds your full message
+# history) is NOT done by this script — it can take a long time on a
+# large history, so it's something you kick off yourself, from inside the
+# app, with a visible "Build index now" button and progress indicator.
+# The app also shows how in-sync the index is (e.g. "N new messages since
+# last build") and lets you re-sync any time.
+#
+# Safe to re-run: an existing venv is reused.
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
@@ -84,33 +86,11 @@ fi
 
 mkdir -p "$SEAGLASS_HOME"
 
-# --- 4. Snapshot chat.db -------------------------------------------------------
-if [ ! -f "$CHAT_DB_SRC" ]; then
-  fail "chat.db not found at $CHAT_DB_SRC. Set SEAGLASS_CHAT_DB_SRC to its location and re-run."
-fi
-
-info "Snapshotting chat.db (safe, read-only copy — never touches the live database)"
-python - "$CHAT_DB_SRC" "$SNAPSHOT_DB" <<'PYEOF'
-import sqlite3
-import sys
-
-src, dst = sys.argv[1], sys.argv[2]
-source = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
-dest = sqlite3.connect(dst)
-with dest:
-    source.backup(dest)
-source.close()
-dest.close()
-PYEOF
-
-# --- 5. Build / resume index -------------------------------------------------------
+# --- 4. Launch -------------------------------------------------------
 if [ -f "$INDEX_DB" ]; then
-  info "Updating existing index at $INDEX_DB (resumes from where it left off)"
+  info "Launching seaglass (existing index found — app will show if it needs a resync)"
 else
-  info "Building a new index at $INDEX_DB (first run — indexes your full message history, may take a while)"
+  info "Launching seaglass — no index yet. Use the 'Build index now' button in the app when you're ready"
+  info "(building reads and embeds your full message history and can take a while for large histories)."
 fi
-python -m seaglass.cli build "$SNAPSHOT_DB" "$INDEX_DB"
-
-# --- 6. Launch -------------------------------------------------------
-info "Launching seaglass"
-exec seaglass-app --index-db "$INDEX_DB" --chat-db "$SNAPSHOT_DB" "$@"
+exec seaglass-app --index-db "$INDEX_DB" --chat-db "$SNAPSHOT_DB" --chat-db-source "$CHAT_DB_SRC" "$@"

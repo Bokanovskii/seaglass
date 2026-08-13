@@ -61,3 +61,13 @@ def test_engine_applies_people_filter(tmp_path, monkeypatch):
     payload = engine.search('dinner', SearchFilters(people_handles=['+15551234567']), SearchOptions())
     assert payload['n_sessions'] >= 1
     assert all('+15551234567' in session['participants'] for session in payload['sessions'])
+
+
+def test_status_before_warmup_reports_not_ready():
+    from seaglass.app.engine import SearchEngine
+
+    engine = SearchEngine('/tmp/does-not-exist-index.db', None)
+    status = engine.status()
+    assert status['index_ready'] is False
+    assert status['n_chunks'] == 0
+    assert status['hydration_available'] is False

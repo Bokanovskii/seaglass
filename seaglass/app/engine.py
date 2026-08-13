@@ -93,6 +93,20 @@ class SearchEngine:
         return {'warnings': list(self.warnings), 'corpus_bounds': self.corpus_bounds}
 
     def status(self) -> dict:
+        if self.index_con is None:
+            return {
+                'n_chunks': 0,
+                'n_vectors': 0,
+                'n_chats': 0,
+                'index_db': self.index_db,
+                'chat_db': self.chat_db,
+                'most_recent_chunk_ts': None,
+                'chat_db_max_ts': None,
+                'n_messages_since_index': 0,
+                'contacts_available': False,
+                'hydration_available': False,
+                'index_ready': False,
+            }
         n_chunks = self.index_con.execute('SELECT COUNT(*) FROM chunks').fetchone()[0]
         n_vectors = self.index_con.execute('SELECT COUNT(*) FROM chunks_vec').fetchone()[0]
         n_chats = self.index_con.execute('SELECT COUNT(DISTINCT chat_id) FROM chunks').fetchone()[0]
@@ -115,6 +129,7 @@ class SearchEngine:
             'n_messages_since_index': newer_messages,
             'contacts_available': self.contact_index is not None,
             'hydration_available': self.chat_con is not None,
+            'index_ready': True,
         }
 
     def suggest_contacts(self, q: str, limit: int = 10) -> list[dict]:

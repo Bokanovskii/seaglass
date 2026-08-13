@@ -25,6 +25,7 @@ from seaglass.app.assist import (
 )
 from seaglass.app.config import save_config
 from seaglass.app.filters import SearchFilters
+from seaglass.app.indexstate import IndexBuildState, run_build
 from seaglass.llm.ghcp import call_ghcp_json_object
 
 STATIC_DIR = Path(__file__).resolve().parent / 'static'
@@ -130,6 +131,7 @@ def create_app(engine, warmup_state, config, token: str):
     assist_manager = SearchAssistManager(engine, config.copilot_bin)
     app.state.pipeline_pool = pipeline_pool
     app.state.assist_manager = assist_manager
+    app.state.build_state = IndexBuildState()
 
     @app.get('/')
     async def root():
@@ -139,12 +141,52 @@ def create_app(engine, warmup_state, config, token: str):
     async def health():
         data = warmup_state.snapshot()
         data['engine'] = engine.health()
+        data['build'] = app.state.build_state.snapshot()
         return data
 
     @app.get('/api/status')
     async def status():
         loop = __import__('asyncio').get_running_loop()
         return await loop.run_in_executor(pipeline_pool, engine.status)
+
+    @app.post('/api/index/build')
+    async def start_build():
+        build_state: IndexBuildState = app.state.build_state
+        if build_state.running:
+            return JSONResponse(status_code=409, content={'detail': 'A build is already in progress.'})
+
+        def on_complete():
+            # Once a build finishes successfully, (re)warm the engine so
+            # search reflects the freshly written index without requiring
+            # the user to restart the app.
+            if build_state.stage != 'done':
+                return
+            warmup_state.state = 'STARTING'
+            warmup_state.error = None
+            for step in warmup_state.steps:
+                step.state = 'pending'
+                step.error = None
+            from seaglass.app.warmup import run_warmup
+            from seaglass.llm.ghcp import detect_ghcp
+            run_warmup(engine, warmup_state, lambda: detect_ghcp(config.copilot_bin))
+
+        thread = threading.Thread(
+            target=run_build,
+            kwargs=dict(
+                state=app.state.build_state,
+                chat_db_source=config.chat_db_source,
+                chat_db_snapshot=config.chat_db,
+                index_db=config.index_db,
+                on_complete=on_complete,
+            ),
+            daemon=True,
+        )
+        thread.start()
+        return {'started': True}
+
+    @app.get('/api/index/build')
+    async def build_status():
+        return app.state.build_state.snapshot()
 
     @app.post('/api/search')
     async def search(body: SearchBody):

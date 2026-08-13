@@ -25,6 +25,7 @@ def parse_args(argv: list[str] | None = None):
     parser = argparse.ArgumentParser(description='Launch the seaglass desktop search app.')
     parser.add_argument('--index-db')
     parser.add_argument('--chat-db')
+    parser.add_argument('--chat-db-source', help='live chat.db to snapshot from when building/syncing the index from the app')
     parser.add_argument('--port', type=int)
     parser.add_argument('--browser', action='store_true')
     parser.add_argument('--assist', choices=['off', 'auto', 'force'])
@@ -90,6 +91,8 @@ def _build_config(args) -> AppConfig:
         config.index_db = args.index_db
     if args.chat_db:
         config.chat_db = args.chat_db
+    if args.chat_db_source:
+        config.chat_db_source = args.chat_db_source
     if args.port:
         config.port = args.port
     if args.browser:
@@ -109,7 +112,10 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     if not config.index_db:
-        print('seaglass-app: No index database configured. Run `seaglass build ...` first or set SEAGLASS_INDEX_DB.')
+        # Defensive: apply_env_overrides always fills in a default, but keep
+        # this in case a caller constructs AppConfig directly without going
+        # through load_config/apply_env_overrides.
+        print('seaglass-app: No index database configured. Set --index-db or SEAGLASS_INDEX_DB.')
         return 2
 
     config.port = pick_port(config.port)
@@ -123,19 +129,32 @@ def main(argv: list[str] | None = None) -> int:
     for warning in warnings:
         warmup_state.add_warning(warning)
 
+    index_exists = Path(config.index_db).exists()
+
     app = create_app(engine, warmup_state, config, token)
     server = uvicorn.Server(uvicorn.Config(app, host='127.0.0.1', port=config.port, log_level='warning'))
     server_thread = threading.Thread(target=server.run, daemon=True)
     server_thread.start()
 
-    warmup_thread = threading.Thread(target=run_warmup, args=(engine, warmup_state, lambda: detect_ghcp(config.copilot_bin)), daemon=True)
-    warmup_thread.start()
+    if index_exists:
+        warmup_thread = threading.Thread(
+            target=run_warmup, args=(engine, warmup_state, lambda: detect_ghcp(config.copilot_bin)), daemon=True
+        )
+        warmup_thread.start()
+    else:
+        # No index yet: don't run warmup against a nonexistent database.
+        # The frontend detects NEEDS_INDEX and shows a "Build index now"
+        # screen; warmup is (re)started automatically once a build
+        # completes (see server.py's /api/index/build).
+        warmup_state.state = 'NEEDS_INDEX'
+        warmup_thread = None
 
     signal.signal(signal.SIGINT, cleanup)
     signal.signal(signal.SIGTERM, cleanup)
 
     if args.headless:
-        warmup_thread.join()
+        if warmup_thread is not None:
+            warmup_thread.join()
         if args.query:
             from seaglass.app.filters import SearchFilters
             from seaglass.app.engine import SearchOptions

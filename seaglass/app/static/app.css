@@ -11,6 +11,8 @@ button { cursor: pointer; }
 .card { width: min(720px, 92vw); background: #1f2937; border: 1px solid #374151; border-radius: 16px; padding: 24px; }
 .progress { height: 10px; background: #111827; border-radius: 999px; overflow: hidden; }
 #progress-bar { height: 100%; width: 0; background: linear-gradient(90deg, #60a5fa, #34d399); }
+.progress .indeterminate { height: 100%; width: 40%; background: linear-gradient(90deg, #60a5fa, #34d399); animation: indeterminate 1.4s ease-in-out infinite; }
+@keyframes indeterminate { 0% { margin-left: -40%; } 100% { margin-left: 100%; } }
 .hidden { display: none !important; }
 .error { color: #fca5a5; }
 .banner { padding: 12px; border-radius: 10px; background: #1d4ed8; margin-bottom: 12px; }

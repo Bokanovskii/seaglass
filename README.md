@@ -47,13 +47,17 @@ cd seaglass
 ./setup.sh
 ```
 
-That's it — this one script creates a venv, installs everything, runs a
-capability preflight (catches missing Full Disk Access etc. with a clear
-message), snapshots your `chat.db` safely, builds the index (first run
-only — safe to re-run any time to pick up new messages), and launches the
-desktop app. See `./setup.sh --help`-style comments at the top of the
-script for what each step does and how to override paths (e.g.
-`SEAGLASS_CHAT_DB_SRC`, `SEAGLASS_HOME`).
+This script creates a venv, installs everything, runs a capability
+preflight (catches missing Full Disk Access etc. with a clear message),
+and launches the desktop app. It does **not** build the search index for
+you — indexing reads and embeds your full message history and can take a
+while on a large history, so it's a deliberate, user-initiated step: the
+app itself shows a "Build index now" screen on first launch with a clear
+time-cost warning, and a live progress indicator while it runs. Once
+built, the app's status bar always shows how in-sync the index is (e.g.
+"N new messages since last build") with a one-click "Sync now" button.
+See the comments at the top of `setup.sh` for how to override paths
+(e.g. `SEAGLASS_CHAT_DB_SRC`, `SEAGLASS_HOME`).
 
 ## Manual setup
 
@@ -64,6 +68,13 @@ without the desktop app):
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
+```
+
+You can also build/update the index from the CLI instead of the app's UI
+(both call the same idempotent build — safe to re-run any time):
+
+```bash
+seaglass build <chat_db_snapshot> <index_db>
 ```
 
 ## Development
@@ -97,17 +108,19 @@ development-plans/       # design docs (see Status above)
 ## Desktop app
 
 The quickest way to get the desktop app running is `./setup.sh` (see
-"Quick start" above) — it handles the venv, install, chat.db snapshot,
-index build, and launch in one command.
+"Quick start" above) — it handles the venv, install, and launch. Building
+the index is a separate, explicit step you trigger from inside the app
+(or via the CLI), since it can take a while on a large message history.
 
 To run it manually instead: install the app extras in the same venv you
-already use for seaglass, then point it at an index (build one with
-`seaglass build <chat_db_snapshot> <index_db>` if you don't have one yet):
+already use for seaglass, then point it at where you want the index and
+chat.db snapshot to live (they don't need to exist yet):
 
 ```bash
 source .venv/bin/activate
 pip install -e ".[app,dev]"
-seaglass-app --index-db /path/to/index.db --chat-db /path/to/chat.db
+seaglass-app --index-db /path/to/index.db --chat-db /path/to/chat_snapshot.db --chat-db-source /path/to/chat.db
 ```
 
-By default this opens a native `pywebview` window. Use `--browser` if you want a browser tab for debugging. On first run, the app shows a real warmup screen while it loads model weights, warms SQLite, and prepares contacts. If no index exists yet, you'll get a friendly prompt to run `seaglass build ...` first. If `chat.db` or Full Disk Access is unavailable, the app explains that hydration is limited and tells you how to fix it. If GitHub Copilot CLI is missing, search still works normally; only optional query assist stays off.
+By default this opens a native `pywebview` window. Use `--browser` if you want a browser tab for debugging. On first run, if no index exists yet, the app shows a "Build index now" screen instead of the warmup screen — building runs in the background with live progress, and the app automatically warms up and becomes searchable as soon as it finishes. Once ready, the app shows a real warmup screen while it loads model weights, warms SQLite, and prepares contacts, and its status bar always reports how in-sync the index is, with a "Sync now" button to pick up new messages any time. If `chat.db` or Full Disk Access is unavailable, the app explains that hydration is limited and tells you how to fix it. If GitHub Copilot CLI is missing, search still works normally; only optional query assist stays off.
+

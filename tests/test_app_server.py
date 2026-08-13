@@ -33,6 +33,9 @@ class StubEngine:
 class StubConfig:
     port = 8765
     copilot_bin = None
+    index_db = '/tmp/does-not-matter-index.db'
+    chat_db = '/tmp/does-not-matter-chat.db'
+    chat_db_source = '/tmp/does-not-matter-source.db'
     def to_dict(self):
         return {'port': self.port}
 
@@ -70,3 +73,28 @@ def test_search_round_trip():
     response = client.post('/api/search', headers={'Authorization': 'Bearer token123', 'Host': '127.0.0.1:8765'}, json={'query': 'lease', 'filters': {}, 'options': {}, 'assist': 'off', 'request_id': 'abc'})
     assert response.status_code == 200
     assert response.json()['request_id'] == 'abc'
+
+
+def test_build_status_reports_idle_by_default():
+    client = _client()
+    response = client.get('/api/index/build', headers={'Authorization': f'Bearer token123', 'Host': '127.0.0.1:8765'})
+    assert response.status_code == 200
+    body = response.json()
+    assert body['running'] is False
+    assert body['stage'] == 'idle'
+
+
+def test_health_includes_build_state():
+    client = _client()
+    response = client.get('/api/health', headers={'Authorization': f'Bearer token123', 'Host': '127.0.0.1:8765'})
+    assert response.status_code == 200
+    assert 'build' in response.json()
+    assert response.json()['build']['running'] is False
+
+
+def test_start_build_reports_conflict_when_already_running():
+    client = _client()
+    app = client.app
+    app.state.build_state.running = True
+    response = client.post('/api/index/build', headers={'Authorization': f'Bearer token123', 'Host': '127.0.0.1:8765'})
+    assert response.status_code == 409

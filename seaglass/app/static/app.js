@@ -18,6 +18,14 @@ const state = {
 
 const els = {
   loading: document.getElementById('loading-screen'),
+  buildScreen: document.getElementById('build-screen'),
+  buildIdle: document.getElementById('build-idle'),
+  buildStart: document.getElementById('build-start'),
+  buildProgress: document.getElementById('build-progress'),
+  buildStageText: document.getElementById('build-stage-text'),
+  buildProgressBar: document.getElementById('build-progress-bar'),
+  buildDetail: document.getElementById('build-detail'),
+  buildError: document.getElementById('build-error'),
   app: document.getElementById('app'),
   progressBar: document.getElementById('progress-bar'),
   warmupSteps: document.getElementById('warmup-steps'),
@@ -28,6 +36,7 @@ const els = {
   resultsMeta: document.getElementById('results-meta'),
   statusBar: document.getElementById('status-bar'),
   assistBanner: document.getElementById('assist-banner'),
+  syncBanner: document.getElementById('sync-banner'),
   peopleInput: document.getElementById('people-input'),
   peopleSuggestions: document.getElementById('people-suggestions'),
   peopleChips: document.getElementById('people-chips'),
@@ -53,6 +62,19 @@ async function api(path, options = {}) {
 
 async function pollHealth() {
   const health = await api('/api/health');
+  if (health.state === 'NEEDS_INDEX' && !(health.build && health.build.running)) {
+    els.loading.classList.add('hidden');
+    els.app.classList.add('hidden');
+    els.buildScreen.classList.remove('hidden');
+    els.buildIdle.classList.remove('hidden');
+    els.buildProgress.classList.add('hidden');
+    return;
+  }
+  if (health.build && health.build.running) {
+    showBuildProgress(health.build);
+    setTimeout(pollHealth, 500);
+    return;
+  }
   els.progressBar.style.width = `${Math.round((health.progress || 0) * 100)}%`;
   els.warmupSteps.innerHTML = (health.steps || []).map(step => `<li>${symbolFor(step.state)} ${step.name} <span>${step.elapsed_s?.toFixed?.(2) || step.elapsed_s || 0}s</span></li>`).join('');
   if (health.error) {
@@ -61,12 +83,48 @@ async function pollHealth() {
   }
   if (health.state === 'READY' || health.state === 'DEGRADED') {
     els.loading.classList.add('hidden');
+    els.buildScreen.classList.add('hidden');
     els.app.classList.remove('hidden');
     await refreshStatus();
+    if (!window.__statusPollStarted) {
+      window.__statusPollStarted = true;
+      setInterval(refreshStatus, 60000);
+    }
     return;
   }
   setTimeout(pollHealth, 250);
 }
+
+function showBuildProgress(build) {
+  els.loading.classList.add('hidden');
+  els.app.classList.add('hidden');
+  els.buildScreen.classList.remove('hidden');
+  els.buildIdle.classList.add('hidden');
+  els.buildProgress.classList.remove('hidden');
+  const stageLabels = {
+    snapshotting: 'Snapshotting chat.db (safe, read-only copy)…',
+    building: 'Embedding and indexing messages… this can take a while for large histories.',
+    idle: 'Starting…',
+  };
+  els.buildStageText.textContent = stageLabels[build.stage] || build.stage;
+  els.buildDetail.textContent = build.chunks_written ? `${build.chunks_written} chunks written so far · ${build.elapsed_s ?? 0}s elapsed` : `${build.elapsed_s ?? 0}s elapsed`;
+}
+
+async function startBuild() {
+  els.buildError.classList.add('hidden');
+  try {
+    await api('/api/index/build', {method: 'POST'});
+  } catch (err) {
+    els.buildError.textContent = err.message;
+    els.buildError.classList.remove('hidden');
+    return;
+  }
+  els.buildIdle.classList.add('hidden');
+  els.buildProgress.classList.remove('hidden');
+  setTimeout(pollHealth, 250);
+}
+
+if (els.buildStart) els.buildStart.onclick = startBuild;
 
 function symbolFor(state) {
   return state === 'done' ? '✓' : state === 'failed' ? '⚠' : state === 'running' ? '⟳' : '•';
@@ -76,6 +134,24 @@ async function refreshStatus() {
   const status = await api('/api/status');
   const stale = status.n_messages_since_index ? ` · ⚠ ${status.n_messages_since_index} msgs since last index build` : '';
   els.statusBar.textContent = `${status.hydration_available ? '●' : '◌'} Ready · ${status.n_chunks} chunks · ${status.n_chats} chats${stale}`;
+  if (status.n_messages_since_index > 0) {
+    els.syncBanner.classList.remove('hidden');
+    els.syncBanner.innerHTML = `${status.n_messages_since_index} new message${status.n_messages_since_index === 1 ? '' : 's'} since the index was last built. <button id="sync-now">Sync now</button>`;
+    document.getElementById('sync-now').onclick = syncNow;
+  } else {
+    els.syncBanner.classList.add('hidden');
+  }
+}
+
+async function syncNow() {
+  try {
+    await api('/api/index/build', {method: 'POST'});
+  } catch (err) {
+    els.syncBanner.textContent = err.message;
+    return;
+  }
+  els.syncBanner.textContent = 'Syncing… this may take a while.';
+  pollHealth();
 }
 
 function buildFilters() {
