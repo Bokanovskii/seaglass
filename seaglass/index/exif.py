@@ -28,8 +28,7 @@ up in a future pass).
 checked, ~17% carried GPS EXIF tags (the rest are either not
 geotagged, e.g. screenshots/memes, or had Location Services off at
 capture time) -- `reverse_geocoder`'s offline GeoNames-derived lookup
-correctly resolved real coordinates to real city/region names (e.g. a
-[REDACTED_LOCATION] coordinate -> "[REDACTED_LOCATION]").
+correctly resolved real coordinates to their real city/region names.
 """
 
 from __future__ import annotations

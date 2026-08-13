@@ -296,8 +296,9 @@ placeholder all render exactly as designed on real messages.
 **Small real-data finding, fixed:** Apple embeds `U+FFFC` (OBJECT
 REPLACEMENT CHARACTER) inline in `message.text` at the position of an
 attachment. Before this fix, that raw marker leaked through alongside our
-own `[attachment]` placeholder (e.g. `"[REDACTED_MESSAGE_TEXT]\ufffc
-[attachment]"`), doubling up meaningless signal in both renderings.
+own `[attachment]` placeholder (e.g. a message body ending in
+`"...\ufffc [attachment]"`), doubling up meaningless signal in both
+renderings.
 `index/render.py` now strips `\ufffc` (plus surrounding whitespace) from
 `message.text` before either rendering runs. Regression-tested in
 `test_render.py`.
@@ -343,10 +344,10 @@ can actually measure whether it costs precision.
 
 **Validated against real data, end to end.** Built a real (capped, 800
 chunk) index from a fresh snapshot of the live, partially-backfilled
-`chat.db`, then ran real free-text queries ("what time are we meeting
-tonight", "any plans for dinner", "boat") through the full
+`chat.db`, then ran real free-text queries (short topical fragments
+about dinner/scheduling/logistics-type conversations) through the full
 parse -> retrieve pipeline. Results were semantically on-target in every
-case (e.g. "any plans for dinner" surfaced actual dinner-planning threads
+case (e.g. a dinner-planning query surfaced actual dinner-planning threads
 ranked above unrelated chat). End-to-end latency including cold MLX model
 load (no daemon, per the user's decision) was ~1.1-1.3s for an 800-chunk
 index -- this will need to be re-measured against the full-size index
@@ -411,11 +412,11 @@ redaction path.
 
 **Validated against real data, end to end, full pipeline.** Built an
 800-chunk real index from a fresh live-`chat.db` snapshot and ran
-`seaglass search ... "any plans for dinner" --chat-db ...`. Real contact
-names resolved correctly (e.g. "[REDACTED_NAME]", "[REDACTED_NAME]");
-sessions grouped sensibly by day within a real group chat; one session's
-top hit was literally "[REDACTED_MESSAGE_TEXT]
-to join" -- a strong true positive for the query. Cold end-to-end latency
+`seaglass search ... "<a short topical query>" --chat-db ...`. Real contact
+names resolved correctly against the user's own Contacts app; sessions
+grouped sensibly by day within a real group chat; the top hit for one
+query was a strong true positive, on-topic and correctly ranked first.
+Cold end-to-end latency
 (embedding model + reranker model load, no daemon, per the user's
 decision to measure this before building one) was **~4.3s** for an
 800-chunk index -- higher than Phase 4a's dense+sparse-only ~1.2s,
@@ -714,8 +715,8 @@ geocode) is never repeated.
 
 **Validated against real data**: a scan of 500 recent real image
 attachments found ~17% carried usable GPS EXIF tags; `reverse_geocoder`
-correctly resolved real coordinates to real places (e.g. a Catalina
-Island coordinate -> "[REDACTED_LOCATION]"). Ran a full
+correctly resolved real coordinates to real places (city/country-level
+resolution, spot-checked against known photo locations). Ran a full
 800-chunk real build with the wiring active (17.0s, comparable per-chunk
 overhead to the pre-geo 500-chunk baseline from earlier sessions):
 found and correctly geocoded 3 real geotagged attachments in that
@@ -766,9 +767,9 @@ than leaving Phase 3.5 purely spec'd-and-tested:
   review-time signals, per §4.2's rule, not auto-rejected.
 - Spot-checked several generated questions by eye: genuinely vague,
   plausible, non-leaking recall-style questions about real past
-  conversations (e.g. "wasn't there a conversation sometime in spring
-  where we [REDACTED_TOPIC]..."),
-  which is exactly the intent of EVALUATION.md §4.1's question style.
+  conversations (terse, topic-fragment phrasing rather than full
+  sentences), which is exactly the intent of EVALUATION.md §4.1's
+  question style.
 
 **⚠️ This output contains real personal message content and was
 deliberately kept out of git.** Added `.gitignore` rules (`*.db`,
@@ -802,8 +803,8 @@ EVALUATION.md's design that a human, not an agent, is supposed to do.
 
 The user flagged that `eval/generate.py`'s generated questions were too
 formal -- structured full sentences like "Wasn't there a conversation
-sometime in spring where we commiserated about..." or "What were the
-dinner plans with...". Real recall-search queries people type are much
+sometime in spring where we talked about..." or "What were the
+plans with...". Real recall-search queries people type are much
 terser: keyword fragments, no question words, no helper verbs.
 
 Fixed `_PROMPT_TEMPLATE` in `seaglass/eval/generate.py` to explicitly
@@ -817,10 +818,10 @@ Regenerated the pending 43-candidate real-scale batch
 (`data/golden-set-review/candidates_for_review.jsonl`) against the same
 already-harvested `index.db` with the new prompt -- 32 draft entries this
 time (batch composition varies run to run since ghcp's phrasing choices
-differ). Spot-checked several: `"[REDACTED_TOPIC]
-texts"`, `"[REDACTED_TOPIC]"`, `"[REDACTED_TOPIC]
-[REDACTED_TOPIC]"` -- terse, no question words, matches the intended
-"typed into a search box" register. Still awaiting the user's human
+differ). Spot-checked several: all were terse, no question words, and
+matched the intended "typed into a search box" register, referencing
+real past conversation topics without quoting message text verbatim.
+Still awaiting the user's human
 review pass (unchanged from §18 -- this only fixes question *style*, not
 the review step itself).
 
