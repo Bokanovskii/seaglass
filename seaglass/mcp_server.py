@@ -120,16 +120,39 @@ def _log(msg: str) -> None:
     print(f"[seaglass-mcp] {msg}", file=sys.stderr, flush=True)
 
 
+def _resolve_path(env_var: str, from_config) -> Optional[str]:
+    """The env var if set, else whatever the desktop app is configured to use.
+
+    Pinning absolute paths in the MCP config is how this drifts: an index
+    built for a one-off experiment gets wired in, the app later builds its
+    real index somewhere else, and every Grogu search silently falls back
+    to a substring scan because the configured path no longer exists.
+    Sharing the app's own config resolution means Grogu and the app can't
+    disagree about which index is current.
+    """
+    value = os.environ.get(env_var)
+    if value:
+        return value
+    try:
+        from seaglass.app.config import load_config
+
+        value = from_config(load_config())
+    except Exception:  # noqa: BLE001 - the env var is still the contract
+        return None
+    return value if value and Path(value).exists() else None
+
+
 def _get_index_con() -> sqlite3.Connection:
     global _index_con
     if _index_con is None:
         with _init_lock:
             if _index_con is None:
-                index_db = os.environ.get("SEAGLASS_INDEX_DB")
+                index_db = _resolve_path("SEAGLASS_INDEX_DB", lambda c: c.index_db)
                 if not index_db:
                     raise RuntimeError(
-                        "SEAGLASS_INDEX_DB is not set -- point it at a built index.db "
-                        "(see `seaglass build`)."
+                        "SEAGLASS_INDEX_DB is not set and no index was found at the "
+                        "default location -- build one from the Seaglass app, or "
+                        "point SEAGLASS_INDEX_DB at a built index.db."
                     )
                 index_path = Path(index_db)
                 if not index_path.exists():
@@ -147,7 +170,7 @@ def _get_chat_con() -> Optional[sqlite3.Connection]:
     if _chat_con is None:
         with _init_lock:
             if _chat_con is None:
-                chat_db = os.environ.get("SEAGLASS_CHAT_DB")
+                chat_db = _resolve_path("SEAGLASS_CHAT_DB", lambda c: c.chat_db)
                 if not chat_db:
                     return None
                 _log(f"opening chat.db snapshot: {chat_db}")

@@ -7,6 +7,8 @@ and test_rank.py do for the underlying pipeline pieces.
 
 from __future__ import annotations
 
+import types
+
 from seaglass.imessage.source import connect_readonly
 from seaglass.index.build import build_index, open_index_db
 
@@ -196,10 +198,39 @@ def test_index_status_reports_counts(tmp_path, monkeypatch):
     assert status["hydration_available"] is True
 
 
-def test_index_status_reports_error_when_unconfigured(monkeypatch):
+def test_index_status_reports_error_when_unconfigured(monkeypatch, tmp_path):
     monkeypatch.delenv("SEAGLASS_INDEX_DB", raising=False)
+    # ...and no index at the app's configured location either. (The default
+    # path is resolved at import time, so setting HOME here would not take.)
+    monkeypatch.setattr(
+        "seaglass.app.config.load_config",
+        lambda *a, **k: types.SimpleNamespace(index_db=str(tmp_path / "missing.db"), chat_db=None),
+    )
     monkeypatch.setattr(mcp_server, "_index_con", None)
 
     status = mcp_server.index_status()
 
     assert "error" in status
+
+
+def test_resolve_path_falls_back_to_app_config(monkeypatch, tmp_path):
+    """With no env var set, the MCP server uses whatever index the desktop
+    app is configured with -- otherwise a pinned, stale path in the MCP
+    config sends every Grogu search to a nonexistent database."""
+    monkeypatch.delenv("SEAGLASS_INDEX_DB", raising=False)
+    index = tmp_path / "index.db"
+    index.write_bytes(b"")
+    fake_config = types.SimpleNamespace(index_db=str(index), chat_db=None)
+    monkeypatch.setattr(
+        "seaglass.app.config.load_config", lambda *a, **k: fake_config
+    )
+
+    assert mcp_server._resolve_path("SEAGLASS_INDEX_DB", lambda c: c.index_db) == str(index)
+    # A configured-but-missing path resolves to nothing rather than being
+    # handed on to be silently created as an empty database.
+    assert mcp_server._resolve_path("SEAGLASS_CHAT_DB", lambda c: c.chat_db) is None
+
+
+def test_resolve_path_prefers_env_var(monkeypatch):
+    monkeypatch.setenv("SEAGLASS_INDEX_DB", "/tmp/explicit.db")
+    assert mcp_server._resolve_path("SEAGLASS_INDEX_DB", lambda c: 'ignored') == "/tmp/explicit.db"
