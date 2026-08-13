@@ -34,6 +34,36 @@ def parse_args(argv: list[str] | None = None):
     return parser.parse_args(argv)
 
 
+def _set_macos_dock_icon() -> None:
+    """Set a proper seaglass Dock icon instead of the generic Python
+    rocket. pywebview's own `icon=` kwarg to `create_window` only takes
+    effect on GTK/QT (its docs say so explicitly) -- on macOS the Cocoa
+    backend has no such hook, and the Dock just shows whatever icon the
+    running interpreter itself has (the stock CPython "rocket"). Setting
+    `NSApplication.sharedApplication().setApplicationIconImage_()`
+    directly via PyObjC is the actual mechanism that changes the Dock
+    tile and Cmd+Tab switcher for a plain (non-bundled) Python process.
+
+    Best-effort only: if PyObjC/AppKit isn't importable (non-macOS, or a
+    stripped-down environment) or the icon asset is missing, silently
+    skip rather than fail app startup over cosmetics.
+    """
+    try:
+        import AppKit
+    except ImportError:
+        return
+
+    icon_path = Path(__file__).resolve().parent / 'static' / 'icons' / 'icon-512.png'
+    if not icon_path.exists():
+        return
+    try:
+        image = AppKit.NSImage.alloc().initWithContentsOfFile_(str(icon_path))
+        if image is not None:
+            AppKit.NSApplication.sharedApplication().setApplicationIconImage_(image)
+    except Exception:
+        pass
+
+
 def pick_port(requested: int | None) -> int:
     start = requested or 8765
     for port in range(start, start + 50):
@@ -175,9 +205,14 @@ def main(argv: list[str] | None = None) -> int:
 
     import webview
 
+    _set_macos_dock_icon()
+    icon_path = Path(__file__).resolve().parent / 'static' / 'icons' / 'icon-512.png'
     webview.create_window('seaglass', url, width=1280, height=900)
     try:
-        webview.start()
+        # `icon` is a start()-time kwarg (GTK/QT only, per pywebview docs),
+        # not a create_window() one -- harmless no-op on the Cocoa backend,
+        # where _set_macos_dock_icon() above is what actually takes effect.
+        webview.start(icon=str(icon_path) if icon_path.exists() else None)
     finally:
         cleanup()
     return 0
