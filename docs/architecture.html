@@ -265,8 +265,82 @@
       </div>
     </section>
 
+    <section id="runtimes">
+      <h2><span class="num">03</span> Runtimes &amp; the chat.db lifecycle</h2>
+      <p>
+        Two things people ask about repeatedly: what actually executes the ML models, and how
+        seaglass can safely read from <code>chat.db</code> — a database that Messages.app itself
+        has open and is actively writing to — without corrupting it or racing a live write.
+      </p>
+
+      <h3>Runtimes</h3>
+      <p>
+        seaglass has no custom inference server or GPU runtime of its own. Both the embedding
+        model and the cross-encoder reranker run in-process via
+        <a href="https://github.com/ml-explore/mlx">Apple's MLX</a>
+        (<code>seaglass/index/embed.py</code>, <code>seaglass/search/rerank.py</code>) — MLX targets
+        Apple Silicon's unified memory directly, so weights are loaded once per process and matmuls
+        run on-GPU with no serialization/IPC round-trip to a separate server. There is deliberately
+        <strong>no persistent daemon</strong> (see the design decision in <a href="#overview">§1</a>):
+        each MCP invocation is a fresh Python process that imports <code>mlx.core</code>, loads
+        model weights from disk, and pays a one-time MLX kernel-compilation cost on the very first
+        query (see the <code>~1.8s</code> cold-invocation number in <a href="#latency">§10</a>).
+        Everything else — SQLite (index.db, chat_snapshot.db, live chat.db reads), the FastAPI app
+        server, the MCP stdio server, and the pywebview desktop shell — is plain CPython; MLX is the
+        only place the app leaves pure-Python/SQLite.
+      </p>
+      <p>
+        The one place GitHub Copilot CLI (GHCP) is invoked is <em>not</em> a runtime seaglass hosts
+        itself — query-assist parsing and golden-set generation shell out to the <code>copilot</code>
+        CLI binary as a subprocess (see <a href="#query-parse">§5</a> and <a href="#eval">§11</a>);
+        seaglass never talks to a model-serving API directly for those steps.
+      </p>
+
+      <h3>chat.db: snapshot during indexing, live afterwards</h3>
+      <p>
+        <code>~/Library/Messages/chat.db</code> is owned by Messages.app, which holds it open and
+        writes to it continuously (new messages, read receipts, reactions). seaglass never opens a
+        writable handle to it and never queries it directly during a full (re)build — instead:
+      </p>
+      <div class="callout decision">
+        <strong>Build/sync time — snapshot, then index the snapshot.</strong>
+        <code>run_build()</code> (<code>seaglass/app/indexstate.py</code>) first copies
+        <code>chat_db_source</code> (the live, real <code>chat.db</code>) to a private
+        <code>chat_snapshot.db</code> file using SQLite's own online backup mechanism, taken via a
+        short-lived read-only connection so Messages.app's writes are never blocked and the copy is
+        always transactionally consistent. The entire embed → rerank → chunk → write pipeline then
+        runs exclusively against that frozen snapshot, never the live file. This is what makes a
+        build safe to run while iMessage is actively receiving texts, and it's also why
+        <code>index.db</code>'s content is only ever as fresh as the snapshot taken at the last
+        build/sync.
+      </div>
+      <div class="callout decision">
+        <strong>After the build — live, read-only polling for staleness.</strong>
+        Once an index exists, the running app needs to know how far the snapshot has drifted from
+        reality without re-copying the whole database every time. <code>SearchEngine.status()</code>
+        (<code>seaglass/app/engine.py</code>) opens a second, independent read-only connection
+        directly to the <em>live</em> <code>chat_db_source</code> — via
+        <code>connect_readonly()</code> (<code>seaglass/imessage/source.py</code>), which
+        <code>ATTACH</code>es it under a <code>file:...?mode=ro</code> URI so it can never write —
+        and compares its most recent message timestamp against the newest chunk already in
+        <code>index.db</code>. This connection is cached and reused across polls (the status
+        endpoint is hit roughly once a minute by the desktop UI) rather than re-attached every time,
+        and it degrades to "unknown/0" rather than throwing if the live file is missing or
+        unreadable (e.g. Full Disk Access revoked). This live connection is used <em>only</em> for
+        counting how stale the index is — it is never used to actually pull message content into the
+        index; that only ever happens against a fresh snapshot, via the same "Sync now" build path
+        described above.
+      </div>
+      <p>
+        In short: <code>chat_snapshot.db</code> is the only thing the retrieval pipeline ever reads
+        message bodies from, and it is only ever refreshed by taking a brand-new consistent
+        snapshot of the live <code>chat.db</code> — the live file itself is touched only for cheap,
+        read-only "how far behind are we" checks between builds, never for content.
+      </p>
+    </section>
+
     <section id="storage">
-      <h2><span class="num">03</span> Storage layer — <code>index.db</code></h2>
+      <h2><span class="num">04</span> Storage layer — <code>index.db</code></h2>
       <p>A single SQLite file holds three cooperating tables per chunk plus two virtual (derived)
       indexes. No text is ever duplicated between them — full text lives compressed in
       <code>chunks.body_semantic</code>; the FTS5 index is <em>contentless</em> (inverted index only,
@@ -280,7 +354,7 @@
     </section>
 
     <section id="query-parse">
-      <h2><span class="num">04</span> Query parsing</h2>
+      <h2><span class="num">05</span> Query parsing</h2>
       <p><code>seaglass/search/parse.py</code> turns a raw natural-language query into a
       <code>ParsedQuery</code>: a <code>semantic</code> text (fed to the embedder + BM25) plus
       structured extractions — <code>date_from</code>/<code>date_to</code>, <code>has_media</code>,
@@ -307,7 +381,7 @@
     </section>
 
     <section id="retrieval">
-      <h2><span class="num">05</span> Hybrid retrieval — dense + sparse, RRF fused</h2>
+      <h2><span class="num">06</span> Hybrid retrieval — dense + sparse, RRF fused</h2>
       <p><code>seaglass/search/retrieve.py</code> implements the baseline retriever: a pre-filter
       followed by two independent candidate-generation paths, fused by Reciprocal Rank Fusion (RRF).</p>
       <table>
@@ -330,7 +404,7 @@
     </section>
 
     <section id="rerank-aggregate">
-      <h2><span class="num">06</span> Rerank + session aggregation</h2>
+      <h2><span class="num">07</span> Rerank + session aggregation</h2>
       <p><code>seaglass/search/rank.py</code> + <code>rerank.py</code> — deliberately kept
       separate from retrieval so the baseline (no rerank) and full pipeline could be evaluated
       independently against the golden set.</p>
@@ -357,7 +431,7 @@
     </section>
 
     <section id="mcp">
-      <h2><span class="num">07</span> MCP server surface</h2>
+      <h2><span class="num">08</span> MCP server surface</h2>
       <p><code>seaglass/mcp_server.py</code> exposes three tools over stdio, single-process, guarded by
       a global lock (<code>_pipeline_lock</code>) since MLX has no cross-thread safety guarantee, plus
       a separate <code>_init_lock</code> around all lazy singleton getters (index connection, chat
@@ -378,7 +452,7 @@
     </section>
 
     <section id="grogu-integration">
-      <h2><span class="num">08</span> Grogu integration</h2>
+      <h2><span class="num">09</span> Grogu integration</h2>
       <p>Grogu (<code>src/grogu_mcp.py</code> + <code>src/grogu_imessage.py</code>) launches
       <code>seaglass-mcp</code> as a stdio subprocess per invocation, configured via
       <code>~/.copilot/mcp-config.json</code> (which supplies <code>SEAGLASS_INDEX_DB</code> and
@@ -396,7 +470,7 @@
     </section>
 
     <section id="latency">
-      <h2><span class="num">09</span> Measured performance</h2>
+      <h2><span class="num">10</span> Measured performance</h2>
       <p>Numbers below were captured against a real 17,525-chunk index. Toggle between memory and
       latency views.</p>
       <div class="chip-row" id="perf-toggle">
@@ -431,7 +505,7 @@
     </section>
 
     <section id="eval">
-      <h2><span class="num">10</span> Evaluation results</h2>
+      <h2><span class="num">11</span> Evaluation results</h2>
       <p>Golden set: 32 hand-reviewed queries against real message history, scored by
       <code>seaglass/eval/score.py</code> — which runs the <em>exact same</em>
       parse → filter → retrieve → rerank → aggregate pipeline as the live MCP server, so these
@@ -452,7 +526,7 @@
     </section>
 
     <section id="cli">
-      <h2><span class="num">11</span> CLI &amp; operational commands</h2>
+      <h2><span class="num">12</span> CLI &amp; operational commands</h2>
       <pre><code># build (or resume) an index from a chat.db snapshot
 python -m seaglass.cli build &lt;chat.db&gt; &lt;index.db&gt;
 

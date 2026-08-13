@@ -56,7 +56,11 @@ async function api(path, options = {}) {
   const response = await fetch(path, {...options, headers});
   if (response.status === 204) return null;
   const payload = await response.json();
-  if (!response.ok) throw new Error(payload.detail || `Request failed: ${response.status}`);
+  if (!response.ok) {
+    const err = new Error(payload.detail || `Request failed: ${response.status}`);
+    err.status = response.status;
+    throw err;
+  }
   return payload;
 }
 
@@ -134,12 +138,20 @@ function symbolFor(state) {
   return state === 'done' ? '✓' : state === 'failed' ? '⚠' : state === 'running' ? '⟳' : '•';
 }
 
+// Owned by pollSyncProgress(): while a sync poll loop is live it owns the
+// sync banner, and the 60s refreshStatus() tick must not stomp on it.
+let syncInProgress = false;
+// Incremented on every syncNow(); a poll loop whose token is stale exits so
+// double-clicks / multiple entry points can never stack concurrent loops.
+let syncPollToken = 0;
+
 async function refreshStatus() {
   const status = await api('/api/status');
   const stale = status.n_messages_since_index
     ? `<span class="status-sep">·</span><span class="status-stale">⚠ ${status.n_messages_since_index.toLocaleString()} msgs since last index build</span>`
     : '';
   els.statusBar.innerHTML = `<span class="status-dot${status.hydration_available ? '' : ' is-off'}"></span><span>Ready</span><span class="status-sep">·</span><span>${Number(status.n_chunks || 0).toLocaleString()} chunks</span><span class="status-sep">·</span><span>${Number(status.n_chats || 0).toLocaleString()} chats</span>${stale}`;
+  if (syncInProgress) return;  // the sync poll loop owns the banner right now
   if (status.n_messages_since_index > 0) {
     els.syncBanner.classList.remove('hidden');
     const plural = status.n_messages_since_index === 1 ? '' : 's';
@@ -150,15 +162,83 @@ async function refreshStatus() {
   }
 }
 
+function syncBannerMessage(text, {spin = false} = {}) {
+  els.syncBanner.classList.remove('hidden');
+  els.syncBanner.innerHTML = `<span class="banner-icon${spin ? ' spin' : ''}">${iconSvg('i-refresh')}</span><span class="banner-text">${escapeHtml(text)}</span>`;
+}
+
 async function syncNow() {
+  if (syncInProgress) return;  // guard against double-clicks stacking poll loops
+  syncInProgress = true;
+  const token = ++syncPollToken;
+  const button = document.getElementById('sync-now');
+  if (button) { button.disabled = true; button.textContent = 'Syncing…'; }
+  syncBannerMessage('Syncing…', {spin: true});
   try {
     await api('/api/index/build', {method: 'POST'});
   } catch (err) {
-    els.syncBanner.innerHTML = `<span class="banner-icon">${iconSvg('i-refresh')}</span><span class="banner-text">${escapeHtml(err.message)}</span>`;
+    if (err.status !== 409) {
+      // Hard failure to even start: release ownership and surface it, then
+      // let the next refreshStatus() tick restore a clickable banner.
+      syncInProgress = false;
+      syncBannerMessage(`Sync failed: ${err.message}`);
+      return;
+    }
+    // 409: a build/sync was already in progress -- fine, just watch it.
+  }
+  pollSyncProgress(token);
+}
+
+// `failures` counts consecutive poll errors; transient network blips during a
+// long build shouldn't tear down the whole progress UI.
+const SYNC_POLL_MAX_FAILURES = 3;
+
+async function pollSyncProgress(token = syncPollToken, failures = 0) {
+  if (token !== syncPollToken) return;  // superseded by a newer sync run
+  let build;
+  try {
+    build = await api('/api/index/build');
+  } catch (err) {
+    if (token !== syncPollToken) return;
+    if (failures + 1 < SYNC_POLL_MAX_FAILURES) {
+      setTimeout(() => pollSyncProgress(token, failures + 1), 750 * (failures + 1));
+      return;
+    }
+    syncInProgress = false;
+    syncBannerMessage(`Lost contact while syncing: ${err.message}`);
     return;
   }
-  els.syncBanner.innerHTML = `<span class="banner-icon">${iconSvg('i-refresh')}</span><span class="banner-text">Syncing… this may take a while.</span>`;
-  pollHealth();
+  if (token !== syncPollToken) return;
+  if (build.running) {
+    const elapsed = build.elapsed_s ?? 0;
+    const detail = build.chunks_written
+      ? `${build.chunks_written.toLocaleString()} chunks written so far · ${elapsed}s elapsed`
+      : `${elapsed}s elapsed`;
+    syncBannerMessage(`Syncing… ${detail}`, {spin: true});
+    setTimeout(() => pollSyncProgress(token, 0), 750);
+    return;
+  }
+  if (build.stage === 'failed') {
+    syncInProgress = false;
+    syncBannerMessage(`Sync failed: ${build.error || 'unknown error'}`);
+    return;
+  }
+  // Not running and not failed: either the run finished ('done'), or the
+  // background thread hasn't flipped running=true yet (we polled in the gap
+  // between POST returning and the worker starting -- in which case `stage`
+  // is still 'idle'). Grace-poll a few times before declaring completion.
+  if (build.stage === 'idle' && failures < 4) {
+    setTimeout(() => pollSyncProgress(token, failures + 1), 750);
+    return;
+  }
+  // Done: release banner ownership and let refreshStatus() render the truth
+  // (hidden banner when nothing is stale, a fresh "Sync now" button if not).
+  syncInProgress = false;
+  try {
+    await refreshStatus();
+  } catch (err) {
+    syncBannerMessage(`Sync finished, but status refresh failed: ${err.message}`);
+  }
 }
 
 function buildFilters() {
@@ -321,6 +401,10 @@ async function openConversation(event) {
     : `${count} messages`;
   els.drawerContent.innerHTML = `<header class="drawer-head"><div class="drawer-titles"><div class="drawer-title">${escapeHtml(payload.title || `Chat ${payload.chat_id}`)}</div><div class="drawer-sub">${escapeHtml(subtitle)}</div></div><button id="close-drawer" class="icon-btn" aria-label="Close conversation" title="Close (Esc)">${iconSvg('i-close', 'icon')}</button></header><div class="drawer-messages">${payload.messages.map(renderMessage).join('')}</div>`;
   document.getElementById('close-drawer').onclick = () => els.drawer.classList.add('hidden');
+  // The messages container is recreated per open, so it starts at scrollTop 0,
+  // but be explicit: WebKit can restore scroll offsets on replaced subtrees.
+  const messages = els.drawerContent.querySelector('.drawer-messages');
+  if (messages) messages.scrollTop = 0;
 }
 
 function renderPeopleChips() {

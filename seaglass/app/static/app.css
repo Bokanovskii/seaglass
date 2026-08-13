@@ -387,6 +387,8 @@ button { cursor: pointer; background: none; border: 0; padding: 0; }
   animation: pulse 2.4s ease-in-out infinite;
 }
 
+.spin { animation: spin 1.1s linear infinite; }
+
 @keyframes spin { to { transform: rotate(360deg); } }
 @keyframes pulse { 0%, 100% { opacity: .85; transform: scale(1); } 50% { opacity: 1; transform: scale(1.08); } }
 
@@ -548,7 +550,7 @@ button { cursor: pointer; background: none; border: 0; padding: 0; }
 #app {
   display: flex;
   flex-direction: column;
-  min-height: 100vh;
+  height: 100vh;
   animation: screen-in var(--t-slow) both;
 }
 
@@ -556,6 +558,7 @@ header {
   position: sticky;
   top: 0;
   z-index: 30;
+  flex: none;
   display: flex;
   gap: var(--s3);
   align-items: center;
@@ -656,6 +659,7 @@ main {
   grid-template-columns: 268px minmax(0, 1fr);
   flex: 1;
   min-height: 0;
+  overflow: hidden;
 }
 
 aside {
@@ -665,6 +669,8 @@ aside {
   flex-direction: column;
   gap: var(--s5);
   background: var(--veil-soft);
+  overflow-y: auto;
+  height: 100%;
 }
 
 aside h2 {
@@ -692,7 +698,7 @@ aside h2 {
 
 .filter-group > label .icon { color: var(--text-muted); }
 
-section { padding: var(--s5) var(--s6) var(--s7); min-width: 0; }
+section { padding: var(--s5) var(--s6) var(--s7); min-width: 0; overflow-y: auto; height: 100%; }
 
 /* combo + suggestions */
 .combo { position: relative; }
@@ -1195,10 +1201,19 @@ mark {
   gap: var(--s3);
   padding: var(--s4);
   border-bottom: 1px solid var(--border);
-  background: var(--panel-head-bg);
+  /* Opaque base under the translucent tint: if WebKit drops/mis-composites
+     backdrop-filter (a known glitch when combined with a sibling scroll
+     container + the panel's entry transform), the header must still be
+     readable rather than appearing to vanish. */
+  background-color: var(--surface);
+  background-image: linear-gradient(var(--panel-head-bg), var(--panel-head-bg));
   -webkit-backdrop-filter: blur(12px);
   backdrop-filter: blur(12px);
   flex: none;
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  isolation: isolate;
 }
 
 .drawer-titles { flex: 1; min-width: 0; }
@@ -1230,6 +1245,8 @@ mark {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
+  overscroll-behavior: contain;
+  contain: layout paint;
   padding: var(--s3) var(--s3) var(--s6);
   display: flex;
   flex-direction: column;
@@ -1242,6 +1259,7 @@ footer#status-bar {
   position: sticky;
   bottom: 0;
   z-index: 20;
+  flex: none;
   display: flex;
   align-items: center;
   gap: var(--s2);
@@ -1269,11 +1287,15 @@ footer#status-bar {
 /* ---------- responsive ---------- */
 
 @media (max-width: 980px) {
-  main { grid-template-columns: 1fr; }
+  /* Single column: stack filters above results and let the whole main
+     region scroll as one, rather than splitting the viewport height
+     between two independently scrolling panes. */
+  main { grid-template-columns: 1fr; grid-auto-rows: min-content; overflow-y: auto; }
   aside {
     border-right: 0;
     border-bottom: 1px solid var(--border);
   }
+  aside, section { height: auto; overflow-y: visible; }
   section { padding: var(--s4); }
 }
 

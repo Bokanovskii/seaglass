@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -9,7 +10,7 @@ from typing import Callable, Optional
 from seaglass.app.chatmeta import ChatMetadataCache
 from seaglass.app.filters import SearchFilters, apply_filters
 from seaglass.imessage.contacts import ContactIndex, ContactsUnavailableError
-from seaglass.imessage.source import apple_to_unix, connect_readonly
+from seaglass.imessage.source import APPLE_EPOCH_UNIX, NS_VS_S_THRESHOLD, connect_readonly
 from seaglass.index.build import open_index_db
 from seaglass.index.embed import EmbeddingModel
 from seaglass.search.conversation import fetch_conversation
@@ -31,12 +32,16 @@ class SearchOptions:
 
 
 class SearchEngine:
-    def __init__(self, index_db: str, chat_db: str | None = None, memory_index: bool = False):
+    def __init__(self, index_db: str, chat_db: str | None = None, memory_index: bool = False, chat_db_source: str | None = None):
         self.index_db = index_db
         self.chat_db = chat_db
+        self.chat_db_source = chat_db_source
         self.memory_index = memory_index
         self.index_con: sqlite3.Connection | None = None
         self.chat_con: sqlite3.Connection | None = None
+        # Cached read-only handle on the *live* chat.db (see status()).
+        self._live_chat_con: sqlite3.Connection | None = None
+        self._live_chat_lock = threading.RLock()
         self.embedding_model: EmbeddingModel | None = None
         self.reranker: CrossEncoderReranker | None = None
         self.contact_index: ContactIndex | None = None
@@ -111,13 +116,7 @@ class SearchEngine:
         n_vectors = self.index_con.execute('SELECT COUNT(*) FROM chunks_vec').fetchone()[0]
         n_chats = self.index_con.execute('SELECT COUNT(DISTINCT chat_id) FROM chunks').fetchone()[0]
         most_recent_chunk_ts = self.index_con.execute('SELECT MAX(end_ts) FROM chunks').fetchone()[0]
-        chat_db_max_ts = None
-        newer_messages = 0
-        if self.chat_con is not None:
-            raw_max = self.chat_con.execute('SELECT MAX(date) FROM im.message').fetchone()[0]
-            chat_db_max_ts = apple_to_unix(raw_max) if raw_max else None
-            if chat_db_max_ts and most_recent_chunk_ts:
-                newer_messages = self.chat_con.execute('SELECT COUNT(*) FROM im.message WHERE date > ?', (int((most_recent_chunk_ts - 978307200) * 1e9),)).fetchone()[0]
+        chat_db_max_ts, newer_messages = self._live_chat_freshness(most_recent_chunk_ts)
         return {
             'n_chunks': n_chunks,
             'n_vectors': n_vectors,
@@ -131,6 +130,74 @@ class SearchEngine:
             'hydration_available': self.chat_con is not None,
             'index_ready': True,
         }
+
+    # `message.date` is Apple-epoch, in seconds on older macOS and
+    # nanoseconds on Big Sur+ (see imessage/source.py apple_to_unix). This
+    # SQL mirrors that per-row magnitude heuristic exactly -- keep the
+    # threshold in sync with NS_VS_S_THRESHOLD.
+    _LIVE_MAX_TS_SQL = f"""
+        SELECT MAX(CASE WHEN m.date > {NS_VS_S_THRESHOLD} THEN m.date / 1e9 ELSE m.date END)
+        FROM im.message m
+        JOIN im.chat_message_join cmj ON cmj.message_id = m.ROWID
+        WHERE m.associated_message_type = 0
+    """
+    _LIVE_NEWER_COUNT_SQL = f"""
+        SELECT COUNT(DISTINCT m.ROWID)
+        FROM im.message m
+        JOIN im.chat_message_join cmj ON cmj.message_id = m.ROWID
+        WHERE m.associated_message_type = 0
+          AND (CASE WHEN m.date > {NS_VS_S_THRESHOLD} THEN m.date / 1e9 ELSE m.date END) > ?
+    """
+
+    def _live_chat_connection(self) -> sqlite3.Connection | None:
+        """Lazily open (and cache) a read-only connection to the *live*
+        chat.db. Cached because `status()` is polled by the UI roughly once
+        a minute and ATTACH + schema assertion is not free.
+
+        Returns None when the live db is missing or unreadable (e.g. Full
+        Disk Access not granted) -- callers degrade gracefully.
+        """
+        with self._live_chat_lock:
+            if self._live_chat_con is not None:
+                return self._live_chat_con
+            live_path = self.chat_db_source or self.chat_db
+            if not live_path or not Path(live_path).exists():
+                return None
+            try:
+                self._live_chat_con = connect_readonly(Path(live_path))
+            except Exception:  # noqa: BLE001 - missing perms/schema drift must not break /api/status
+                self._live_chat_con = None
+            return self._live_chat_con
+
+    def _close_live_chat_connection(self) -> None:
+        with self._live_chat_lock:
+            if self._live_chat_con is not None:
+                try:
+                    self._live_chat_con.close()
+                except sqlite3.Error:
+                    pass
+                self._live_chat_con = None
+
+    def _live_chat_freshness(self, most_recent_chunk_ts: float | None) -> tuple[float | None, int]:
+        """(max message ts in the live chat.db as unix seconds, count of
+        live messages newer than the newest indexed chunk)."""
+        con = self._live_chat_connection()
+        if con is None:
+            return None, 0
+        try:
+            with self._live_chat_lock:
+                raw_max = con.execute(self._LIVE_MAX_TS_SQL).fetchone()[0]
+                chat_db_max_ts = float(raw_max) + APPLE_EPOCH_UNIX if raw_max is not None else None
+                newer = 0
+                if chat_db_max_ts is not None and most_recent_chunk_ts:
+                    newer = con.execute(
+                        self._LIVE_NEWER_COUNT_SQL,
+                        (float(most_recent_chunk_ts) - APPLE_EPOCH_UNIX,),
+                    ).fetchone()[0]
+            return chat_db_max_ts, int(newer)
+        except Exception:  # noqa: BLE001 - never break /api/status on a flaky read
+            self._close_live_chat_connection()
+            return None, 0
 
     def suggest_contacts(self, q: str, limit: int = 10) -> list[dict]:
         if self.contact_index is None:

@@ -124,7 +124,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     save_config(config)
 
-    engine = SearchEngine(config.index_db, config.chat_db, memory_index=config.memory_index)
+    engine = SearchEngine(config.index_db, config.chat_db, memory_index=config.memory_index, chat_db_source=config.chat_db_source)
     warmup_state = WarmupState(list(DEFAULT_WARMUP_STEPS))
     for warning in warnings:
         warmup_state.add_warning(warning)

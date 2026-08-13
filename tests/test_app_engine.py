@@ -71,3 +71,67 @@ def test_status_before_warmup_reports_not_ready():
     assert status['index_ready'] is False
     assert status['n_chunks'] == 0
     assert status['hydration_available'] is False
+
+
+def _snapshot_and_live(tmp_path, monkeypatch, live_messages):
+    """Build a stale snapshot chat.db + index, plus a *live* chat.db that
+    additionally contains `live_messages` (list of (text, apple_date))."""
+    snap_dir = tmp_path / 'snap'
+    snap_dir.mkdir()
+    base = [('dinner plans with alice', APPLE_EPOCH_START, False, 0), ('photo attached', APPLE_EPOCH_START + 10, True, 0)]
+    snapshot_db = build_fixture_chat_db(snap_dir, [{'chat_id': 1, 'handles': ['+15551234567'], 'messages': base}])
+    index_db = tmp_path / 'index.db'
+    build_index(snapshot_db, index_db, embedding_model=FakeEmbeddingModel(), batch_size=10)
+
+    live_dir = tmp_path / 'live'
+    live_dir.mkdir()
+    extra = [(text, date, False, 0) for text, date in live_messages]
+    live_db = build_fixture_chat_db(live_dir, [{'chat_id': 1, 'handles': ['+15551234567'], 'messages': base + extra}])
+
+    monkeypatch.setattr('seaglass.app.engine.EmbeddingModel', FakeEmbeddingModel)
+    monkeypatch.setattr('seaglass.app.engine.CrossEncoderReranker', FakeReranker)
+    monkeypatch.setattr('seaglass.app.engine.ContactIndex.load', lambda: ContactIndex([]))
+    engine = SearchEngine(str(index_db), str(snapshot_db), chat_db_source=str(live_db))
+    engine.warmup(progress=lambda name: __import__('contextlib').nullcontext())
+    return engine
+
+
+def test_status_counts_messages_from_live_chat_db_not_snapshot(tmp_path, monkeypatch):
+    engine = _snapshot_and_live(tmp_path, monkeypatch, [('brand new message', APPLE_EPOCH_START + 5000), ('another new one', APPLE_EPOCH_START + 6000)])
+    status = engine.status()
+    assert status['n_messages_since_index'] == 2
+    assert status['chat_db_max_ts'] > status['most_recent_chunk_ts']
+
+
+def test_status_reports_zero_when_live_db_matches_index(tmp_path, monkeypatch):
+    engine = _snapshot_and_live(tmp_path, monkeypatch, [])
+    assert engine.status()['n_messages_since_index'] == 0
+
+
+def test_status_normalizes_nanosecond_dates_like_source(tmp_path, monkeypatch):
+    # Big Sur+ writes nanoseconds-since-2001; the live query must apply the
+    # same magnitude heuristic as imessage/source.apple_to_unix.
+    ns_date = int((APPLE_EPOCH_START + 7000) * 1e9)
+    engine = _snapshot_and_live(tmp_path, monkeypatch, [('nanosecond era message', ns_date)])
+    status = engine.status()
+    assert status['n_messages_since_index'] == 1
+    assert abs(status['chat_db_max_ts'] - (APPLE_EPOCH_START + 7000 + 978307200)) < 1
+
+
+def test_status_degrades_gracefully_when_live_db_missing(tmp_path, monkeypatch):
+    engine = _snapshot_and_live(tmp_path, monkeypatch, [('new', APPLE_EPOCH_START + 5000)])
+    engine._close_live_chat_connection()
+    engine.chat_db_source = str(tmp_path / 'gone' / 'chat.db')
+    engine.chat_db = None
+    status = engine.status()
+    assert status['n_messages_since_index'] == 0
+    assert status['chat_db_max_ts'] is None
+    assert status['index_ready'] is True
+
+
+def test_status_reuses_cached_live_connection(tmp_path, monkeypatch):
+    engine = _snapshot_and_live(tmp_path, monkeypatch, [('new', APPLE_EPOCH_START + 5000)])
+    engine.status()
+    first = engine._live_chat_con
+    engine.status()
+    assert engine._live_chat_con is first is not None
