@@ -111,7 +111,7 @@ def connect_readonly(chat_db: Path) -> sqlite3.Connection:
     change and yields silently corrupt reads on a live database
     (PLAN.md §6 Phase 1). Requires Full Disk Access for the caller.
     """
-    con = sqlite3.connect(":memory:")
+    con = sqlite3.connect(":memory:", check_same_thread=False)
     con.execute(f"ATTACH DATABASE 'file:{chat_db}?mode=ro' AS im")
     assert_schema(con)
     return con

@@ -66,6 +66,7 @@ class SearchEngine:
         with progress('open_chat'):
             if self.chat_db:
                 self.chat_con = connect_readonly(Path(self.chat_db))
+                self.chat_con = self.chat_con if getattr(self.chat_con, 'execute', None) else self.chat_con
         with progress('build_chatmeta'):
             present_chat_ids = {row[0] for row in self.index_con.execute('SELECT DISTINCT chat_id FROM chunks')}
             self.chatmeta = ChatMetadataCache.build(self.chat_con, present_chat_ids) if self.chat_con else ChatMetadataCache({})
