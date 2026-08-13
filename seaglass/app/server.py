@@ -205,6 +205,11 @@ def create_app(engine, warmup_state, config, token: str):
         options = engine.__class__.__dict__ and __import__('seaglass.app.engine', fromlist=['SearchOptions']).SearchOptions(**body.options)
         payload = await loop.run_in_executor(pipeline_pool, engine.search, body.query, filters, options)
         payload['request_id'] = body.request_id
+        # A "load more" fetch is the same query -- re-running Assist would
+        # duplicate the LLM call and overwrite the banner already shown.
+        if int(body.options.get('offset') or 0) > 0:
+            payload['assist_token'] = None
+            return payload
         parsed = __import__('seaglass.search.parse', fromlist=['parse_query']).parse_query(body.query, contact_index=engine.contact_index)
         assist_token = assist_manager.submit(body.query, parsed, body.assist)
         payload['assist_token'] = assist_token

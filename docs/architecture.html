@@ -446,6 +446,22 @@
         independently retrieved.</li>
       </ol>
       <div class="callout decision">
+        <strong>Verbatim matches: putting the lexical signal back.</strong>
+        Reserved slots get a recent chunk <em>into</em> the results, but they don't decide its
+        rank. The remaining gap: if the user types <em>"classic"</em> and someone literally texted
+        <em>"classic"</em> an hour ago, that is almost certainly the message they mean — whatever
+        the cross-encoder thinks of the surrounding 20 messages. After reranking, the candidate
+        pool is re-queried against <code>chunks_fts</code> with the query wrapped as an FTS5
+        <em>phrase</em> (<code>exact_phrase_chunk_ids</code>), and sessions containing a verbatim
+        hit get <code>+1.2 &times; 0.5<sup>age / 30d</sup></code> added before the recency
+        multiplier (<code>LEXICAL_MATCH_BOOST</code>, <code>LEXICAL_HALF_LIFE_DAYS</code>).
+        The half-life is deliberately 30 days — a twelfth of the general recency half-life —
+        because the signal being modelled is <em>recent</em> verbatim match: any common word
+        appears verbatim across years of history, so an old literal match earns almost nothing and
+        the usual relevance ordering still decides. Measured on the real 386k-message index: the
+        query <em>"classic"</em> moved today's match from rank 7 to rank 1.
+      </div>
+      <div class="callout decision">
         <strong>Why recency needs reserved slots and not just a multiplier.</strong>
         The cross-encoder scores a whole conversation <em>chunk</em>, so a query matching one
         short message inside a long window scores terribly: a message sent today reading exactly
@@ -463,6 +479,31 @@
         judgment call since <code>chat.db</code> timestamps carry no stored timezone of their own, and
         local wall-clock day is the closest approximation to how a person actually remembers a
         conversation.
+      </div>
+      <div class="callout decision">
+        <strong>Pagination without re-ranking.</strong> "Load more" must not change what was on
+        page 1, and re-running the cross-encoder per page would be both slow and unstable. So
+        <code>rerank_candidates(top_k=None)</code> scores every candidate in one pass and
+        <code>order_sessions()</code> returns the <em>complete</em> ordering; the engine caches
+        that ordering (LRU, keyed by everything affecting rank <em>except</em> offset) and serves
+        later pages by slicing it. Page 1 is built from the top-12 rerank cut with recency
+        reservations applied; deeper pages append the remaining scored pool in pure score order,
+        so adding pages is strictly additive and never reshuffles what the user already read.
+        The cache is invalidated on <code>warmup()</code> because a rebuild renumbers chunk ids.
+        Cached pages return in 0.13–0.18&nbsp;s versus ~1.4&nbsp;s cold.
+      </div>
+      <div class="callout decision">
+        <strong>MLX memory: cap the Metal buffer cache.</strong> Activity Monitor showed the app at
+        7.30&nbsp;GB while <code>ps</code> RSS read 170&nbsp;MB. <code>footprint -p</code> located
+        it: 7144&nbsp;MB under <em>IOAccelerator (graphics)</em> — MLX's Metal buffer cache, which
+        on Apple Silicon lives in unified memory and counts toward physical footprint but not RSS.
+        It is not a leak: <em>active</em> memory stayed flat at 254&nbsp;MB across repeated query
+        rounds while <em>cache</em> grew and never shrank, retaining the high-water mark of the
+        largest batch ever run (an index build sets a very high one). <code>seaglass/mlxmem.py</code>
+        caps it at 512&nbsp;MB (<code>SEAGLASS_MLX_CACHE_MB</code>) at model load and releases it
+        after a build. Measured cost: none — 0.63&nbsp;s vs 0.64&nbsp;s over six embed+rerank
+        rounds, because a single query's working set is far smaller than the retained cache.
+        Steady state drops from ~5.3&nbsp;GB to ~1.2&nbsp;GB.
       </div>
     </section>
 
@@ -641,7 +682,7 @@ const PIPELINE_STAGES = [
     detail: {
       title: "aggregate_sessions(...) + expand_sessions(...)",
       file: "seaglass/search/rank.py",
-      body: "Groups top-12 reranked chunks by (chat_id, local calendar day) into up to 8 sessions, combining member-chunk scores per session. Each session score is then multiplied by a bounded recency factor (up to 1.6x for today, 365-day half-life) and 2 of the 8 slots are reserved for the newest matches. Finally each session is padded with ±2 time-adjacent chunks for context."
+      body: "Groups top-12 reranked chunks by (chat_id, local calendar day) into up to 8 sessions, combining member-chunk scores per session. Each session score is then multiplied by a bounded recency factor (up to 1.6x for today, 365-day half-life) and 2 of the 8 slots are reserved for the newest matches. Sessions containing a verbatim (FTS5 phrase) match get an additional bonus that decays on a 30-day half-life, so a message the user literally typed today dominates. Finally each session is padded with ±2 time-adjacent chunks for context."
     }
   }
 ];

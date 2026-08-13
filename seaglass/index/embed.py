@@ -63,6 +63,9 @@ class EmbeddingModel:
             return
         from mlx_embeddings import load
 
+        from seaglass.mlxmem import configure_mlx_memory
+
+        configure_mlx_memory()
         self._model, self._tokenizer = load(self.model_id)
 
     def embed(self, texts: Sequence[str]) -> np.ndarray:

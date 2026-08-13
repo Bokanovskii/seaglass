@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
@@ -17,9 +18,16 @@ from seaglass.search.conversation import fetch_conversation
 from seaglass.search.format import format_search_result
 from seaglass.search.hydrate import hydrate_sessions
 from seaglass.search.parse import ParsedQuery, parse_query
-from seaglass.search.rank import aggregate_sessions, expand_sessions, rerank_candidates
+from seaglass.search.rank import (
+    RERANK_TOP_K,
+    aggregate_sessions,
+    expand_sessions,
+    order_sessions,
+    rerank_candidates,
+    select_reranked_head,
+)
 from seaglass.search.rerank import CrossEncoderReranker
-from seaglass.search.retrieve import build_candidate_chunk_ids, retrieve
+from seaglass.search.retrieve import build_candidate_chunk_ids, exact_phrase_chunk_ids, retrieve
 
 
 @dataclass
@@ -29,6 +37,9 @@ class SearchOptions:
     rerank: bool = True
     redact: bool = False
     expansions: list[str] = field(default_factory=list)
+    # Pagination. `offset` skips already-shown sessions; the ranked chunk
+    # list is cached per query so paging never re-runs the models.
+    offset: int = 0
 
 
 class SearchEngine:
@@ -49,8 +60,17 @@ class SearchEngine:
         self.corpus_bounds: tuple[float, float] = (0.0, 0.0)
         self.warnings: list[str] = []
         self.last_status: dict = {}
+        # Ranked-chunk cache so "load more" costs a regroup, not another
+        # embed + cross-encoder pass (~0.5-1.2s). Keyed by everything that
+        # can change the ranking; small because entries hold whole
+        # candidate lists and only the newest queries are ever paged.
+        self._page_cache: 'OrderedDict[tuple, list]' = OrderedDict()
+        self._page_cache_lock = threading.RLock()
 
     def warmup(self, progress: Callable[[str], object]) -> None:
+        # A rebuild can prune or renumber chunk ids, so any cached ranking
+        # from before this (re)warm is stale.
+        self.invalidate_page_cache()
         with progress('import_runtime'):
             __import__('sqlite_vec')
             __import__('mlx')
@@ -259,6 +279,10 @@ class SearchEngine:
                 'n_results': 0,
                 'confidence': 'none',
                 'sessions': [],
+                'offset': max(0, options.offset),
+                'total_sessions': 0,
+                'has_more': False,
+                'next_offset': max(0, options.offset),
                 'effective_filters': _effective_filters(parsed),
                 'parse_source': 'deterministic',
                 'timings': timings,
@@ -268,12 +292,34 @@ class SearchEngine:
 
         if options.rerank:
             rerank_started = time.time()
-            ranked = rerank_candidates(self.index_con, parsed.semantic, fused, self.reranker)
+            cache_key = self._page_cache_key(text, parsed, options)
+            scored = self._cached_ranking(cache_key)
+            if scored is None:
+                # top_k=None scores and keeps every fused candidate; the
+                # page-1 cut is applied below, so paging draws from one pass.
+                scored = rerank_candidates(
+                    self.index_con, parsed.semantic, fused, self.reranker, top_k=None
+                )
+                self._store_ranking(cache_key, scored)
+                timings['rerank_cached'] = False
+            else:
+                timings['rerank_cached'] = True
+            ranked = select_reranked_head(scored, top_k=RERANK_TOP_K)
             timings['rerank'] = round(time.time() - rerank_started, 4)
         else:
             ranked = []
+            scored = []
         aggregate_started = time.time()
-        sessions = aggregate_sessions(ranked, max_sessions=options.max_sessions)
+        # Which candidates literally contain the query text -- a much
+        # stronger signal than semantic similarity for the very common
+        # "find the message where someone said X" search.
+        lexical_ids = exact_phrase_chunk_ids(
+            self.index_con, parsed.semantic, [r.chunk_id for r in fused]
+        )
+        ordered = self._ordered_sessions(ranked, scored, options, lexical_ids)
+        offset = max(0, options.offset)
+        sessions = ordered[offset: offset + options.max_sessions]
+        total_sessions = len(ordered)
         expand_sessions(self.index_con, sessions)
         timings['aggregate_expand'] = round(time.time() - aggregate_started, 4)
 
@@ -294,6 +340,10 @@ class SearchEngine:
                 session['participants'] = list(meta.participants)
 
         payload.update({
+            'offset': offset,
+            'total_sessions': total_sessions,
+            'has_more': offset + options.max_sessions < total_sessions,
+            'next_offset': offset + options.max_sessions,
             'effective_filters': _effective_filters(parsed),
             'parse_source': 'deterministic',
             'timings': timings,
@@ -301,6 +351,70 @@ class SearchEngine:
             'candidate_count': 0 if candidate_ids is None else len(candidate_ids),
         })
         return payload
+
+    @staticmethod
+    def _ordered_sessions(ranked, scored, options: SearchOptions, lexical_ids=None) -> list:
+        """Page 1 comes from the usual RERANK_TOP_K cut; later pages are the
+        rest of the scored candidates in score order, appended.
+
+        Built additively on purpose. Simply aggregating all the scored
+        candidates at once would give more pages, but it would also change
+        which sessions land on page 1 (more chunks means more sessions
+        competing for the recency reservation), so the ordinary
+        no-pagination result would silently differ from the tuned pipeline.
+        Appending instead guarantees page 1 is byte-identical to the
+        unpaginated search while later pages keep going.
+        """
+        head = order_sessions(
+            ranked, head_size=options.max_sessions, lexical_chunk_ids=lexical_ids
+        )
+        if not scored or len(scored) <= len(ranked):
+            return head
+        seen = {(s.chat_id, s.day) for s in head}
+        # recent_slots=0: the recency guarantee has already been honoured on
+        # page 1, and re-applying it here would pull recent-but-weak matches
+        # ahead of stronger ones deep in the list.
+        tail = order_sessions(
+            scored, head_size=0, recent_slots=0, lexical_chunk_ids=lexical_ids
+        )
+        return head + [s for s in tail if (s.chat_id, s.day) not in seen]
+
+    _PAGE_CACHE_MAX = 8
+
+    @staticmethod
+    def _page_cache_key(text: str, parsed: ParsedQuery, options: SearchOptions) -> tuple:
+        """Everything that can change the ranking -- but NOT `offset`, which
+        is precisely what we want to serve from one cached ranking."""
+        return (
+            text,
+            parsed.semantic,
+            tuple(parsed.people_participant),
+            parsed.date_from,
+            parsed.date_to,
+            parsed.has_media,
+            options.fused_top_k,
+            tuple(options.expansions),
+        )
+
+    def _cached_ranking(self, key: tuple):
+        with self._page_cache_lock:
+            ranking = self._page_cache.get(key)
+            if ranking is not None:
+                self._page_cache.move_to_end(key)
+            return ranking
+
+    def _store_ranking(self, key: tuple, ranking: list) -> None:
+        with self._page_cache_lock:
+            self._page_cache[key] = ranking
+            self._page_cache.move_to_end(key)
+            while len(self._page_cache) > self._PAGE_CACHE_MAX:
+                self._page_cache.popitem(last=False)
+
+    def invalidate_page_cache(self) -> None:
+        """Called after a sync: cached rankings reference chunk ids that a
+        rebuild can prune or renumber."""
+        with self._page_cache_lock:
+            self._page_cache.clear()
 
     def conversation(self, chat_id: int, around_ts: float | None, limit: int = 50) -> dict:
         if self.chat_con is None:

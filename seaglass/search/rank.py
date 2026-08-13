@@ -22,7 +22,7 @@ from __future__ import annotations
 import dataclasses
 import time
 from datetime import datetime
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import zstandard
 
@@ -63,6 +63,19 @@ RECENCY_MAX_BOOST = 0.6
 # stay purely relevance-ordered.
 RECENT_SESSION_SLOTS = 2
 
+# A verbatim match is a different kind of evidence from semantic
+# similarity: if the user types "classic" and someone literally texted
+# "classic" an hour ago, that is almost certainly the message they mean,
+# whatever a cross-encoder thinks of the surrounding conversation.
+#
+# The bonus decays fast (30-day half-life, far shorter than the 365-day
+# half-life used for general recency) so it means "recent lexical match"
+# specifically. An old verbatim match is common and unremarkable -- the
+# word "classic" appears across years of history -- so it earns almost
+# nothing and the usual relevance ordering still decides.
+LEXICAL_MATCH_BOOST = 1.2
+LEXICAL_HALF_LIFE_DAYS = 30.0
+
 _dctx = zstandard.ZstdDecompressor()
 
 
@@ -92,12 +105,14 @@ def rerank_candidates(
     query: str,
     fused: Sequence[RetrievalResult],
     reranker: CrossEncoderReranker,
-    top_k: int = RERANK_TOP_K,
+    top_k: Optional[int] = RERANK_TOP_K,
     *,
     recent_slots: int = RERANK_RECENT_SLOTS,
 ) -> List[RankedChunk]:
     """Step 5: score every fused candidate against `query` in one batched
-    forward pass, return the top `top_k` by rerank score (descending).
+    forward pass, return the top `top_k` by rerank score (descending), or
+    all of them when `top_k is None` (used by paginated search, which cuts
+    the list itself via `select_reranked_head`).
     Reads `body_semantic` for the candidates only (PLAN.md §6 step 5 --
     this is why `body_semantic` is stored uncompressed-per-chunk).
     """
@@ -126,38 +141,40 @@ def rerank_candidates(
         return []
 
     scores = reranker.score(pairs)
-    by_score = sorted(zip(ordered_ids, scores), key=lambda pair: pair[1], reverse=True)
-    ranked = _reserve_recent_chunks(by_score, by_id, top_k=top_k, slots=recent_slots)
-
-    result: List[RankedChunk] = []
-    for chunk_id, score in ranked:
+    scored: List[RankedChunk] = []
+    for chunk_id, score in zip(ordered_ids, scores):
         _, chat_id, start_ts, _ = by_id[chunk_id]
-        result.append(
+        scored.append(
             RankedChunk(chunk_id=chunk_id, chat_id=chat_id, start_ts=start_ts, rerank_score=score)
         )
-    return result
+    scored.sort(key=lambda c: c.rerank_score, reverse=True)
+    if top_k is None:
+        return scored
+    return select_reranked_head(scored, top_k=top_k, recent_slots=recent_slots)
 
 
-def _reserve_recent_chunks(
-    by_score: Sequence[Tuple[int, float]],
-    by_id: Dict[int, tuple],
+def select_reranked_head(
+    scored: Sequence[RankedChunk],
     *,
-    top_k: int,
-    slots: int,
-) -> List[Tuple[int, float]]:
-    """Take the top `top_k - slots` candidates by rerank score, then fill
-    the remaining slots with the newest of whatever is left. Always returns
-    exactly min(top_k, len(by_score)) distinct candidates.
+    top_k: int = RERANK_TOP_K,
+    recent_slots: int = RERANK_RECENT_SLOTS,
+) -> List[RankedChunk]:
+    """Cut an already-scored, score-descending candidate list to `top_k`,
+    reserving the last `recent_slots` places for the newest candidates.
+
+    Split out from `rerank_candidates` so paginated search can score every
+    candidate once and still reproduce the exact unpaginated first page.
+    Always returns min(top_k, len(scored)) distinct chunks.
     """
-    if slots <= 0 or len(by_score) <= top_k:
-        return list(by_score[:top_k])
+    if recent_slots <= 0 or len(scored) <= top_k:
+        return list(scored[:top_k])
 
-    keep = max(0, top_k - slots)
-    selected = list(by_score[:keep])
-    chosen = {chunk_id for chunk_id, _ in selected}
+    keep = max(0, top_k - recent_slots)
+    selected = list(scored[:keep])
+    chosen = {c.chunk_id for c in selected}
 
-    remainder = [pair for pair in by_score[keep:] if pair[0] not in chosen]
-    remainder.sort(key=lambda pair: by_id[pair[0]][2], reverse=True)
+    remainder = [c for c in scored[keep:] if c.chunk_id not in chosen]
+    remainder.sort(key=lambda c: c.start_ts, reverse=True)
     selected.extend(remainder[: top_k - len(selected)])
     return selected
 
@@ -175,6 +192,12 @@ def _sigmoid(logit: float) -> float:
     return 1.0 / (1.0 + math.exp(-logit))
 
 
+def _lexical_freshness(ts: float, now: float) -> float:
+    """0..1 weight on the verbatim-match bonus. See LEXICAL_MATCH_BOOST."""
+    age_days = max(0.0, (now - ts) / 86400.0)
+    return 0.5 ** (age_days / LEXICAL_HALF_LIFE_DAYS)
+
+
 def _recency_multiplier(ts: float, now: float) -> float:
     """Exponential-decay boost in (1, 1 + RECENCY_MAX_BOOST]. Clamped at
     age >= 0 so a message with a slightly future timestamp (clock skew
@@ -190,19 +213,43 @@ def aggregate_sessions(
     *,
     now: Optional[float] = None,
     recent_slots: int = RECENT_SESSION_SLOTS,
+    lexical_chunk_ids: Optional[Iterable[int]] = None,
+) -> List[Session]:
+    """The first page of `order_sessions` -- see there for the details."""
+    return order_sessions(
+        ranked,
+        head_size=max_sessions,
+        now=now,
+        recent_slots=recent_slots,
+        lexical_chunk_ids=lexical_chunk_ids,
+    )[:max_sessions]
+
+
+def order_sessions(
+    ranked: Sequence[RankedChunk],
+    *,
+    head_size: int = MAX_SESSIONS,
+    now: Optional[float] = None,
+    recent_slots: int = RECENT_SESSION_SLOTS,
+    lexical_chunk_ids: Optional[Iterable[int]] = None,
 ) -> List[Session]:
     """Step 6a: dedup by chunk_id (a chunk can only appear once in `ranked`
     already, since it came from a single top-k rerank pass, but this stays
     defensive) then group by `(chat_id, day)`, summing each chunk's
     sigmoid-mapped rerank score (see `_sigmoid`), then scaling by how
-    recent the session is (see `_recency_multiplier`). Returns sessions
-    sorted by score descending, capped at `max_sessions`.
+    recent the session is (see `_recency_multiplier`).
+
+    Returns *all* sessions in display order: the first `head_size` have the
+    recency reservation applied, the rest follow in score order so that
+    pagination can keep drawing from a stable list.
 
     `now` is injectable so tests are deterministic.
     """
     now = time.time() if now is None else now
+    lexical_chunk_ids = set(lexical_chunk_ids or ())
     groups: Dict[Tuple[int, str], Session] = {}
     latest_ts: Dict[Tuple[int, str], float] = {}
+    lexical_ts: Dict[Tuple[int, str], float] = {}
     seen_chunk_ids: set = set()
     for chunk in ranked:
         if chunk.chunk_id in seen_chunk_ids:
@@ -218,13 +265,19 @@ def aggregate_sessions(
         session.score += _sigmoid(chunk.rerank_score)
         session.hit_chunk_ids.append(chunk.chunk_id)
         latest_ts[key] = max(latest_ts.get(key, 0.0), float(chunk.start_ts))
+        if chunk.chunk_id in lexical_chunk_ids:
+            # Freshness is judged on the newest verbatim match in the
+            # session, not on the session's newest chunk overall.
+            lexical_ts[key] = max(lexical_ts.get(key, 0.0), float(chunk.start_ts))
 
     for key, session in groups.items():
+        if lexical_chunk_ids and lexical_ts.get(key):
+            session.score += LEXICAL_MATCH_BOOST * _lexical_freshness(lexical_ts[key], now)
         session.score *= _recency_multiplier(latest_ts[key], now)
 
     sessions = sorted(groups.values(), key=lambda s: s.score, reverse=True)
     return _reserve_recent_sessions(
-        sessions, latest_ts, max_sessions=max_sessions, slots=recent_slots
+        sessions, latest_ts, head_size=head_size, slots=recent_slots
     )
 
 
@@ -232,16 +285,20 @@ def _reserve_recent_sessions(
     sessions: List[Session],
     latest_ts: Dict[Tuple[int, str], float],
     *,
-    max_sessions: int,
+    head_size: int,
     slots: int,
 ) -> List[Session]:
-    """Keep the top relevance-ranked sessions, but guarantee the newest
-    matches a place in the results. See RECENT_SESSION_SLOTS.
-    """
-    if slots <= 0 or len(sessions) <= max_sessions:
-        return sessions[:max_sessions]
+    """Reorder so the newest matches are guaranteed a place in the first
+    `head_size` sessions. See RECENT_SESSION_SLOTS.
 
-    keep = max(0, max_sessions - slots)
+    Returns *every* session, not just the head: pagination needs the tail
+    in a stable order, and returning the whole list keeps page 1 byte-identical
+    to the unpaginated result.
+    """
+    if slots <= 0 or len(sessions) <= head_size:
+        return sessions
+
+    keep = max(0, head_size - slots)
     selected = sessions[:keep]
     selected_keys = {(s.chat_id, s.day) for s in selected}
 
@@ -250,13 +307,17 @@ def _reserve_recent_sessions(
         key=lambda s: latest_ts[(s.chat_id, s.day)],
         reverse=True,
     )
-    for session in newest[: max_sessions - len(selected)]:
+    for session in newest[: head_size - len(selected)]:
         selected.append(session)
         selected_keys.add((session.chat_id, session.day))
 
     # Re-sort so the reserved entries slot into a sensible order rather
-    # than always appearing last.
-    return sorted(selected, key=lambda s: s.score, reverse=True)[:max_sessions]
+    # than always appearing last, then append everything that didn't make
+    # the head, still in score order, for pagination to draw from.
+    head = sorted(selected, key=lambda s: s.score, reverse=True)[:head_size]
+    head_keys = {(s.chat_id, s.day) for s in head}
+    tail = [s for s in sessions if (s.chat_id, s.day) not in head_keys]
+    return head + tail
 
 
 def expand_sessions(index_con, sessions: Sequence[Session], radius: int = EXPANSION_RADIUS) -> None:

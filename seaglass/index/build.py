@@ -72,6 +72,7 @@ from seaglass.imessage import source
 from seaglass.index import exif, render
 from seaglass.index.chunker import Chunk, chunk_messages
 from seaglass.index.embed import EmbeddingModel, compute_calibration_absmax, quantize_int8
+from seaglass.mlxmem import release_mlx_cache
 
 BATCH_SIZE = 200
 CALIBRATION_SAMPLE_SIZE = 2_000
@@ -589,6 +590,12 @@ def build_index(
         index_con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     except sqlite3.Error:
         pass
+
+    # A build embeds far larger batches than any query does, and MLX's
+    # buffer cache retains that high-water mark for the life of the
+    # process. Hand it back now rather than leaving several GB of unified
+    # memory resident behind an idle search app (see seaglass/mlxmem.py).
+    release_mlx_cache()
 
     return chunks_written
 

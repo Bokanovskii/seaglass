@@ -67,6 +67,8 @@ def fetch_conversation(
             text = decode_attributed_body(attributed_body)
         sender = _resolve_sender(is_from_me, handle, contact_index)
         kind = attachment_kinds.get(rowid)
+        if not (text or "").strip() and not kind:
+            continue  # system row with no content -- see hydrate._hydrate_chunks
         messages.append(
             HydratedMessage(
                 message_id=rowid,

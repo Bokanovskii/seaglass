@@ -192,6 +192,15 @@ def _hydrate_chunks(
     ):
         if not text and attributed_body:
             text = decode_attributed_body(attributed_body)
+        kind = attachment_kinds.get(rowid) if has_attachment else None
+        if not (text or "").strip() and not kind:
+            # System rows (chat.db `item_type != 0`: group renames, shared
+            # location start/stop, participant changes) carry neither text
+            # nor an attachment and would render as an empty bubble. They
+            # are filtered here rather than in the snapshot query because
+            # that filter set is pinned -- changing it forces a full
+            # re-embed (see imessage/source.py).
+            continue
         sender = _resolve_sender(is_from_me, handle, contact_index)
         messages.append(
             HydratedMessage(
@@ -201,7 +210,7 @@ def _hydrate_chunks(
                 sender=sender,
                 text=text,
                 has_attachment=bool(has_attachment),
-                attachment_kind=attachment_kinds.get(rowid) if has_attachment else None,
+                attachment_kind=kind,
             )
         )
     return messages

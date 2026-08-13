@@ -15,6 +15,13 @@ const state = {
   requestId: null,
   assistToken: null,
   results: [],
+  shownResults: 0,
+  // pagination
+  pageQuery: '',
+  pageFilters: {},
+  nextOffset: 0,
+  hasMore: false,
+  loadingMore: false,
 };
 
 const els = {
@@ -150,7 +157,7 @@ let syncPollToken = 0;
 async function refreshStatus() {
   const status = await api('/api/status');
   const stale = status.n_messages_since_index
-    ? `<span class="status-sep">·</span><span class="status-stale">⚠ ${status.n_messages_since_index.toLocaleString()} msgs since last index build</span>`
+    ? `<span class="status-sep">·</span><span class="status-stale">${status.n_messages_since_index.toLocaleString()} msgs since last index build</span>`
     : '';
   els.statusBar.innerHTML = `<span class="status-dot${status.hydration_available ? '' : ' is-off'}"></span><span>Ready</span><span class="status-sep">·</span><span>${Number(status.n_chunks || 0).toLocaleString()} chunks</span><span class="status-sep">·</span><span>${Number(status.n_chats || 0).toLocaleString()} chats</span>${stale}`;
   if (syncInProgress) return;  // the sync poll loop owns the banner right now
@@ -276,7 +283,7 @@ async function search() {
   if (!els.query.value.trim() && !hasActiveFilters()) {
     state.results = [];
     els.resultsMeta.innerHTML = '';
-    els.results.innerHTML = `<div class="empty-state"><div class="empty-icon">${iconSvg('i-search')}</div><div class="empty-title">Search your messages</div><p class="empty-hint">Type what you're looking for — a topic, a phrase, a plan someone mentioned — or narrow things down with the filters on the left.</p></div>`;
+    renderIdleState();
     return;
   }
   state.requestId = crypto.randomUUID();
@@ -291,10 +298,53 @@ async function search() {
     setBusy(false);
   }
   if (payload.request_id !== state.requestId) return;
+  // Remember exactly what produced this page so "load more" pages the same
+  // query, not whatever the inputs happen to say by the time it is clicked.
+  state.pageQuery = els.query.value;
+  state.pageFilters = buildFilters();
   renderResults(payload);
   if (payload.assist_token) {
     state.assistToken = payload.assist_token;
     pollAssist(payload.assist_token);
+  }
+}
+
+// Paging appends rather than replaces, so results accumulate into one
+// scrollable list. The backend caches the ranking per query, so each page
+// costs a regroup rather than another embed + cross-encoder pass.
+async function loadMore() {
+  if (state.loadingMore || !state.hasMore) return;
+  state.loadingMore = true;
+  const button = els.results.querySelector('.load-more');
+  if (button) {
+    button.disabled = true;
+    button.querySelector('span').textContent = 'Loading…';
+  }
+  const requestId = state.requestId;
+  const offset = state.nextOffset;
+  try {
+    const payload = await api('/api/search', {
+      method: 'POST',
+      body: JSON.stringify({
+        query: state.pageQuery,
+        filters: state.pageFilters,
+        options: { offset },
+        assist: 'off',
+        request_id: requestId,
+      })
+    });
+    // A new search started while this was in flight -- its results own the
+    // list now, so discard this page instead of appending it to them.
+    if (state.requestId !== requestId) return;
+    appendResults(payload);
+  } catch (err) {
+    if (button) {
+      button.disabled = false;
+      button.querySelector('span').textContent = 'Could not load more — retry';
+    }
+    throw err;
+  } finally {
+    state.loadingMore = false;
   }
 }
 
@@ -308,25 +358,116 @@ function iconSvg(name, className = 'icon') {
   return `<svg class="${className}" aria-hidden="true"><use href="#${name}"></use></svg>`;
 }
 
-function renderResults(payload) {
-  state.results = payload.sessions || [];
-  const term = payload.effective_filters.semantic || els.query.value;
+// The results pane is the largest surface in the window, so it must never
+// sit empty -- an unexplained void reads as a broken app rather than as
+// "nothing searched yet".
+function renderIdleState() {
+  state.results = [];
+  state.hasMore = false;
+  els.resultsMeta.innerHTML = '';
+  els.results.innerHTML = `<div class="empty-state"><div class="empty-icon">${iconSvg('i-search')}</div><div class="empty-title">Search your messages</div><p class="empty-hint">Type what you're looking for — a topic, a phrase, a plan someone mentioned — or narrow things down with the filters on the left.</p></div>`;
+}
+
+// Counts describe what is on screen, so they grow as pages are appended.
+function updateResultsMeta(payload) {
+  const term = payload.effective_filters?.semantic || state.pageQuery || els.query.value;
+  const sessions = state.results.length;
+  const total = payload.total_sessions || sessions;
+  const msgs = state.shownResults || 0;
   els.resultsMeta.innerHTML = [
     term ? `<span class="meta-query">${escapeHtml(term)}</span>` : '',
-    `<span class="meta-pill">${payload.n_sessions} session${payload.n_sessions === 1 ? '' : 's'}</span>`,
-    `<span class="meta-pill">${payload.n_results} msg${payload.n_results === 1 ? '' : 's'}</span>`,
+    `<span class="meta-pill">${sessions}${total > sessions ? ` of ${total}` : ''} session${sessions === 1 ? '' : 's'}</span>`,
+    `<span class="meta-pill">${msgs} msg${msgs === 1 ? '' : 's'}</span>`,
     `<span class="meta-pill">${payload.elapsed_s}s</span>`,
   ].filter(Boolean).join('');
+}
+
+function renderResults(payload) {
+  state.results = payload.sessions || [];
+  state.shownResults = payload.n_results || 0;
+  updateResultsMeta(payload);
   if (!payload.sessions?.length) {
     els.results.innerHTML = `<div class="empty-state"><div class="empty-icon">${iconSvg('i-search')}</div><div class="empty-title">No matching messages</div><p class="empty-hint">Nothing matched this search and the filters you have applied. Try loosening a filter, widening the date range, or rephrasing the query.</p></div>`;
     return;
   }
   els.results.innerHTML = payload.sessions.map((session, index) => renderSession(session, index)).join('');
-  document.querySelectorAll('[data-chat-id]').forEach(link => link.addEventListener('click', openConversation));
+  wireResults(payload);
+}
+
+// Second and later pages are appended so the list grows instead of jumping.
+function appendResults(payload) {
+  const start = state.results.length;
+  const sessions = payload.sessions || [];
+  // Defensive: the ranking is cached per query so pages cannot normally
+  // overlap, but a sync between pages invalidates that cache -- never
+  // render the same session twice.
+  const seen = new Set(state.results.map(s => `${s.chat_id}|${s.day}`));
+  const fresh = sessions.filter(s => !seen.has(`${s.chat_id}|${s.day}`));
+  state.results = state.results.concat(fresh);
+  state.shownResults = (state.shownResults || 0)
+    + fresh.reduce((n, s) => n + (s.messages || []).length, 0);
+
+  const existing = els.results.querySelector('.load-more-row');
+  if (existing) existing.remove();
+  els.results.insertAdjacentHTML(
+    'beforeend',
+    fresh.map((session, i) => renderSession(session, start + i)).join('')
+  );
+  updateResultsMeta(payload);
+  wireResults(payload);
+}
+
+function wireResults(payload) {
+  state.hasMore = Boolean(payload.has_more);
+  state.nextOffset = payload.next_offset ?? 0;
+  renderLoadMore(payload);
+  document.querySelectorAll('[data-chat-id]').forEach(link => {
+    link.removeEventListener('click', openConversation);
+    link.addEventListener('click', openConversation);
+  });
   applyHitClamping();
 }
 
-const CLAMP_SLACK_PX = 24;  // don't clamp for a sliver -- the toggle would cost more room than it saves
+function renderLoadMore(payload) {
+  const existing = els.results.querySelector('.load-more-row');
+  if (existing) existing.remove();
+  if (!state.hasMore) return;
+  const shown = state.results.length;
+  const total = payload.total_sessions || 0;
+  const row = document.createElement('div');
+  row.className = 'load-more-row';
+  row.innerHTML = `<button type="button" class="load-more">`
+    + `${iconSvg('i-chevron-down', 'icon icon-sm')}<span>Load more</span></button>`
+    + (total ? `<div class="load-more-count">${shown} of ${total} conversations</div>` : '');
+  row.querySelector('.load-more').addEventListener('click', () => { loadMore(); });
+  els.results.appendChild(row);
+}
+
+const CLAMP_SLACK_PX = 24;
+const CLAMP_LEAD_CONTEXT = 3;  // messages of run-up kept above the anchor
+
+// Which message in a hit chunk is the one the user was actually looking
+// for. A chunk spans a whole conversation window, so the literal match can
+// sit anywhere in it -- including past the clamp, which made a card look
+// like it had matched on nothing (searching "how was golf" showed four
+// messages whose only tie to the query was the word "was").
+//
+// Marks are the query terms the server highlighted, so the most-marked
+// message is the closest thing to a verbatim match. Ties go to the latest,
+// matching the ranking rule that recent verbatim matches dominate.
+function bestMatchIndex(msgs) {
+  let anchor = -1;
+  let best = 0;
+  msgs.forEach((msg, i) => {
+    const marks = msg.querySelectorAll('mark').length;
+    if (marks > 0 && marks >= best) {
+      best = marks;
+      anchor = i;
+    }
+  });
+  return anchor;
+}
+  // don't clamp for a sliver -- the toggle would cost more room than it saves
 
 // A hit inside a long group thread can render a card tall enough to push
 // every other result off screen. Clamp those, but only after measuring:
@@ -338,8 +479,20 @@ const CLAMP_SLACK_PX = 24;  // don't clamp for a sliver -- the toggle would cost
 // expanded across re-measurement.
 function applyHitClamping() {
   document.querySelectorAll('.card-hits').forEach(hits => {
-    const existing = hits.nextElementSibling;
-    if (existing && existing.classList.contains('card-expand')) existing.remove();
+    // The toggle is overlaid on the fade inside a positioned wrapper so it
+    // reads as belonging to the message list, not to the section below it.
+    let wrap = hits.parentElement;
+    if (!wrap || !wrap.classList.contains('card-hits-wrap')) {
+      wrap = document.createElement('div');
+      wrap.className = 'card-hits-wrap';
+      hits.insertAdjacentElement('beforebegin', wrap);
+      wrap.appendChild(hits);
+    }
+    const existing = wrap.querySelector(':scope > .card-expand');
+    if (existing) existing.remove();
+
+    const msgs = Array.from(hits.querySelectorAll(':scope > .msg'));
+    msgs.forEach(msg => msg.classList.remove('msg-out'));
 
     // Measure against the clamped height, then decide the final state.
     hits.classList.add('is-clamped');
@@ -348,20 +501,38 @@ function applyHitClamping() {
       delete hits.dataset.expanded;
       return;
     }
+
+    // Clamping cuts from the bottom, so put the best match near the top of
+    // what survives by dropping the messages that precede its run-up.
+    const anchor = bestMatchIndex(msgs);
+    const start = anchor < 0 ? 0 : Math.max(0, anchor - CLAMP_LEAD_CONTEXT);
+    const applyWindow = () => {
+      const clamped = hits.classList.contains('is-clamped');
+      msgs.forEach((msg, i) => msg.classList.toggle('msg-out', clamped && i < start));
+    };
+
     if (hits.dataset.expanded === 'true') hits.classList.remove('is-clamped');
+    applyWindow();
 
     const button = document.createElement('button');
     button.type = 'button';
     button.className = 'card-expand';
+    // Name what is actually hidden -- a bare "Show more" next to the
+    // "Surrounding context" row is ambiguous about which it expands.
+    const total = msgs.length;
     const paint = () => {
       const clamped = hits.classList.contains('is-clamped');
-      button.innerHTML = `${iconSvg('i-chevron-down', 'icon icon-sm')} <span>${clamped ? 'Show more' : 'Show less'}</span>`;
+      const label = clamped
+        ? (total ? `Show all ${total} messages` : 'Show more')
+        : 'Show less';
+      button.innerHTML = `${iconSvg('i-chevron-down', 'icon icon-sm')} <span>${label}</span>`;
       button.setAttribute('aria-expanded', String(!clamped));
     };
     paint();
     button.addEventListener('click', () => {
       const clamped = hits.classList.toggle('is-clamped');
       hits.dataset.expanded = String(!clamped);
+      applyWindow();
       paint();
       // Re-collapsing from far down a long card would otherwise leave the
       // viewport somewhere below the card entirely.
@@ -370,7 +541,7 @@ function applyHitClamping() {
         if (card && card.getBoundingClientRect().top < 0) card.scrollIntoView({block: 'start'});
       }
     });
-    hits.insertAdjacentElement('afterend', button);
+    wrap.appendChild(button);
   });
 }
 
@@ -640,5 +811,6 @@ function debounce(fn, delay) {
 // summary -- so a fresh search never silently inherits a previous
 // session's date range or *looks* like it has one.
 applyPreset('');
+renderIdleState();
 
 pollHealth();

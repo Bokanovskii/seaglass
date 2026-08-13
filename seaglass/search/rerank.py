@@ -54,6 +54,10 @@ class CrossEncoderReranker:
             return
         import mlx.core as mx
         from mlx_embeddings.models.bert import Model, ModelArgs
+
+        from seaglass.mlxmem import configure_mlx_memory
+
+        configure_mlx_memory()
         from mlx_embeddings.utils import get_model_path, load_tokenizer
         from safetensors import safe_open
 

@@ -11,6 +11,7 @@ from seaglass.index.build import build_index, open_index_db
 from seaglass.search.rank import (
     RankedChunk,
     aggregate_sessions,
+    order_sessions,
     expand_sessions,
     rerank_candidates,
 )
@@ -260,18 +261,173 @@ class TestRecencyShaping:
         )
 
     def test_rerank_cut_reserves_slots_for_newest_candidates(self):
-        from seaglass.search.rank import _reserve_recent_chunks
+        from seaglass.search.rank import select_reranked_head
 
-        # (chunk_id, score) descending by score; by_id[cid][2] is start_ts
-        by_score = [(i, 10.0 - i) for i in range(10)]
-        by_id = {i: (i, 1, i * 1000, b"") for i in range(10)}  # newest == highest id
-
-        picked = _reserve_recent_chunks(by_score, by_id, top_k=5, slots=2)
-        ids = [cid for cid, _ in picked]
+        # score-descending, with the newest chunks at the *bottom* by score
+        scored = [
+            RankedChunk(chunk_id=i, chat_id=1, start_ts=i * 1000, rerank_score=10.0 - i)
+            for i in range(10)
+        ]
+        picked = select_reranked_head(scored, top_k=5, recent_slots=2)
+        ids = [c.chunk_id for c in picked]
         assert len(ids) == 5 and len(set(ids)) == 5
-        assert ids[:3] == [0, 1, 2]  # top-(top_k - slots) purely by score
-        assert set(ids[3:]) == {9, 8}  # newest of the remainder
+        assert ids[:3] == [0, 1, 2]      # top-(top_k - slots) purely by score
+        assert set(ids[3:]) == {9, 8}    # newest of the remainder
 
-        # degenerate cases return the plain top-k
-        assert _reserve_recent_chunks(by_score, by_id, top_k=5, slots=0) == by_score[:5]
-        assert _reserve_recent_chunks(by_score[:3], by_id, top_k=5, slots=2) == by_score[:3]
+        # degenerate cases fall back to the plain top-k
+        assert select_reranked_head(scored, top_k=5, recent_slots=0) == scored[:5]
+        assert select_reranked_head(scored[:3], top_k=5, recent_slots=2) == scored[:3]
+
+
+class TestSessionPagination:
+    """order_sessions returns a stable full ordering whose first page is
+    byte-identical to the unpaginated result (see rank.py's order_sessions).
+    """
+
+    @staticmethod
+    def _ranked(n, now):
+        # descending relevance, ascending age -> recency and relevance disagree
+        return [
+            RankedChunk(
+                chunk_id=i,
+                chat_id=i,
+                start_ts=int(now - (n - i) * 86400),
+                rerank_score=float(n - i),
+            )
+            for i in range(n)
+        ]
+
+    def test_first_page_matches_the_unpaginated_result(self):
+        now = 1_700_000_000.0
+        ranked = self._ranked(30, now)
+        full = order_sessions(ranked, head_size=8, now=now)
+        page1 = aggregate_sessions(ranked, max_sessions=8, now=now)
+        assert [(s.chat_id, s.day) for s in full[:8]] == [(s.chat_id, s.day) for s in page1]
+
+    def test_pages_are_disjoint_and_cover_everything(self):
+        now = 1_700_000_000.0
+        ranked = self._ranked(30, now)
+        full = order_sessions(ranked, head_size=8, now=now)
+
+        keys = [(s.chat_id, s.day) for s in full]
+        assert len(set(keys)) == len(keys), "a session must never appear on two pages"
+
+        # walking pages reconstructs the full list exactly, with no gaps
+        walked = []
+        for offset in range(0, len(full), 8):
+            walked.extend(full[offset: offset + 8])
+        assert [(s.chat_id, s.day) for s in walked] == keys
+
+    def test_tail_is_ordered_by_score(self):
+        now = 1_700_000_000.0
+        full = order_sessions(self._ranked(30, now), head_size=8, now=now)
+        tail_scores = [s.score for s in full[8:]]
+        assert tail_scores == sorted(tail_scores, reverse=True)
+
+    def test_returns_everything_when_it_all_fits_in_the_head(self):
+        now = 1_700_000_000.0
+        ranked = self._ranked(3, now)
+        assert len(order_sessions(ranked, head_size=8, now=now)) == 3
+
+
+class TestLexicalDominance:
+    """A recent verbatim match beats a stronger-but-older semantic match
+    (see rank.py's LEXICAL_MATCH_BOOST / LEXICAL_HALF_LIFE_DAYS).
+    """
+
+    def test_recent_verbatim_match_outranks_stronger_old_semantic(self):
+        now = 1_700_000_000.0
+        day = 86400.0
+        chunks = [
+            # strong cross-encoder score, but months old
+            RankedChunk(chunk_id=1, chat_id=1, start_ts=int(now - 180 * day), rerank_score=3.0),
+            # weak score -- the query word is one message in a long chunk --
+            # but someone literally typed it today
+            RankedChunk(chunk_id=2, chat_id=2, start_ts=int(now - 3600), rerank_score=-0.8),
+        ]
+        ordered = aggregate_sessions(chunks, now=now, recent_slots=0, lexical_chunk_ids={2})
+        assert ordered[0].chat_id == 2
+
+        # without the lexical signal the old semantic match wins, which is
+        # exactly the behaviour being corrected
+        plain = aggregate_sessions(chunks, now=now, recent_slots=0)
+        assert plain[0].chat_id == 1
+
+    def test_old_verbatim_match_earns_almost_nothing(self):
+        now = 1_700_000_000.0
+        day = 86400.0
+        chunks = [
+            RankedChunk(chunk_id=1, chat_id=1, start_ts=int(now - 10 * day), rerank_score=2.0),
+            RankedChunk(chunk_id=2, chat_id=2, start_ts=int(now - 900 * day), rerank_score=1.0),
+        ]
+        ordered = aggregate_sessions(chunks, now=now, recent_slots=0, lexical_chunk_ids={2})
+        assert ordered[0].chat_id == 1
+
+    def test_no_lexical_ids_leaves_ordering_untouched(self):
+        now = 1_700_000_000.0
+        chunks = [
+            RankedChunk(chunk_id=1, chat_id=1, start_ts=int(now - 86400), rerank_score=2.0),
+            RankedChunk(chunk_id=2, chat_id=2, start_ts=int(now - 86400), rerank_score=1.0),
+        ]
+        base = aggregate_sessions(chunks, now=now, recent_slots=0)
+        empty = aggregate_sessions(chunks, now=now, recent_slots=0, lexical_chunk_ids=set())
+        assert [s.score for s in base] == [s.score for s in empty]
+
+    def test_freshness_uses_the_newest_verbatim_chunk_in_the_session(self):
+        from seaglass.search.rank import LEXICAL_MATCH_BOOST
+
+        now = 1_700_000_000.0
+        day = 86400.0
+        # same session, two verbatim matches: the recent one sets freshness
+        chunks = [
+            RankedChunk(chunk_id=1, chat_id=1, start_ts=int(now - 400 * day), rerank_score=0.0),
+            RankedChunk(chunk_id=2, chat_id=1, start_ts=int(now), rerank_score=0.0),
+        ]
+        ordered = aggregate_sessions(
+            chunks, now=now, recent_slots=0, lexical_chunk_ids={1, 2}, max_sessions=8
+        )
+        boosted = [s for s in ordered if s.chat_id == 1]
+        # two same-day sessions may split by day; the newest must carry ~full boost
+        assert max(s.score for s in boosted) > LEXICAL_MATCH_BOOST
+
+
+class TestExactPhraseLookup:
+    def test_matches_are_restricted_to_the_candidate_pool(self, tmp_path):
+        import sqlite3
+
+        from seaglass.search.retrieve import exact_phrase_chunk_ids
+
+        con = sqlite3.connect(":memory:")
+        con.execute("CREATE VIRTUAL TABLE chunks_fts USING fts5(body)")
+        con.execute("INSERT INTO chunks_fts(rowid, body) VALUES (1, 'that was a classic move')")
+        con.execute("INSERT INTO chunks_fts(rowid, body) VALUES (2, 'classic')")
+        con.execute("INSERT INTO chunks_fts(rowid, body) VALUES (3, 'nothing relevant here')")
+
+        assert exact_phrase_chunk_ids(con, "classic", [1, 2, 3]) == {1, 2}
+        assert exact_phrase_chunk_ids(con, "classic", [3]) == set()
+        assert exact_phrase_chunk_ids(con, "classic", []) == set()
+
+    def test_phrase_is_matched_in_order_not_as_loose_terms(self, tmp_path):
+        import sqlite3
+
+        from seaglass.search.retrieve import exact_phrase_chunk_ids
+
+        con = sqlite3.connect(":memory:")
+        con.execute("CREATE VIRTUAL TABLE chunks_fts USING fts5(body)")
+        con.execute("INSERT INTO chunks_fts(rowid, body) VALUES (1, 'how was golf today')")
+        con.execute("INSERT INTO chunks_fts(rowid, body) VALUES (2, 'golf was fun how about you')")
+
+        assert exact_phrase_chunk_ids(con, "how was golf", [1, 2]) == {1}
+
+    def test_malformed_query_fails_open_instead_of_raising(self):
+        import sqlite3
+
+        from seaglass.search.retrieve import exact_phrase_chunk_ids
+
+        con = sqlite3.connect(":memory:")
+        con.execute("CREATE VIRTUAL TABLE chunks_fts USING fts5(body)")
+        con.execute("INSERT INTO chunks_fts(rowid, body) VALUES (1, 'he said \"classic\" again')")
+
+        # embedded quotes are escaped, not left to break the MATCH syntax
+        assert exact_phrase_chunk_ids(con, '"classic"', [1]) == {1}
+        assert exact_phrase_chunk_ids(con, '*', [1]) == set()

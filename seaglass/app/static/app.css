@@ -4,38 +4,53 @@
 :root {
   color-scheme: dark;
 
-  /* palette — dark (primary) */
-  --bg: #080b11;
-  --bg-glow-a: rgba(86, 207, 225, .12);
-  --bg-glow-b: rgba(99, 102, 241, .10);
-  --surface: #10151e;
-  --surface-2: #161d29;
-  --surface-3: #1c2532;
-  --surface-hover: #1a2231;
-  --border: rgba(255, 255, 255, .08);
-  --border-strong: rgba(255, 255, 255, .15);
-  --text-primary: #e9eff7;
-  --text-secondary: #9dabbd;
-  --text-muted: #6d7c8e;
+  /* palette — dark (primary)
+     Mirrors Messages.app on macOS dark: a near-black canvas, neutral
+     elevated greys, iOS systemBlue for anything actionable, and the two
+     familiar bubble fills (blue outgoing, grey incoming). Greys are the
+     Apple system greys rather than the blue-tinted set used before, so
+     the blue reads as the only chromatic element on screen. */
+  --bg: #1e1e20;              /* macOS dark window chrome, not black --
+                                 Messages' canvas is a lifted grey, and a
+                                 pure-black field made the empty results
+                                 area read as a void. */
+  --bg-glow-a: rgba(10, 132, 255, .10);
+  --bg-glow-b: rgba(10, 132, 255, .05);
+  --surface: #252528;         /* sidebar / cards */
+  --surface-2: #2c2c30;       /* inputs */
+  --surface-3: #35353a;       /* raised chips */
+  --surface-hover: #3d3d42;
+  --border: rgba(255, 255, 255, .10);
+  --border-strong: rgba(255, 255, 255, .20);
+  --text-primary: #ffffff;
+  --text-secondary: #98989f;
+  --text-muted: #6c6c70;
 
-  --accent: #56cfe1;
-  --accent-hover: #74dced;
-  --accent-soft: rgba(86, 207, 225, .14);
-  --accent-softer: rgba(86, 207, 225, .07);
-  --accent-ink: #04222a;
-  --accent-2: #7aa2ff;
+  --accent: #0a84ff;          /* iOS systemBlue, dark variant */
+  --accent-hover: #3d9bff;
+  --accent-soft: rgba(10, 132, 255, .18);
+  --accent-softer: rgba(10, 132, 255, .09);
+  --accent-ink: #ffffff;
+  --accent-2: #5e5ce6;        /* systemIndigo, for avatar gradients */
 
-  --success: #4ade80;
-  --warning: #fbbf24;
-  --danger: #f87171;
-  --danger-soft: rgba(248, 113, 113, .12);
-  --warning-soft: rgba(251, 191, 36, .12);
-  --success-soft: rgba(74, 222, 128, .12);
+  --success: #30d158;         /* systemGreen — also the SMS bubble colour */
+  --warning: #ff9f0a;
+  --danger: #ff453a;
+  --danger-soft: rgba(255, 69, 58, .14);
+  --warning-soft: rgba(255, 159, 10, .14);
+  --success-soft: rgba(48, 209, 88, .14);
 
-  --mark-bg: rgba(250, 204, 21, .26);
-  --mark-text: #ffe9a3;
-  --bubble-me: linear-gradient(180deg, rgba(86, 207, 225, .16), rgba(86, 207, 225, .09));
-  --bubble-me-border: rgba(86, 207, 225, .26);
+  --mark-bg: rgba(255, 214, 10, .30);
+  --mark-text: #ffe98a;
+
+  /* Messages bubbles: solid fills, white text on blue. The gradient is
+     the subtle top-lit one Messages uses, not a flat block. */
+  --bubble-me: linear-gradient(180deg, #1f86ff, #0a6cff);
+  --bubble-me-border: rgba(10, 132, 255, .35);
+  --bubble-me-text: #ffffff;
+  --bubble-them: #3f3f44;
+  --bubble-them-text: #ffffff;
+  --bubble-radius: 18px;
 
   /* radii */
   --r-xs: 6px;
@@ -69,15 +84,15 @@
   --shadow-1: 0 1px 2px rgba(0, 0, 0, .3);
   --shadow-2: 0 6px 20px -8px rgba(0, 0, 0, .55), 0 1px 2px rgba(0, 0, 0, .35);
   --shadow-3: 0 24px 60px -20px rgba(0, 0, 0, .7), 0 2px 8px rgba(0, 0, 0, .4);
-  --ring: 0 0 0 2px rgba(86, 207, 225, .55);
+  --ring: 0 0 0 2px rgba(10, 132, 255, .6);
   --inset-hi: inset 0 1px 0 rgba(255, 255, 255, .05);
 
   /* translucent veils (explicit rgba so no color-mix support is required) */
-  --header-bg: rgba(8, 11, 17, .72);
-  --panel-head-bg: rgba(22, 29, 41, .78);
-  --veil-soft: rgba(16, 21, 30, .38);
-  --veil: rgba(28, 37, 50, .42);
-  --veil-strong: rgba(28, 37, 50, .55);
+  --header-bg: rgba(30, 30, 32, .78);
+  --panel-head-bg: rgba(37, 37, 40, .82);
+  --veil-soft: rgba(37, 37, 40, .38);
+  --veil: rgba(53, 53, 58, .42);
+  --veil-strong: rgba(53, 53, 58, .60);
 
   --t-fast: 130ms cubic-bezier(.2, .7, .3, 1);
   --t: 190ms cubic-bezier(.2, .7, .3, 1);
@@ -87,38 +102,45 @@
 @media (prefers-color-scheme: light) {
   :root {
     color-scheme: light;
-    --bg: #f4f6fa;
-    --bg-glow-a: rgba(20, 160, 180, .10);
-    --bg-glow-b: rgba(99, 102, 241, .08);
+    /* Messages.app light: white canvas, systemGray6 incoming bubbles. */
+    --bg: #ffffff;
+    --bg-glow-a: rgba(0, 122, 255, .07);
+    --bg-glow-b: rgba(0, 122, 255, .04);
     --surface: #ffffff;
-    --surface-2: #f7f9fc;
-    --surface-3: #eef2f7;
-    --surface-hover: #f0f4f9;
-    --border: rgba(15, 30, 50, .10);
-    --border-strong: rgba(15, 30, 50, .20);
-    --text-primary: #101724;
-    --text-secondary: #56657a;
-    --text-muted: #7d8b9d;
-    --accent: #0e9bb0;
-    --accent-hover: #0b8899;
-    --accent-soft: rgba(14, 155, 176, .12);
-    --accent-softer: rgba(14, 155, 176, .06);
+    --surface-2: #f7f7f9;
+    --surface-3: #efeff4;
+    --surface-hover: #ebebf0;
+    --border: rgba(60, 60, 67, .16);
+    --border-strong: rgba(60, 60, 67, .29);
+    --text-primary: #000000;
+    --text-secondary: #6c6c70;
+    --text-muted: #8e8e93;
+    --accent: #007aff;
+    --accent-hover: #0060df;
+    --accent-soft: rgba(0, 122, 255, .12);
+    --accent-softer: rgba(0, 122, 255, .06);
     --accent-ink: #ffffff;
-    --accent-2: #4f6ef7;
-    --mark-bg: rgba(250, 204, 21, .45);
+    --accent-2: #5856d6;
+    --success: #34c759;
+    --warning: #ff9500;
+    --danger: #ff3b30;
+    --mark-bg: rgba(255, 204, 0, .45);
     --mark-text: #4a3400;
-    --bubble-me: linear-gradient(180deg, rgba(14, 155, 176, .13), rgba(14, 155, 176, .07));
-    --bubble-me-border: rgba(14, 155, 176, .25);
+    --bubble-me: linear-gradient(180deg, #2a8cff, #007aff);
+    --bubble-me-border: rgba(0, 122, 255, .3);
+    --bubble-me-text: #ffffff;
+    --bubble-them: #e9e9eb;
+    --bubble-them-text: #000000;
     --shadow-1: 0 1px 2px rgba(16, 24, 40, .06);
     --shadow-2: 0 8px 24px -12px rgba(16, 24, 40, .25), 0 1px 2px rgba(16, 24, 40, .06);
     --shadow-3: 0 24px 60px -24px rgba(16, 24, 40, .35), 0 2px 8px rgba(16, 24, 40, .08);
-    --ring: 0 0 0 2px rgba(14, 155, 176, .45);
+    --ring: 0 0 0 2px rgba(0, 122, 255, .45);
     --inset-hi: inset 0 1px 0 rgba(255, 255, 255, .8);
-    --header-bg: rgba(244, 246, 250, .78);
-    --panel-head-bg: rgba(247, 249, 252, .85);
+    --header-bg: rgba(255, 255, 255, .78);
+    --panel-head-bg: rgba(247, 247, 249, .85);
     --veil-soft: rgba(255, 255, 255, .55);
-    --veil: rgba(238, 242, 247, .6);
-    --veil-strong: rgba(238, 242, 247, .85);
+    --veil: rgba(239, 239, 244, .6);
+    --veil-strong: rgba(239, 239, 244, .85);
   }
 }
 
@@ -532,8 +554,10 @@ button { cursor: pointer; background: none; border: 0; padding: 0; }
 }
 .build-facts li strong { color: var(--text-primary); font-weight: 600; }
 .build-facts .icon { margin-top: 2px; color: var(--accent); }
-.build-fact-warn .icon { color: var(--warning); }
-.build-fact-warn strong { color: var(--warning); }
+/* "This takes a while" is an expectation-setter, not a warning -- amber
+   here made a normal first run look like something had gone wrong. */
+.build-fact-warn .icon { color: var(--accent); }
+.build-fact-warn strong { color: var(--text-primary); }
 
 .build-stage { margin: 0 0 var(--s4); font-size: var(--fs-lg); font-weight: 560; }
 .build-detail {
@@ -611,7 +635,7 @@ header {
   height: 40px;
   padding: 0 62px 0 38px;
   font-size: 15px;
-  border-radius: var(--r-lg);
+  border-radius: var(--r-full);   /* Messages' pill-shaped search field */
   background: var(--surface-2);
   border: 1px solid var(--border);
   color: var(--text-primary);
@@ -855,8 +879,10 @@ input[type="date"]:not(:focus)::-webkit-datetime-edit-year-field { color: var(--
 .banner .banner-text strong { color: var(--text-primary); font-weight: 600; }
 .banner .banner-actions { display: flex; gap: 6px; flex: none; }
 
-#sync-banner { border-color: rgba(251, 191, 36, .28); background: linear-gradient(180deg, var(--warning-soft), transparent); }
-#sync-banner .banner-icon { background: var(--warning-soft); color: var(--warning); }
+/* "New messages since the last build" is routine housekeeping, not a
+   fault, so it stays in the accent blue rather than shouting in amber. */
+#sync-banner { border-color: var(--bubble-me-border); background: linear-gradient(180deg, var(--accent-soft), transparent); }
+#sync-banner .banner-icon { background: var(--accent-soft); color: var(--accent); }
 
 #assist-banner { border-color: var(--bubble-me-border); background: linear-gradient(180deg, var(--accent-soft), transparent); }
 #assist-banner .banner-icon { background: var(--accent-soft); color: var(--accent); }
@@ -1001,6 +1027,10 @@ input[type="date"]:not(:focus)::-webkit-datetime-edit-year-field { color: var(--
   position: relative;
 }
 
+/* Messages dropped from the clamped window because they sit above the
+   best match. Expanding the card restores them. */
+.card-hits > .msg.msg-out { display: none; }
+
 .card-hits.is-clamped::after {
   content: '';
   position: absolute;
@@ -1010,23 +1040,40 @@ input[type="date"]:not(:focus)::-webkit-datetime-edit-year-field { color: var(--
   background: linear-gradient(to bottom, transparent, var(--surface));
 }
 
+/* The toggle is overlaid on the fade *inside* the message list rather than
+   placed after it: sitting as a full-width bar between the messages and the
+   "Surrounding context" row made it read as expanding that section instead. */
+.card-hits-wrap { position: relative; }
+
 .card-expand {
+  position: absolute;
+  left: 50%;
+  bottom: var(--s2);
+  transform: translateX(-50%);
   display: flex;
   align-items: center;
   gap: 5px;
-  width: 100%;
-  padding: 7px var(--s4);
+  padding: 5px 12px;
   font-size: var(--fs-sm);
   font-weight: 550;
   color: var(--text-secondary);
-  background: transparent;
-  border: 0;
-  border-top: 1px solid var(--border);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  box-shadow: 0 1px 6px rgba(0, 0, 0, .28);
   cursor: pointer;
-  transition: background var(--t-fast), color var(--t-fast);
+  white-space: nowrap;
+  transition: background var(--t-fast), color var(--t-fast), border-color var(--t-fast);
 }
 
-.card-expand:hover { background: var(--surface-hover); color: var(--accent); }
+/* Once expanded there is no fade to sit on, so it returns to the flow. */
+.card-expand[aria-expanded="true"] {
+  position: static;
+  transform: none;
+  margin: var(--s2) auto 10px;
+}
+
+.card-expand:hover { background: var(--surface-hover); color: var(--accent); border-color: var(--accent); }
 .card-expand .icon { transition: transform var(--t-fast); }
 .card-expand[aria-expanded="true"] .icon { transform: rotate(180deg); }
 
@@ -1043,7 +1090,7 @@ input[type="date"]:not(:focus)::-webkit-datetime-edit-year-field { color: var(--
 .msg-me { flex-direction: row-reverse; }
 .msg-me .msg-head { flex-direction: row-reverse; }
 .msg-me .msg-body { display: flex; flex-direction: column; align-items: flex-end; }
-.msg-me .msg-text { border-radius: var(--r-lg) 4px var(--r-lg) var(--r-lg); text-align: left; }
+.msg-me .msg-text { border-radius: var(--bubble-radius); border-bottom-right-radius: 5px; border-bottom-left-radius: var(--bubble-radius); text-align: left; }
 
 .msg {
   display: flex;
@@ -1096,24 +1143,31 @@ input[type="date"]:not(:focus)::-webkit-datetime-edit-year-field { color: var(--
   font-style: italic;
 }
 
+/* Messages-style bubbles: solid fills, no outline, generous rounding
+   with the corner nearest the sender squared off into a tail. */
 .msg-text {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   font-size: var(--fs-md);
-  line-height: 1.45;
-  color: var(--text-primary);
-  padding: 6px 11px;
-  border-radius: 4px var(--r-lg) var(--r-lg) var(--r-lg);
-  background: var(--surface-3);
-  border: 1px solid var(--border);
+  line-height: 1.35;
+  color: var(--bubble-them-text);
+  padding: 7px 13px;
+  border-radius: var(--bubble-radius);
+  border-bottom-left-radius: 5px;
+  background: var(--bubble-them);
+  border: 0;
   display: inline-block;
   max-width: 100%;
 }
 
 .msg-me .msg-text {
   background: var(--bubble-me);
-  border-color: var(--bubble-me-border);
+  color: var(--bubble-me-text);
+  border: 0;
 }
+
+/* `mark` inherits bubble colour, so give it enough contrast on blue. */
+.msg-me .msg-text mark { background: rgba(255, 255, 255, .30); color: #fff; }
 
 .msg-text:empty::before { content: "—"; color: var(--text-muted); }
 
@@ -1343,7 +1397,7 @@ footer#status-bar {
 }
 .status-dot.is-off { background: var(--text-muted); box-shadow: none; }
 .status-sep { opacity: .4; }
-.status-stale { color: var(--warning); }
+.status-stale { color: var(--accent); }
 
 /* ---------- responsive ---------- */
 
@@ -1374,3 +1428,32 @@ footer#status-bar {
     transition-duration: .01ms !important;
   }
 }
+
+
+/* pagination */
+.load-more-row {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: var(--s4) 0 var(--s6);
+}
+
+.load-more {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 18px;
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border: 0;
+  border-radius: var(--r-full);
+  cursor: pointer;
+  transition: background var(--t-fast), color var(--t-fast);
+}
+
+.load-more:hover:not(:disabled) { background: var(--accent); color: #fff; }
+.load-more:disabled { opacity: .6; cursor: default; }
+.load-more-count { font-size: var(--fs-xs); color: var(--text-muted); }

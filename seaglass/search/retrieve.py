@@ -220,6 +220,42 @@ def sparse_search(
         return []
 
 
+def exact_phrase_chunk_ids(
+    index_con, phrase: str, chunk_ids: Sequence[int]
+) -> Set[int]:
+    """Which of `chunk_ids` contain `phrase` as a literal phrase.
+
+    Distinct from `sparse_search`, which ranks by BM25 over loose terms:
+    this asks the yes/no question "did someone actually type this?". The
+    phrase is wrapped in double quotes so FTS5 treats it as a phrase
+    rather than as a bag of terms, with any embedded quotes doubled to
+    escape them.
+
+    Fails open to the empty set: a lexical bonus is an enhancement, and a
+    malformed query must never break the search that would otherwise work.
+    """
+    phrase = phrase.strip()
+    if not phrase or not chunk_ids:
+        return set()
+
+    matched: Set[int] = set()
+    escaped = '"' + phrase.replace('"', '""') + '"'
+    ids = list(chunk_ids)
+    # Chunked to stay under SQLite's variable limit for large candidate pools.
+    for start in range(0, len(ids), CANDIDATE_INLINE_LIMIT):
+        batch = ids[start: start + CANDIDATE_INLINE_LIMIT]
+        placeholders = ",".join("?" for _ in batch)
+        try:
+            rows = index_con.execute(
+                f"SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH ? AND rowid IN ({placeholders})",
+                [escaped, *batch],
+            ).fetchall()
+        except Exception:
+            return set()
+        matched.update(row[0] for row in rows)
+    return matched
+
+
 def rrf_fuse(
     ranked_lists: Sequence[Sequence[int]],
     k: int = RRF_K,

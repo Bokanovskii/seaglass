@@ -34,6 +34,37 @@ def parse_args(argv: list[str] | None = None):
     return parser.parse_args(argv)
 
 
+def _set_macos_app_name(name: str = 'Seaglass') -> None:
+    """Show "Seaglass" rather than "Python" in the Dock, the Cmd+Tab
+    switcher and the menu bar.
+
+    For a non-bundled interpreter macOS takes the display name from the
+    *running binary's* bundle -- which is CPython's own, hence "Python".
+    There is no NSApplication setter for it, but AppKit reads the name out
+    of the main bundle's info dictionary lazily, so overwriting
+    `CFBundleName` in that (mutable) dictionary before the app finishes
+    launching is what actually takes effect.
+
+    Must run before `webview.start()` creates the NSApplication. Purely
+    cosmetic, so every failure path is swallowed.
+    """
+    try:
+        from Foundation import NSBundle
+    except ImportError:
+        return
+    try:
+        bundle = NSBundle.mainBundle()
+        if bundle is None:
+            return
+        info = bundle.localizedInfoDictionary() or bundle.infoDictionary()
+        if info is None:
+            return
+        info['CFBundleName'] = name
+        info['CFBundleDisplayName'] = name
+    except Exception:
+        pass
+
+
 def _set_macos_dock_icon() -> None:
     """Set a proper seaglass Dock icon instead of the generic Python
     rocket. pywebview's own `icon=` kwarg to `create_window` only takes
@@ -205,9 +236,10 @@ def main(argv: list[str] | None = None) -> int:
 
     import webview
 
+    _set_macos_app_name()
     _set_macos_dock_icon()
     icon_path = Path(__file__).resolve().parent / 'static' / 'icons' / 'icon-512.png'
-    webview.create_window('seaglass', url, width=1280, height=900)
+    webview.create_window('Seaglass', url, width=1280, height=900)
     try:
         # `icon` is a start()-time kwarg (GTK/QT only, per pywebview docs),
         # not a create_window() one -- harmless no-op on the Cocoa backend,
