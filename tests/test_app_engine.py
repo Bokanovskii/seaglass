@@ -226,3 +226,27 @@ def test_freshness_cache_is_dropped_after_a_build(tmp_path, monkeypatch):
 
     engine.status()
     assert len(calls) == 1
+
+
+def test_search_payload_declares_its_ordering(tmp_path, monkeypatch):
+    # A caller taking the first N messages needs to know whether "first"
+    # means most relevant or most recent.
+    from seaglass.app.engine import SearchOptions
+    from seaglass.app.filters import SearchFilters
+
+    engine = _snapshot_and_live(tmp_path, monkeypatch, [])
+    relevance = engine.search('dinner plans', SearchFilters(), SearchOptions())
+    assert relevance['ordering'] == 'relevance'
+
+    browse = engine.search('recent messages', SearchFilters(), SearchOptions())
+    assert browse['ordering'] == 'recent'
+
+
+def test_search_payload_reports_index_staleness(tmp_path, monkeypatch):
+    from seaglass.app.engine import SearchOptions
+    from seaglass.app.filters import SearchFilters
+
+    engine = _snapshot_and_live(tmp_path, monkeypatch, [('brand new', APPLE_EPOCH_START + 5000)])
+    payload = engine.search('dinner plans', SearchFilters(), SearchOptions())
+    assert payload['index_stale'] is True
+    assert payload['n_messages_since_index'] == 1

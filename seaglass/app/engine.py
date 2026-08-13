@@ -474,6 +474,10 @@ class SearchEngine:
             # answers "what did X just say" from this.
             'n_messages_since_index': int(newer_messages),
             'index_stale': bool(newer_messages),
+            # 'recent' means the result is time-ordered, not relevance-
+            # ordered, so a caller taking the first N gets the newest
+            # messages rather than the oldest of the newest day.
+            'ordering': 'recent' if not parsed.semantic.strip() else 'relevance',
             'offset': offset,
             'total_sessions': total_sessions,
             'has_more': offset + options.max_sessions < total_sessions,
