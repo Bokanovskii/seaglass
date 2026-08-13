@@ -13,11 +13,9 @@ privacy boundary and its two consequences.
 ## Status
 
 Working end-to-end: index build, hybrid retrieval, reranking, session
-aggregation, and the MCP server are implemented and tested (see
-[`docs/architecture.html`](docs/architecture.html) for a detailed,
-interactive breakdown of every component — GitHub Pages isn't available on
-this private repo's plan, so download/open that file locally rather than
-following a live link). Grogu integrates with seaglass over MCP and prefers
+aggregation, and the MCP server are implemented and tested (see the
+[interactive architecture reference](https://bokanovskii.github.io/seaglass/architecture.html)
+for a detailed breakdown of every component). Grogu integrates with seaglass over MCP and prefers
 it over its legacy SQL `LIKE` fallback whenever seaglass is configured and
 reachable.
 
