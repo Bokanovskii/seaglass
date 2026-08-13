@@ -489,8 +489,17 @@
         later pages by slicing it. Page 1 is built from the top-12 rerank cut with recency
         reservations applied; deeper pages append the remaining scored pool in pure score order,
         so adding pages is strictly additive and never reshuffles what the user already read.
-        The cache is invalidated on <code>warmup()</code> because a rebuild renumbers chunk ids.
+        The cache is invalidated on <code>warmup()</code> because a rebuild renumbers chunk ids, and its key must include <em>every</em> filter — the cached value is the reranked candidate pool, and filters are exactly what narrow that pool, so an omitted filter made toggling it replay the previous query's results.
         Cached pages return in 0.13–0.18&nbsp;s versus ~1.4&nbsp;s cold.
+      </div>
+      <div class="callout decision">
+        <strong>A query with no words is a browse, not a search.</strong>
+        An empty (or filters-only) query has nothing to match on, but embedding the empty string
+        still yields a direction in vector space — so the pipeline used to return dozens of
+        confidently-scored, meaningless sessions. A blank <code>semantic</code> now short-circuits
+        to the newest chunks in the candidate set (<code>recency_ranked</code>), which is what
+        "show me messages from Alice" with no query text actually means. It skips both models
+        entirely: 0.04&nbsp;s versus ~1.3&nbsp;s, and the filters still apply.
       </div>
       <div class="callout decision">
         <strong>MLX memory: cap the Metal buffer cache.</strong> Activity Monitor showed the app at

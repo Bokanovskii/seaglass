@@ -20,6 +20,7 @@ from seaglass.search.hydrate import hydrate_sessions
 from seaglass.search.parse import ParsedQuery, parse_query
 from seaglass.search.rank import (
     RERANK_TOP_K,
+    RankedChunk,
     aggregate_sessions,
     expand_sessions,
     order_sessions,
@@ -27,7 +28,12 @@ from seaglass.search.rank import (
     select_reranked_head,
 )
 from seaglass.search.rerank import CrossEncoderReranker
-from seaglass.search.retrieve import build_candidate_chunk_ids, exact_phrase_chunk_ids, retrieve
+from seaglass.search.retrieve import (
+    build_candidate_chunk_ids,
+    exact_phrase_chunk_ids,
+    recency_ranked,
+    retrieve,
+)
 
 
 @dataclass
@@ -261,6 +267,17 @@ class SearchEngine:
         candidate_ids = build_candidate_chunk_ids(self.index_con, parsed, chat_con=self.chat_con)
         timings['prefilter'] = round(time.time() - prefilter_started, 4)
 
+        if not parsed.semantic.strip():
+            # No words to match on -- just filters, or nothing at all.
+            # Embedding the empty string produces an arbitrary direction in
+            # vector space, so the old behaviour was 48 confidently-scored
+            # but meaningless sessions. Browse the newest matching chunks
+            # instead, which is what "show me messages from Alice" with no
+            # query text actually means (and skips the models entirely).
+            return self._browse_recent(
+                text, parsed, candidate_ids, options, timings, t0
+            )
+
         retrieve_started = time.time()
         fused = retrieve(
             self.index_con,
@@ -317,6 +334,42 @@ class SearchEngine:
             self.index_con, parsed.semantic, [r.chunk_id for r in fused]
         )
         ordered = self._ordered_sessions(ranked, scored, options, lexical_ids)
+        return self._finish(ordered, options, timings, t0, candidate_ids, parsed, aggregate_started)
+
+    def _browse_recent(self, text, parsed, candidate_ids, options, timings, t0) -> dict:
+        """Filters-only (or empty) search: newest matching chunks, no models."""
+        aggregate_started = time.time()
+        if candidate_ids is None:
+            rows = self.index_con.execute(
+                'SELECT id, chat_id, start_ts FROM chunks ORDER BY start_ts DESC LIMIT ?',
+                (options.fused_top_k,),
+            ).fetchall()
+        else:
+            ids = recency_ranked(self.index_con, candidate_ids)[: options.fused_top_k]
+            rows = self._chunk_rows(ids)
+        # Descending pseudo-scores keep the newest-first order through
+        # aggregation, whose sigmoid is monotonic.
+        ordered_chunks = [
+            RankedChunk(chunk_id=cid, chat_id=chat_id, start_ts=start_ts, rerank_score=float(len(rows) - i))
+            for i, (cid, chat_id, start_ts) in enumerate(rows)
+        ]
+        timings['browse'] = round(time.time() - aggregate_started, 4)
+        ordered = order_sessions(ordered_chunks, head_size=options.max_sessions, recent_slots=0)
+        return self._finish(ordered, options, timings, t0, candidate_ids, parsed, aggregate_started)
+
+    def _chunk_rows(self, ids):
+        if not ids:
+            return []
+        placeholders = ','.join('?' for _ in ids)
+        by_id = {
+            row[0]: row
+            for row in self.index_con.execute(
+                f'SELECT id, chat_id, start_ts FROM chunks WHERE id IN ({placeholders})', list(ids)
+            )
+        }
+        return [by_id[i] for i in ids if i in by_id]
+
+    def _finish(self, ordered, options, timings, t0, candidate_ids, parsed, aggregate_started) -> dict:
         offset = max(0, options.offset)
         sessions = ordered[offset: offset + options.max_sessions]
         total_sessions = len(ordered)
@@ -384,7 +437,13 @@ class SearchEngine:
     @staticmethod
     def _page_cache_key(text: str, parsed: ParsedQuery, options: SearchOptions) -> tuple:
         """Everything that can change the ranking -- but NOT `offset`, which
-        is precisely what we want to serve from one cached ranking."""
+        is precisely what we want to serve from one cached ranking.
+
+        Every filter must appear here: the cached value is the *reranked
+        candidate pool*, and the candidate pool is exactly what filters
+        narrow. Omitting one means flipping that filter silently replays
+        the previous query's results.
+        """
         return (
             text,
             parsed.semantic,
@@ -392,7 +451,10 @@ class SearchEngine:
             parsed.date_from,
             parsed.date_to,
             parsed.has_media,
+            getattr(parsed, 'is_group', None),
+            tuple(getattr(parsed, 'chat_ids', None) or ()),
             options.fused_top_k,
+            options.rerank,
             tuple(options.expansions),
         )
 

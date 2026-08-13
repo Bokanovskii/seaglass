@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import dataclasses
+
 import concurrent.futures
 import queue
 import secrets
@@ -24,6 +26,7 @@ from seaglass.app.assist import (
     should_assist,
 )
 from seaglass.app.config import save_config
+from seaglass.app.engine import SearchOptions
 from seaglass.app.filters import SearchFilters
 from seaglass.app.indexstate import IndexBuildState, run_build
 from seaglass.llm.ghcp import call_ghcp_json_object
@@ -123,6 +126,18 @@ class SearchAssistManager:
         return payload
 
 
+def _coerce(cls, values):
+    """Build a dataclass from a request body, ignoring unknown keys.
+
+    A stray or stale key (an old frontend build, a Grogu client written
+    against a newer schema) would otherwise raise TypeError and turn the
+    whole search into a 500. Unknown filters are dropped rather than
+    honoured, which degrades to a broader search -- the safe direction.
+    """
+    known = {f.name for f in dataclasses.fields(cls)}
+    return cls(**{k: v for k, v in (values or {}).items() if k in known})
+
+
 def create_app(engine, warmup_state, config, token: str):
     app = FastAPI()
     allowed_host = f'127.0.0.1:{config.port}'
@@ -201,8 +216,8 @@ def create_app(engine, warmup_state, config, token: str):
     @app.post('/api/search')
     async def search(body: SearchBody):
         loop = __import__('asyncio').get_running_loop()
-        filters = SearchFilters(**body.filters)
-        options = engine.__class__.__dict__ and __import__('seaglass.app.engine', fromlist=['SearchOptions']).SearchOptions(**body.options)
+        filters = _coerce(SearchFilters, body.filters)
+        options = _coerce(SearchOptions, body.options)
         payload = await loop.run_in_executor(pipeline_pool, engine.search, body.query, filters, options)
         payload['request_id'] = body.request_id
         # A "load more" fetch is the same query -- re-running Assist would
@@ -235,8 +250,9 @@ def create_app(engine, warmup_state, config, token: str):
         deterministic = __import__('seaglass.search.parse', fromlist=['parse_query']).parse_query(body['query'], contact_index=engine.contact_index)
         merged, changes, expansions = merge_ghcp_parse(deterministic, pending, engine.contact_index, engine.corpus_bounds)
         loop = __import__('asyncio').get_running_loop()
-        filters = SearchFilters(**body.get('filters', {}))
-        options = __import__('seaglass.app.engine', fromlist=['SearchOptions']).SearchOptions(**body.get('options', {}), expansions=expansions)
+        filters = _coerce(SearchFilters, body.get('filters'))
+        options = _coerce(SearchOptions, body.get('options'))
+        options.expansions = expansions
         payload = await loop.run_in_executor(pipeline_pool, engine.search, merged.raw, filters, options)
         payload['parse_source'] = 'ghcp'
         payload['assist_changes'] = changes

@@ -135,3 +135,52 @@ def test_status_reuses_cached_live_connection(tmp_path, monkeypatch):
     first = engine._live_chat_con
     engine.status()
     assert engine._live_chat_con is first is not None
+
+
+def test_blank_query_browses_newest_instead_of_scoring_noise(tmp_path, monkeypatch):
+    """An empty query has no words to match on: embedding the empty string
+    gives an arbitrary vector-space direction, so the old behaviour was
+    dozens of confidently-scored but meaningless sessions.
+    """
+    engine = _engine(tmp_path, monkeypatch)
+    payload = engine.search('   ', SearchFilters(), SearchOptions())
+
+    assert payload['sessions'], 'browse should still show something to look at'
+    # newest first, and the models are skipped entirely
+    starts = [s['messages'][0]['ts'] for s in payload['sessions']]
+    assert starts == sorted(starts, reverse=True)
+    assert 'browse' in payload['timings']
+    assert 'rerank' not in payload['timings']
+
+
+def test_blank_query_still_honours_filters(tmp_path, monkeypatch):
+    engine = _engine(tmp_path, monkeypatch)
+    payload = engine.search('', SearchFilters(chat_ids=[2]), SearchOptions())
+    assert payload['sessions']
+    assert {s['chat_id'] for s in payload['sessions']} == {2}
+
+
+def test_blank_query_paginates(tmp_path, monkeypatch):
+    engine = _engine(tmp_path, monkeypatch)
+    first = engine.search('', SearchFilters(), SearchOptions(max_sessions=1))
+    assert first['has_more'] is (first['total_sessions'] > 1)
+    if first['has_more']:
+        second = engine.search('', SearchFilters(), SearchOptions(max_sessions=1, offset=first['next_offset']))
+        assert second['sessions'][0]['chat_id'] != first['sessions'][0]['chat_id'] or \
+            second['sessions'][0]['messages'][0]['ts'] != first['sessions'][0]['messages'][0]['ts']
+
+
+def test_page_cache_is_not_shared_across_different_filters(tmp_path, monkeypatch):
+    """The cache holds a reranked *candidate pool*, and filters are what
+    narrow that pool -- so a filter missing from the key made switching
+    Any/1:1/Group replay the previous query's results verbatim.
+    """
+    engine = _engine(tmp_path, monkeypatch)
+    everything = engine.search('discussion', SearchFilters(), SearchOptions())
+    one_chat = engine.search('discussion', SearchFilters(chat_ids=[1]), SearchOptions())
+    assert {s['chat_id'] for s in one_chat['sessions']} <= {1}
+    assert one_chat['sessions'] != everything['sessions'] or everything['n_sessions'] <= 1
+
+    grouped = engine.search('discussion', SearchFilters(is_group=True), SearchOptions())
+    solo = engine.search('discussion', SearchFilters(is_group=False), SearchOptions())
+    assert not ({s['chat_id'] for s in grouped['sessions']} & {s['chat_id'] for s in solo['sessions']})
