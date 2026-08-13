@@ -45,6 +45,9 @@
       <symbol id="i-arrow-out" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
         <path d="M14 5h5v5"></path><path d="M19 5 11 13"></path><path d="M18.5 14.5V18a2 2 0 0 1-2 2h-9a2 2 0 0 1-2-2v-9a2 2 0 0 1 2-2H11"></path>
       </symbol>
+      <symbol id="i-chevron-down" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="m6 9 6 6 6-6"></path>
+      </symbol>
     </defs>
   </svg>
 
@@ -146,18 +149,16 @@
 
         <div class="filter-group">
           <label><svg class="icon icon-sm" aria-hidden="true"><use href="#i-calendar"></use></svg> Date range</label>
-          <div class="dates"><input id="date-from" type="date" autocomplete="off"><span aria-hidden="true">→</span><input id="date-to" type="date" autocomplete="off"></div>
           <div class="presets">
             <button data-days="7">7d</button>
             <button data-days="30">30d</button>
             <button data-days="90">90d</button>
             <button data-days="365">1y</button>
             <button data-days="">All</button>
+            <button data-days="custom">Custom</button>
           </div>
-        </div>
-
-        <div class="filter-group">
-          <label class="switch-row"><input id="has-media" type="checkbox"><span class="switch" aria-hidden="true"></span><span class="switch-text"><svg class="icon icon-sm" aria-hidden="true"><use href="#i-clip"></use></svg> Has media</span></label>
+          <div id="date-summary" class="date-summary">All time</div>
+          <div class="dates hidden"><input id="date-from" type="date" autocomplete="off"><span aria-hidden="true">→</span><input id="date-to" type="date" autocomplete="off"></div>
         </div>
 
         <button id="clear-filters" class="btn btn-ghost btn-block">Clear all filters</button>

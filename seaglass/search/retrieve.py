@@ -20,7 +20,7 @@ golden-set eval (Phase 3.5) shows it hurts precision.
 from __future__ import annotations
 
 import dataclasses
-from typing import Dict, List, Optional, Sequence, Set
+from typing import Dict, Iterable, List, Optional, Sequence, Set
 
 import numpy as np
 
@@ -37,6 +37,19 @@ SPARSE_TOP_K = 200
 RRF_K = 60
 FUSED_TOP_K = 50
 CANDIDATE_INLINE_LIMIT = 2000
+
+# Candidate slots (out of FUSED_TOP_K) reserved for the most recent
+# matching chunks. Lexical/semantic scores are near-identical across
+# hundreds of hits for a common word -- "sweet" matches 228 chunks, and
+# BM25's ordering among them is essentially arbitrary -- so a message sent
+# today can land at sparse rank 171 and never reach the reranker at all.
+# That reads to the user as "search can't find what I just said".
+#
+# Reserving slots (rather than weighting recency into the fusion score)
+# keeps relevance ordering intact and the reranker's workload identical:
+# recent matches are guaranteed a *hearing*, and the cross-encoder still
+# decides whether they deserve to be shown.
+RECENCY_RESERVED_SLOTS = 10
 
 
 @dataclasses.dataclass(frozen=True)
@@ -211,18 +224,53 @@ def rrf_fuse(
     ranked_lists: Sequence[Sequence[int]],
     k: int = RRF_K,
     top_k: int = FUSED_TOP_K,
+    weights: Optional[Sequence[float]] = None,
 ) -> List[RetrievalResult]:
     """Reciprocal Rank Fusion over any number of ranked (best-first) id
     lists. ⚠️ Retrieve deep, fuse, THEN truncate -- truncating each arm to
     top_k before fusion discards the long-tail corroboration signal RRF
     depends on (PLAN.md §6 Phase 4).
+
+    `weights` scales each list's contribution (default 1.0 each), so a
+    supporting signal like recency can inform the fusion without carrying
+    the same authority as the dense/sparse relevance arms.
     """
+    if weights is None:
+        weights = [1.0] * len(ranked_lists)
     scores: Dict[int, float] = {}
-    for ranked_list in ranked_lists:
+    for ranked_list, weight in zip(ranked_lists, weights):
         for rank, chunk_id in enumerate(ranked_list, start=1):
-            scores[chunk_id] = scores.get(chunk_id, 0.0) + 1.0 / (k + rank)
+            scores[chunk_id] = scores.get(chunk_id, 0.0) + weight / (k + rank)
     ordered = sorted(scores.items(), key=lambda pair: pair[1], reverse=True)
     return [RetrievalResult(chunk_id=cid, rrf_score=score) for cid, score in ordered[:top_k]]
+
+
+def recency_ranked(index_con, chunk_ids: Iterable[int]) -> List[int]:
+    """Order already-matched chunks newest-first.
+
+    Used as a third RRF arm. Lexical/semantic scores are near-identical
+    across hundreds of hits for a common word ("sweet" matches 228 chunks
+    with essentially arbitrary BM25 ordering among them), so without this
+    a message from today can land at sparse rank 171 and never reach the
+    candidate pool at all -- the search silently can't find things the
+    user just said. Restricted to chunks that already matched, so it adds
+    *ordering*, never new unrelated results.
+    """
+    ids = list(chunk_ids)
+    if not ids:
+        return []
+    ordered: List[int] = []
+    for start in range(0, len(ids), CANDIDATE_INLINE_LIMIT):
+        batch = ids[start:start + CANDIDATE_INLINE_LIMIT]
+        placeholders = ",".join("?" for _ in batch)
+        ordered.extend(
+            row[0]
+            for row in index_con.execute(
+                f"SELECT id FROM chunks WHERE id IN ({placeholders}) ORDER BY start_ts DESC",
+                batch,
+            )
+        )
+    return ordered
 
 
 def retrieve(
@@ -236,6 +284,7 @@ def retrieve(
     rrf_k: int = RRF_K,
     fused_top_k: int = FUSED_TOP_K,
     extra_sparse_queries: Sequence[str] = (),
+    recency_slots: int = RECENCY_RESERVED_SLOTS,
 ) -> List[RetrievalResult]:
     """The Phase 4a baseline pipeline: pre-filter -> dense + sparse ->
     RRF fuse -> top `fused_top_k`. No reranker (Phase 4b).
@@ -258,4 +307,52 @@ def retrieve(
         if extra_ids:
             ranked_lists.append(extra_ids)
 
-    return rrf_fuse(ranked_lists, k=rrf_k, top_k=fused_top_k)
+    fused = rrf_fuse(ranked_lists, k=rrf_k, top_k=fused_top_k)
+    matched = list(dict.fromkeys([cid for arm in ranked_lists for cid in arm]))
+    return reserve_recent_slots(
+        index_con, fused, matched, top_k=fused_top_k, slots=recency_slots
+    )
+
+
+def reserve_recent_slots(
+    index_con,
+    fused: Sequence[RetrievalResult],
+    matched_ids: Sequence[int],
+    *,
+    top_k: int = FUSED_TOP_K,
+    slots: int = RECENCY_RESERVED_SLOTS,
+) -> List[RetrievalResult]:
+    """Guarantee that the newest matching chunks reach the reranker.
+
+    Keeps the best `top_k - slots` candidates by fusion score, then fills
+    the remainder with the most recent matched chunks not already present
+    (falling back to more fusion-ranked candidates if there aren't enough
+    recent ones). The result is still exactly `top_k` candidates, so the
+    reranker's cost is unchanged. See RECENCY_RESERVED_SLOTS.
+    """
+    if slots <= 0 or not fused:
+        return list(fused[:top_k])
+
+    kept = list(fused[:max(0, top_k - slots)])
+    kept_ids = {r.chunk_id for r in kept}
+    room = top_k - len(kept)
+
+    recent_pool = [cid for cid in recency_ranked(index_con, matched_ids) if cid not in kept_ids]
+    additions: List[RetrievalResult] = []
+    scores = {r.chunk_id: r.rrf_score for r in fused}
+    for chunk_id in recent_pool[:room]:
+        additions.append(RetrievalResult(chunk_id=chunk_id, rrf_score=scores.get(chunk_id, 0.0)))
+        kept_ids.add(chunk_id)
+
+    if len(kept) + len(additions) < top_k:
+        # Not enough distinct recent matches -- give the slack back to the
+        # fusion ranking rather than returning a short candidate list.
+        for result in fused[len(kept):]:
+            if result.chunk_id in kept_ids:
+                continue
+            additions.append(result)
+            kept_ids.add(result.chunk_id)
+            if len(kept) + len(additions) >= top_k:
+                break
+
+    return kept + additions

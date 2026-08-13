@@ -12,12 +12,15 @@ so a naive range spans other conversations (PLAN.md §6 step 7).
 from __future__ import annotations
 
 import dataclasses
-from typing import List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence
 
 from seaglass.imessage.attributedbody import decode_attributed_body
 from seaglass.imessage.contacts import ContactIndex
 from seaglass.imessage.source import apple_to_unix
 from seaglass.search.rank import Session
+
+# Stay well under SQLite's default 999-variable limit for `IN (...)`.
+_SQLITE_VARIABLE_BATCH = 800
 
 
 
@@ -29,6 +32,10 @@ class HydratedMessage:
     sender: Optional[str]  # resolved contact display name, else raw handle, else None (is_from_me)
     text: Optional[str]
     has_attachment: bool
+    # Human-readable kind for attachment-only messages ("Photo", "Video",
+    # ...). Attachment-only messages have no text at all, so without this
+    # the client has nothing to render but an empty bubble.
+    attachment_kind: Optional[str] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -50,6 +57,75 @@ def _resolve_sender(is_from_me: int, handle: Optional[str], contact_index: Optio
         if name is not None:
             return name
     return handle
+
+
+def _attachment_label(mime_type: Optional[str], uti: Optional[str], is_sticker: int) -> str:
+    """Best-effort human name for one attachment. chat.db is inconsistent
+    here -- plenty of rows carry a NULL mime_type and only a UTI (and some
+    have neither) -- so fall back through both before giving up.
+    """
+    if is_sticker:
+        return 'Sticker'
+    mime = (mime_type or '').lower()
+    uti_value = (uti or '').lower()
+    if mime == 'image/gif' or 'gif' in uti_value:
+        return 'GIF'
+    if mime.startswith('image/') or uti_value.startswith('public.hei') or uti_value in {'public.jpeg', 'public.png'}:
+        return 'Photo'
+    if mime.startswith('video/') or 'movie' in uti_value or 'mpeg-4' in uti_value:
+        return 'Video'
+    if mime.startswith('audio/') or 'audio' in uti_value:
+        return 'Audio message'
+    if mime == 'application/pdf' or uti_value == 'com.adobe.pdf':
+        return 'PDF'
+    if mime == 'text/vcard' or 'vcard' in uti_value:
+        return 'Contact card'
+    return 'Attachment'
+
+
+def _fetch_attachment_kinds(chat_con, msg_ids: Sequence[int]) -> Dict[int, str]:
+    """Map message ROWID -> a short label describing its attachments, e.g.
+    "Photo" or "3 photos". Attachment-only messages carry no text, so this
+    is the only thing the UI can show for them besides an empty bubble.
+
+    The `attachment` table's columns vary between macOS releases, so probe
+    for the ones we want and substitute literals for any that are missing
+    rather than failing the whole hydration with "no such column".
+    """
+    if not msg_ids:
+        return {}
+    available = {row[1] for row in chat_con.execute("PRAGMA im.table_info(attachment)")}
+    if not available:
+        return {}
+    mime_expr = "a.mime_type" if "mime_type" in available else "NULL"
+    uti_expr = "a.uti" if "uti" in available else "NULL"
+    sticker_expr = "COALESCE(a.is_sticker, 0)" if "is_sticker" in available else "0"
+
+    kinds: Dict[int, str] = {}
+    for start in range(0, len(msg_ids), _SQLITE_VARIABLE_BATCH):
+        batch = msg_ids[start:start + _SQLITE_VARIABLE_BATCH]
+        placeholders = ",".join("?" for _ in batch)
+        by_message: Dict[int, List[str]] = {}
+        for message_id, mime_type, uti, is_sticker in chat_con.execute(
+            f"""
+            SELECT maj.message_id, {mime_expr}, {uti_expr}, {sticker_expr}
+            FROM im.message_attachment_join maj
+            JOIN im.attachment a ON a.ROWID = maj.attachment_id
+            WHERE maj.message_id IN ({placeholders})
+            """,
+            list(batch),
+        ):
+            by_message.setdefault(message_id, []).append(
+                _attachment_label(mime_type, uti, is_sticker)
+            )
+        for message_id, labels in by_message.items():
+            if len(labels) == 1:
+                kinds[message_id] = labels[0]
+            elif len(set(labels)) == 1:
+                kinds[message_id] = f'{len(labels)} {labels[0].lower()}s'
+            else:
+                kinds[message_id] = f'{len(labels)} attachments'
+    return kinds
 
 
 def hydrate_sessions(
@@ -101,6 +177,7 @@ def _hydrate_chunks(
     if not msg_ids:
         return []
     msg_placeholders = ",".join("?" for _ in msg_ids)
+    attachment_kinds = _fetch_attachment_kinds(chat_con, msg_ids)
     query = f"""
         SELECT m.ROWID, m.text, m.attributedBody, m.date, m.is_from_me, h.id,
                EXISTS (SELECT 1 FROM im.message_attachment_join maj WHERE maj.message_id = m.ROWID)
@@ -124,6 +201,7 @@ def _hydrate_chunks(
                 sender=sender,
                 text=text,
                 has_attachment=bool(has_attachment),
+                attachment_kind=attachment_kinds.get(rowid) if has_attachment else None,
             )
         )
     return messages

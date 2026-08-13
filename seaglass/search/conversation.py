@@ -5,7 +5,7 @@ from typing import Optional
 from seaglass.imessage.attributedbody import decode_attributed_body
 from seaglass.imessage.contacts import ContactIndex
 from seaglass.imessage.source import apple_to_unix
-from seaglass.search.hydrate import HydratedMessage, _resolve_sender
+from seaglass.search.hydrate import HydratedMessage, _fetch_attachment_kinds, _resolve_sender
 
 
 def fetch_conversation(
@@ -61,10 +61,12 @@ def fetch_conversation(
         ).fetchall()
 
     messages = []
+    attachment_kinds = _fetch_attachment_kinds(chat_con, [row[0] for row in rows])
     for rowid, text, attributed_body, date, is_from_me, handle in rows:
         if not text and attributed_body:
             text = decode_attributed_body(attributed_body)
         sender = _resolve_sender(is_from_me, handle, contact_index)
+        kind = attachment_kinds.get(rowid)
         messages.append(
             HydratedMessage(
                 message_id=rowid,
@@ -72,7 +74,8 @@ def fetch_conversation(
                 is_from_me=bool(is_from_me),
                 sender=sender,
                 text=text,
-                has_attachment=False,
+                has_attachment=kind is not None,
+                attachment_kind=kind,
             )
         )
 
@@ -87,6 +90,8 @@ def fetch_conversation(
                 "is_from_me": m.is_from_me,
                 "sender": m.sender,
                 "text": m.text,
+                "has_attachment": m.has_attachment,
+                "attachment_kind": m.attachment_kind,
             }
             for m in messages
         ],

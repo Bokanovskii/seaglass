@@ -41,6 +41,7 @@ def _format_message(message: HydratedMessage, redact: bool) -> dict:
         "sender": _redact(message.sender) if redact else message.sender,
         "text": _redact(message.text) if redact else message.text,
         "has_attachment": message.has_attachment,
+        "attachment_kind": message.attachment_kind,
     }
 
 

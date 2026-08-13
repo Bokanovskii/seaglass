@@ -54,7 +54,15 @@ def build_fixture_chat_db(tmp_path, chats):
         CREATE TABLE chat_message_join (chat_id INTEGER, message_id INTEGER);
         CREATE TABLE chat_handle_join (chat_id INTEGER, handle_id INTEGER);
         CREATE TABLE handle (ROWID INTEGER PRIMARY KEY, id TEXT);
-        CREATE TABLE attachment (ROWID INTEGER PRIMARY KEY, filename TEXT);
+        CREATE TABLE attachment (
+            ROWID INTEGER PRIMARY KEY,
+            filename TEXT,
+            uti TEXT,
+            mime_type TEXT,
+            transfer_name TEXT,
+            total_bytes INTEGER,
+            is_sticker INTEGER
+        );
         CREATE TABLE message_attachment_join (message_id INTEGER, attachment_id INTEGER);
         """
     )

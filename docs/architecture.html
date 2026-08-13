@@ -390,6 +390,7 @@
         <tr><td>Dense</td><td><code>sqlite-vec</code> int8 cosine KNN over <code>chunks_vec</code>, constrained to the pre-filter set if present</td><td>200</td></tr>
         <tr><td>Sparse</td><td>FTS5 BM25 over <code>chunks_fts</code> (porter/unicode61 tokenizer), same constraint</td><td>200</td></tr>
         <tr><td>Fuse</td><td>Reciprocal Rank Fusion, <code>k=60</code></td><td>50 (<code>FUSED_TOP_K</code>)</td></tr>
+        <tr><td>Recency reserve</td><td>Last 10 of the 50 fused slots (<code>RECENCY_RESERVED_SLOTS</code>) are refilled with the <em>newest</em> matched chunks not already present</td><td>50 (unchanged)</td></tr>
       </table>
       <div class="callout warn">
         <strong>Note:</strong> FTS5's <code>bm25()</code> returns <em>negative</em>
@@ -400,6 +401,18 @@
         <strong>Note:</strong> <code>sqlite-vec</code>'s int8 column type will silently
         misinterpret a bare blob parameter as float32 — every insert/query wraps the vector with
         <code>vec_int8(...)</code> explicitly.
+      </div>
+      <div class="callout decision">
+        <strong>Why reserve slots for recency instead of weighting it into RRF?</strong>
+        BM25 ordering among hundreds of near-identical matches is essentially arbitrary — a
+        one-word message sent today landed at sparse rank 171 of 228 for the query
+        <em>"sweet"</em>, and <code>1/(60+171)</code> can never reach the fused top 50.
+        Adding a weighted recency arm to RRF was measured first: the target only entered the
+        pool at <code>recency_weight = 1.0</code>, i.e. recency made fully co-equal with
+        relevance, which distorts every other query. Reserved slots are bounded instead — the
+        top 40 stay purely relevance-ordered, the candidate count stays exactly 50 so the
+        reranker's cost is unchanged, and unused slack is handed back to the fusion ranking so
+        the list is never short.
       </div>
     </section>
 
@@ -412,16 +425,39 @@
         <li><strong>Cross-encoder rerank</strong> (<code>ms-marco-MiniLM-L-12-v2</code>) scores each of
         the 50 fused candidates against the query text directly (not just embedding similarity),
         cut to top 12 (<code>RERANK_TOP_K</code>). The model is run in eval mode for deterministic
-        scoring.
+        scoring. The last 3 of those 12 slots (<code>RERANK_RECENT_SLOTS</code>) are reserved for
+        the newest candidates — every fused candidate is scored in the same batched forward pass
+        regardless of the cut, so this costs no extra model compute; it only decides which
+        already-scored chunks are allowed to reach aggregation.
         </li>
         <li><strong>Session aggregation</strong> groups the top-12 reranked chunks by
         <code>(chat_id, local calendar day)</code> — approximating "that day we talked about X" —
         into up to 8 sessions (<code>MAX_SESSIONS</code>), combining member-chunk scores per session.
         </li>
+        <li><strong>Recency shaping</strong> multiplies each session's score by
+        <code>1 + 0.6 &times; 0.5<sup>age / 365d</sup></code> (<code>RECENCY_MAX_BOOST</code>,
+        <code>RECENCY_HALF_LIFE_DAYS</code>), so a session from today is worth up to 1.6&times; one
+        from the distant past. Bounded on purpose: this breaks ties between comparably relevant
+        sessions rather than letting a weak recent match outrank a strong old one. Two of the eight
+        session slots (<code>RECENT_SESSION_SLOTS</code>) are then reserved for the newest matches.
+        </li>
         <li><strong>Expansion</strong> pads each session with ±2 time-adjacent chunks
         (<code>EXPANSION_RADIUS</code>) for conversational context, even if those chunks weren't
         independently retrieved.</li>
       </ol>
+      <div class="callout decision">
+        <strong>Why recency needs reserved slots and not just a multiplier.</strong>
+        The cross-encoder scores a whole conversation <em>chunk</em>, so a query matching one
+        short message inside a long window scores terribly: a message sent today reading exactly
+        <em>"Sweet"</em> sits in a 22-message chunk that the reranker scored <code>-4.89</code>
+        (sigmoid <code>0.0075</code>) for the query <em>"sweet"</em> — rank 32 of 50. No bounded
+        recency multiplier can rescue that, so relevance alone would let the user conclude search
+        simply cannot find what they just typed. Note the sparse/BM25 arm <em>did</em> find that
+        chunk; the lexical signal is what gets discarded once the cross-encoder takes over. The
+        reservations at all three stages (candidate pool → rerank cut → session slots) form one
+        chain that puts it back, each bounded so the majority of every result list stays purely
+        relevance-ordered.
+      </div>
       <div class="callout decision">
         Day-boundary grouping uses the <strong>local system timezone</strong>, not UTC — a deliberate
         judgment call since <code>chat.db</code> timestamps carry no stored timezone of their own, and
@@ -585,11 +621,11 @@ const PIPELINE_STAGES = [
     }
   },
   {
-    id: "rrf", label: "RRF Fuse", sub: "k=60, top 50", x: 480, w: 120,
+    id: "rrf", label: "RRF Fuse + Recency Reserve", sub: "k=60, top 50", x: 480, w: 120,
     detail: {
       title: "Reciprocal Rank Fusion",
       file: "seaglass/search/retrieve.py",
-      body: "Combines dense + sparse rankings into one fused list of the top 50 (FUSED_TOP_K) chunk_ids via RRF with k=60. This is the baseline retriever, deliberately evaluated on its own before rerank/aggregation were added."
+      body: "Combines dense + sparse rankings into one fused list of the top 50 (FUSED_TOP_K) chunk_ids via RRF with k=60. This is the baseline retriever, deliberately evaluated on its own before rerank/aggregation were added. The last 10 slots (RECENCY_RESERVED_SLOTS) are then refilled with the newest matched chunks, so a recent message buried at BM25 rank 171 still reaches the reranker — the count stays exactly 50, so rerank cost is unchanged."
     }
   },
   {
@@ -597,15 +633,15 @@ const PIPELINE_STAGES = [
     detail: {
       title: "rerank_candidates(...)",
       file: "seaglass/search/rank.py + rerank.py",
-      body: "ms-marco-MiniLM-L-12-v2 cross-encoder scores each of the 50 fused candidates directly against the query, cut to top 12. Runs in eval mode for deterministic scoring."
+      body: "ms-marco-MiniLM-L-12-v2 cross-encoder scores each of the 50 fused candidates directly against the query, cut to top 12. Runs in eval mode for deterministic scoring. All 50 are scored in one batched forward pass regardless of the cut, so reserving the last 3 slots (RERANK_RECENT_SLOTS) for the newest candidates costs no extra compute."
     }
   },
   {
-    id: "aggregate", label: "Session Aggregate + Expand", sub: "rank.py, max 8 sessions", x: 810, w: 150,
+    id: "aggregate", label: "Session Aggregate + Recency + Expand", sub: "rank.py, max 8 sessions", x: 810, w: 150,
     detail: {
       title: "aggregate_sessions(...) + expand_sessions(...)",
       file: "seaglass/search/rank.py",
-      body: "Groups top-12 reranked chunks by (chat_id, local calendar day) into up to 8 sessions, combining member-chunk scores per session, then pads each with ±2 time-adjacent chunks for context."
+      body: "Groups top-12 reranked chunks by (chat_id, local calendar day) into up to 8 sessions, combining member-chunk scores per session. Each session score is then multiplied by a bounded recency factor (up to 1.6x for today, 365-day half-life) and 2 of the 8 slots are reserved for the newest matches. Finally each session is padded with ±2 time-adjacent chunks for context."
     }
   }
 ];

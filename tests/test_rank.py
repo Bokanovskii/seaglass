@@ -181,3 +181,97 @@ class TestExpandSessions:
         # no crash, no negative-index wraparound; only forward neighbors
         assert set(session.context_chunk_ids).issubset(set(all_ids))
         assert first_id not in session.context_chunk_ids
+
+
+class TestRecencyShaping:
+    """Recency is a first-class ranking signal (see rank.py's
+    RECENCY_MAX_BOOST / RECENT_SESSION_SLOTS / RERANK_RECENT_SLOTS).
+    """
+
+    def test_multiplier_decays_from_max_boost_to_one(self):
+        from seaglass.search.rank import (
+            RECENCY_HALF_LIFE_DAYS,
+            RECENCY_MAX_BOOST,
+            _recency_multiplier,
+        )
+
+        now = 1_700_000_000.0
+        day = 86400.0
+        assert _recency_multiplier(now, now) == pytest.approx(1 + RECENCY_MAX_BOOST)
+        half = _recency_multiplier(now - RECENCY_HALF_LIFE_DAYS * day, now)
+        assert half == pytest.approx(1 + RECENCY_MAX_BOOST / 2)
+        # far past decays toward a no-op multiplier, never below 1.0
+        ancient = _recency_multiplier(now - 100 * 365 * day, now)
+        assert 1.0 <= ancient < 1.01
+        # future timestamps (clock skew) must not amplify beyond the cap
+        assert _recency_multiplier(now + 10 * day, now) <= 1 + RECENCY_MAX_BOOST
+
+    def test_recent_session_wins_ties_but_not_blowouts(self):
+        now = 1_700_000_000.0
+        day = 86400.0
+        old = int(now - 3000 * day)
+        recent = int(now - day)
+
+        # comparable relevance -> recency decides
+        tied = [
+            RankedChunk(chunk_id=1, chat_id=1, start_ts=old, rerank_score=1.0),
+            RankedChunk(chunk_id=2, chat_id=2, start_ts=recent, rerank_score=1.0),
+        ]
+        ordered = aggregate_sessions(tied, now=now, recent_slots=0)
+        assert ordered[0].chat_id == 2
+
+        # a far stronger old match still wins: recency is bounded
+        lopsided = [
+            RankedChunk(chunk_id=1, chat_id=1, start_ts=old, rerank_score=8.0),
+            RankedChunk(chunk_id=2, chat_id=2, start_ts=recent, rerank_score=-8.0),
+        ]
+        ordered = aggregate_sessions(lopsided, now=now, recent_slots=0)
+        assert ordered[0].chat_id == 1
+
+    def test_reserved_slots_admit_recent_low_scoring_session(self):
+        now = 1_700_000_000.0
+        day = 86400.0
+        # 8 strong old sessions would fill every slot on relevance alone
+        ranked = [
+            RankedChunk(chunk_id=i, chat_id=i, start_ts=int(now - (2000 + i) * day), rerank_score=6.0)
+            for i in range(1, 9)
+        ]
+        today = RankedChunk(chunk_id=99, chat_id=99, start_ts=int(now), rerank_score=-6.0)
+
+        without = aggregate_sessions(ranked + [today], now=now, recent_slots=0)
+        assert 99 not in {s.chat_id for s in without}
+
+        with_slots = aggregate_sessions(ranked + [today], now=now, recent_slots=2)
+        assert 99 in {s.chat_id for s in with_slots}
+        # bounded: the reservation never costs more than `slots` results,
+        # and the result set stays the same size and duplicate-free
+        assert len(with_slots) == 8
+        chat_ids = [s.chat_id for s in with_slots]
+        assert len(set(chat_ids)) == len(chat_ids)
+
+    def test_reservation_is_a_noop_when_nothing_is_displaced(self):
+        now = 1_700_000_000.0
+        ranked = [
+            RankedChunk(chunk_id=i, chat_id=i, start_ts=int(now), rerank_score=float(i))
+            for i in range(1, 4)
+        ]
+        assert aggregate_sessions(ranked, now=now, recent_slots=2) == aggregate_sessions(
+            ranked, now=now, recent_slots=0
+        )
+
+    def test_rerank_cut_reserves_slots_for_newest_candidates(self):
+        from seaglass.search.rank import _reserve_recent_chunks
+
+        # (chunk_id, score) descending by score; by_id[cid][2] is start_ts
+        by_score = [(i, 10.0 - i) for i in range(10)]
+        by_id = {i: (i, 1, i * 1000, b"") for i in range(10)}  # newest == highest id
+
+        picked = _reserve_recent_chunks(by_score, by_id, top_k=5, slots=2)
+        ids = [cid for cid, _ in picked]
+        assert len(ids) == 5 and len(set(ids)) == 5
+        assert ids[:3] == [0, 1, 2]  # top-(top_k - slots) purely by score
+        assert set(ids[3:]) == {9, 8}  # newest of the remainder
+
+        # degenerate cases return the plain top-k
+        assert _reserve_recent_chunks(by_score, by_id, top_k=5, slots=0) == by_score[:5]
+        assert _reserve_recent_chunks(by_score[:3], by_id, top_k=5, slots=2) == by_score[:3]

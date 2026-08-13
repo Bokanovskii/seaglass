@@ -13,6 +13,7 @@ from seaglass.search.retrieve import (
     dense_search,
     resolve_participant_chat_ids,
     retrieve,
+    RetrievalResult,
     rrf_fuse,
     sparse_search,
 )
@@ -184,3 +185,77 @@ class TestRetrieveEndToEnd:
             assert False, "expected RuntimeError"
         except RuntimeError as error:
             assert "int8_absmax" in str(error)
+
+
+class TestReserveRecentSlots:
+    """The newest matched chunks must reach the reranker even when fusion
+    buries them (see retrieve.py's RECENCY_RESERVED_SLOTS).
+    """
+
+    @staticmethod
+    def _index(tmp_path):
+        # one chat per day so the build produces plenty of distinct chunks
+        chats = [
+            {
+                "chat_id": n,
+                "handles": [f"+1555111{n:04d}"],
+                "messages": [
+                    (f"day {n} planning notes", APPLE_EPOCH_START + n * 86400, False, 0),
+                    (f"day {n} follow up", APPLE_EPOCH_START + n * 86400 + 30, True, 0),
+                ],
+            }
+            for n in range(1, 9)
+        ]
+        chat_db_path = build_fixture_chat_db(tmp_path, chats)
+        index_db_path = tmp_path / "index.db"
+        build_index(chat_db_path, index_db_path, embedding_model=FakeEmbeddingModel(), batch_size=10)
+        return open_index_db(index_db_path)
+
+    def test_recent_match_is_promoted_into_the_candidate_pool(self, tmp_path):
+        from seaglass.search.retrieve import recency_ranked, reserve_recent_slots
+
+        con = self._index(tmp_path)
+        matched = [row[0] for row in con.execute("SELECT id FROM chunks").fetchall()]
+        assert len(matched) >= 3, "fixture needs several chunks to exercise displacement"
+
+        by_recency = recency_ranked(con, matched)
+        newest = by_recency[0]
+        # fusion ranks the newest chunk dead last
+        fused = [
+            RetrievalResult(chunk_id=cid, rrf_score=1.0 / (i + 1))
+            for i, cid in enumerate([c for c in matched if c != newest] + [newest])
+        ]
+        top_k = len(fused) - 1
+
+        without = reserve_recent_slots(con, fused, matched, top_k=top_k, slots=0)
+        assert newest not in {r.chunk_id for r in without}
+
+        with_slots = reserve_recent_slots(con, fused, matched, top_k=top_k, slots=2)
+        ids = [r.chunk_id for r in with_slots]
+        assert newest in ids
+        # the reranker's cost must not change: exactly top_k, no duplicates
+        assert len(ids) == top_k
+        assert len(set(ids)) == len(ids)
+        # the head of the list stays purely relevance-ordered
+        assert ids[: top_k - 2] == [r.chunk_id for r in fused[: top_k - 2]]
+
+    def test_slack_falls_back_to_fusion_ranking(self, tmp_path):
+        from seaglass.search.retrieve import reserve_recent_slots
+
+        con = self._index(tmp_path)
+        all_ids = [row[0] for row in con.execute("SELECT id FROM chunks").fetchall()]
+        fused = [RetrievalResult(chunk_id=cid, rrf_score=1.0 / (i + 1)) for i, cid in enumerate(all_ids)]
+
+        # only one chunk is a real match, so most reserved slots go unused
+        result = reserve_recent_slots(con, fused, all_ids[:1], top_k=len(all_ids), slots=5)
+        ids = [r.chunk_id for r in result]
+        assert len(ids) == len(all_ids), "must never return a short candidate list"
+        assert set(ids) == set(all_ids)
+
+    def test_noop_when_pool_already_fits(self, tmp_path):
+        from seaglass.search.retrieve import reserve_recent_slots
+
+        con = self._index(tmp_path)
+        all_ids = [row[0] for row in con.execute("SELECT id FROM chunks").fetchall()]
+        fused = [RetrievalResult(chunk_id=cid, rrf_score=1.0 / (i + 1)) for i, cid in enumerate(all_ids)]
+        assert reserve_recent_slots(con, fused, all_ids, top_k=len(all_ids) + 10, slots=3) == fused

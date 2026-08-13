@@ -20,8 +20,9 @@ ADDENDUM.md as a judgment call.
 from __future__ import annotations
 
 import dataclasses
+import time
 from datetime import datetime
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import zstandard
 
@@ -29,8 +30,38 @@ from seaglass.search.rerank import CrossEncoderReranker
 from seaglass.search.retrieve import RetrievalResult
 
 RERANK_TOP_K = 12
+# Slots (out of RERANK_TOP_K) reserved for the newest candidates. Every
+# fused candidate is scored in the same batched forward pass regardless of
+# the cut, so widening this costs no extra model compute -- it only decides
+# which scored chunks are allowed to reach session aggregation. Without it
+# the recency shaping below is unreachable for any chunk the cross-encoder
+# happens to rate poorly (see RECENT_SESSION_SLOTS).
+RERANK_RECENT_SLOTS = 3
 EXPANSION_RADIUS = 2
 MAX_SESSIONS = 8
+
+# Recency shaping for the final session ordering. A session's relevance
+# score is multiplied by 1 + RECENCY_MAX_BOOST * 0.5**(age / half-life),
+# i.e. a session from today is worth up to 1.6x one from the distant past.
+# Bounded on purpose: recency should break ties between comparably
+# relevant sessions, not let a weak recent match outrank a strong old one.
+RECENCY_HALF_LIFE_DAYS = 365.0
+RECENCY_MAX_BOOST = 0.6
+
+# Sessions (out of MAX_SESSIONS) reserved for the most recent matches.
+#
+# The cross-encoder scores a whole conversation *chunk*, so a query that
+# matches one short message inside a long window scores terribly -- a
+# message sent today reading exactly "Sweet" sits in a 22-message chunk
+# that scores -4.89 for the query "sweet". Relevance alone therefore can
+# never surface it, no matter how large a recency multiplier is applied,
+# and the user concludes search simply cannot find what they just said.
+#
+# The sparse/BM25 arm *did* find that chunk -- that signal is what gets
+# thrown away at ranking time. Reserving a small number of slots for the
+# newest matched sessions puts it back, bounded so the majority of results
+# stay purely relevance-ordered.
+RECENT_SESSION_SLOTS = 2
 
 _dctx = zstandard.ZstdDecompressor()
 
@@ -62,6 +93,8 @@ def rerank_candidates(
     fused: Sequence[RetrievalResult],
     reranker: CrossEncoderReranker,
     top_k: int = RERANK_TOP_K,
+    *,
+    recent_slots: int = RERANK_RECENT_SLOTS,
 ) -> List[RankedChunk]:
     """Step 5: score every fused candidate against `query` in one batched
     forward pass, return the top `top_k` by rerank score (descending).
@@ -93,7 +126,8 @@ def rerank_candidates(
         return []
 
     scores = reranker.score(pairs)
-    ranked = sorted(zip(ordered_ids, scores), key=lambda pair: pair[1], reverse=True)[:top_k]
+    by_score = sorted(zip(ordered_ids, scores), key=lambda pair: pair[1], reverse=True)
+    ranked = _reserve_recent_chunks(by_score, by_id, top_k=top_k, slots=recent_slots)
 
     result: List[RankedChunk] = []
     for chunk_id, score in ranked:
@@ -102,6 +136,30 @@ def rerank_candidates(
             RankedChunk(chunk_id=chunk_id, chat_id=chat_id, start_ts=start_ts, rerank_score=score)
         )
     return result
+
+
+def _reserve_recent_chunks(
+    by_score: Sequence[Tuple[int, float]],
+    by_id: Dict[int, tuple],
+    *,
+    top_k: int,
+    slots: int,
+) -> List[Tuple[int, float]]:
+    """Take the top `top_k - slots` candidates by rerank score, then fill
+    the remaining slots with the newest of whatever is left. Always returns
+    exactly min(top_k, len(by_score)) distinct candidates.
+    """
+    if slots <= 0 or len(by_score) <= top_k:
+        return list(by_score[:top_k])
+
+    keep = max(0, top_k - slots)
+    selected = list(by_score[:keep])
+    chosen = {chunk_id for chunk_id, _ in selected}
+
+    remainder = [pair for pair in by_score[keep:] if pair[0] not in chosen]
+    remainder.sort(key=lambda pair: by_id[pair[0]][2], reverse=True)
+    selected.extend(remainder[: top_k - len(selected)])
+    return selected
 
 
 def _sigmoid(logit: float) -> float:
@@ -117,14 +175,34 @@ def _sigmoid(logit: float) -> float:
     return 1.0 / (1.0 + math.exp(-logit))
 
 
-def aggregate_sessions(ranked: Sequence[RankedChunk], max_sessions: int = MAX_SESSIONS) -> List[Session]:
+def _recency_multiplier(ts: float, now: float) -> float:
+    """Exponential-decay boost in (1, 1 + RECENCY_MAX_BOOST]. Clamped at
+    age >= 0 so a message with a slightly future timestamp (clock skew
+    between devices is common in chat.db) can't earn an outsized boost.
+    """
+    age_days = max(0.0, (now - ts) / 86400.0)
+    return 1.0 + RECENCY_MAX_BOOST * (0.5 ** (age_days / RECENCY_HALF_LIFE_DAYS))
+
+
+def aggregate_sessions(
+    ranked: Sequence[RankedChunk],
+    max_sessions: int = MAX_SESSIONS,
+    *,
+    now: Optional[float] = None,
+    recent_slots: int = RECENT_SESSION_SLOTS,
+) -> List[Session]:
     """Step 6a: dedup by chunk_id (a chunk can only appear once in `ranked`
     already, since it came from a single top-k rerank pass, but this stays
     defensive) then group by `(chat_id, day)`, summing each chunk's
-    sigmoid-mapped rerank score (see `_sigmoid`). Returns sessions sorted
-    by score descending, capped at `max_sessions`.
+    sigmoid-mapped rerank score (see `_sigmoid`), then scaling by how
+    recent the session is (see `_recency_multiplier`). Returns sessions
+    sorted by score descending, capped at `max_sessions`.
+
+    `now` is injectable so tests are deterministic.
     """
+    now = time.time() if now is None else now
     groups: Dict[Tuple[int, str], Session] = {}
+    latest_ts: Dict[Tuple[int, str], float] = {}
     seen_chunk_ids: set = set()
     for chunk in ranked:
         if chunk.chunk_id in seen_chunk_ids:
@@ -139,9 +217,46 @@ def aggregate_sessions(ranked: Sequence[RankedChunk], max_sessions: int = MAX_SE
             groups[key] = session
         session.score += _sigmoid(chunk.rerank_score)
         session.hit_chunk_ids.append(chunk.chunk_id)
+        latest_ts[key] = max(latest_ts.get(key, 0.0), float(chunk.start_ts))
+
+    for key, session in groups.items():
+        session.score *= _recency_multiplier(latest_ts[key], now)
 
     sessions = sorted(groups.values(), key=lambda s: s.score, reverse=True)
-    return sessions[:max_sessions]
+    return _reserve_recent_sessions(
+        sessions, latest_ts, max_sessions=max_sessions, slots=recent_slots
+    )
+
+
+def _reserve_recent_sessions(
+    sessions: List[Session],
+    latest_ts: Dict[Tuple[int, str], float],
+    *,
+    max_sessions: int,
+    slots: int,
+) -> List[Session]:
+    """Keep the top relevance-ranked sessions, but guarantee the newest
+    matches a place in the results. See RECENT_SESSION_SLOTS.
+    """
+    if slots <= 0 or len(sessions) <= max_sessions:
+        return sessions[:max_sessions]
+
+    keep = max(0, max_sessions - slots)
+    selected = sessions[:keep]
+    selected_keys = {(s.chat_id, s.day) for s in selected}
+
+    newest = sorted(
+        (s for s in sessions if (s.chat_id, s.day) not in selected_keys),
+        key=lambda s: latest_ts[(s.chat_id, s.day)],
+        reverse=True,
+    )
+    for session in newest[: max_sessions - len(selected)]:
+        selected.append(session)
+        selected_keys.add((session.chat_id, session.day))
+
+    # Re-sort so the reserved entries slot into a sensible order rather
+    # than always appearing last.
+    return sorted(selected, key=lambda s: s.score, reverse=True)[:max_sessions]
 
 
 def expand_sessions(index_con, sessions: Sequence[Session], radius: int = EXPANSION_RADIUS) -> None:

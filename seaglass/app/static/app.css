@@ -790,7 +790,13 @@ input[type="date"]:not(:focus)::-webkit-datetime-edit-month-field,
 input[type="date"]:not(:focus)::-webkit-datetime-edit-day-field,
 input[type="date"]:not(:focus)::-webkit-datetime-edit-year-field { color: var(--text-muted); }
 
-.presets { display: flex; gap: 5px; }
+.presets { display: flex; gap: 5px; flex-wrap: wrap; }
+
+.date-summary {
+  font-size: var(--fs-sm);
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
 
 .presets button {
   flex: 1;
@@ -806,6 +812,12 @@ input[type="date"]:not(:focus)::-webkit-datetime-edit-year-field { color: var(--
 
 .presets button:hover { background: var(--accent-soft); color: var(--accent); border-color: var(--bubble-me-border); }
 .presets button:active { transform: translateY(1px); }
+.presets button.active,
+.presets button.active:hover {
+  background: var(--accent-soft);
+  color: var(--accent);
+  border-color: var(--bubble-me-border);
+}
 
 /* ---------- banners ---------- */
 
@@ -978,6 +990,46 @@ input[type="date"]:not(:focus)::-webkit-datetime-edit-year-field { color: var(--
 
 .card-hits { padding: var(--s3) var(--s4); display: flex; flex-direction: column; gap: 2px; }
 
+/* Long sessions (a hit inside a big group thread) could render an
+   arbitrarily tall card, pushing every other result off screen. Clamp to a
+   readable height and let the user expand. `.is-clamped` is only applied by
+   JS once the content is measured as actually overflowing, so short cards
+   never get a pointless "Show more". */
+.card-hits.is-clamped {
+  max-height: 22rem;
+  overflow: hidden;
+  position: relative;
+}
+
+.card-hits.is-clamped::after {
+  content: '';
+  position: absolute;
+  inset: auto 0 0 0;
+  height: 4.5rem;
+  pointer-events: none;
+  background: linear-gradient(to bottom, transparent, var(--surface));
+}
+
+.card-expand {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  width: 100%;
+  padding: 7px var(--s4);
+  font-size: var(--fs-sm);
+  font-weight: 550;
+  color: var(--text-secondary);
+  background: transparent;
+  border: 0;
+  border-top: 1px solid var(--border);
+  cursor: pointer;
+  transition: background var(--t-fast), color var(--t-fast);
+}
+
+.card-expand:hover { background: var(--surface-hover); color: var(--accent); }
+.card-expand .icon { transition: transform var(--t-fast); }
+.card-expand[aria-expanded="true"] .icon { transform: rotate(180deg); }
+
 .card-foot-row {
   display: flex;
   align-items: center;
@@ -1034,6 +1086,15 @@ input[type="date"]:not(:focus)::-webkit-datetime-edit-year-field { color: var(--
 .msg-time { font-size: var(--fs-xs); color: var(--text-muted); font-variant-numeric: tabular-nums; }
 .msg-clip { color: var(--text-muted); display: inline-flex; }
 .msg-clip .icon { width: 12px; height: 12px; }
+
+/* Placeholder shown in place of the text of an attachment-only message. */
+.msg-attachment {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--text-muted);
+  font-style: italic;
+}
 
 .msg-text {
   white-space: pre-wrap;

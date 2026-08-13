@@ -11,6 +11,7 @@ const state = {
   assist: 'auto',
   people: [],
   selectedChat: null,
+  datePreset: '',  // '' (All) | 'custom' | a day count, mirrors the preset buttons
   requestId: null,
   assistToken: null,
   results: [],
@@ -46,7 +47,8 @@ const els = {
   drawerContent: document.getElementById('drawer-content'),
   dateFrom: document.getElementById('date-from'),
   dateTo: document.getElementById('date-to'),
-  hasMedia: document.getElementById('has-media'),
+  dates: document.querySelector('.dates'),
+  dateSummary: document.getElementById('date-summary'),
 };
 
 async function api(path, options = {}) {
@@ -249,7 +251,9 @@ function buildFilters() {
     chat_ids: state.selectedChat ? [state.selectedChat.chat_id] : null,
     date_from: els.dateFrom.value ? new Date(`${els.dateFrom.value}T00:00:00`).getTime() / 1000 : null,
     date_to: els.dateTo.value ? new Date(`${els.dateTo.value}T23:59:59`).getTime() / 1000 : null,
-    has_media: els.hasMedia.checked ? true : null,
+    // No has_media here: a two-state toggle reads as "only with media" vs
+    // "only without", which is misleading. Assist can still infer the
+    // backend filter from a natural-language query like "photos from Ana".
   };
 }
 
@@ -261,7 +265,6 @@ function hasActiveFilters() {
     || filters.chat_ids
     || filters.date_from
     || filters.date_to
-    || filters.has_media
   );
 }
 
@@ -320,6 +323,55 @@ function renderResults(payload) {
   }
   els.results.innerHTML = payload.sessions.map((session, index) => renderSession(session, index)).join('');
   document.querySelectorAll('[data-chat-id]').forEach(link => link.addEventListener('click', openConversation));
+  applyHitClamping();
+}
+
+const CLAMP_SLACK_PX = 24;  // don't clamp for a sliver -- the toggle would cost more room than it saves
+
+// A hit inside a long group thread can render a card tall enough to push
+// every other result off screen. Clamp those, but only after measuring:
+// cards that fit get no "Show more" button at all.
+//
+// Safe to call repeatedly (it re-runs on resize, since a card that fits at
+// one window width can overflow at another): any existing toggle is
+// discarded and rebuilt, and a card the user explicitly expanded stays
+// expanded across re-measurement.
+function applyHitClamping() {
+  document.querySelectorAll('.card-hits').forEach(hits => {
+    const existing = hits.nextElementSibling;
+    if (existing && existing.classList.contains('card-expand')) existing.remove();
+
+    // Measure against the clamped height, then decide the final state.
+    hits.classList.add('is-clamped');
+    if (hits.scrollHeight <= hits.clientHeight + CLAMP_SLACK_PX) {
+      hits.classList.remove('is-clamped');
+      delete hits.dataset.expanded;
+      return;
+    }
+    if (hits.dataset.expanded === 'true') hits.classList.remove('is-clamped');
+
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'card-expand';
+    const paint = () => {
+      const clamped = hits.classList.contains('is-clamped');
+      button.innerHTML = `${iconSvg('i-chevron-down', 'icon icon-sm')} <span>${clamped ? 'Show more' : 'Show less'}</span>`;
+      button.setAttribute('aria-expanded', String(!clamped));
+    };
+    paint();
+    button.addEventListener('click', () => {
+      const clamped = hits.classList.toggle('is-clamped');
+      hits.dataset.expanded = String(!clamped);
+      paint();
+      // Re-collapsing from far down a long card would otherwise leave the
+      // viewport somewhere below the card entirely.
+      if (clamped) {
+        const card = hits.closest('.result-card');
+        if (card && card.getBoundingClientRect().top < 0) card.scrollIntoView({block: 'start'});
+      }
+    });
+    hits.insertAdjacentElement('afterend', button);
+  });
 }
 
 function renderSession(session, index) {
@@ -346,10 +398,16 @@ function renderMessage(message) {
   const isMe = message.is_from_me || !message.sender;
   const sender = message.sender || 'Me';
   const clip = message.has_attachment ? `<span class="msg-clip" title="has attachment">${iconSvg('i-clip', 'icon icon-sm')}</span>` : '';
+  // Attachment-only messages (photos, stickers, audio notes) carry no text
+  // at all, so rendering `text` alone produced a blank bubble.
+  const hasText = Boolean((message.text || '').trim());
+  const body = hasText
+    ? highlight(message.text)
+    : `<span class="msg-attachment">${iconSvg('i-clip', 'icon icon-sm')} ${escapeHtml(message.attachment_kind || (message.has_attachment ? 'Attachment' : 'No text'))}</span>`;
   return `<div class="msg${isMe ? ' msg-me' : ''}">`
     + `<span class="msg-avatar" style="--avatar-h:${hueFor(sender)}" aria-hidden="true">${escapeHtml(initialsFor(sender))}</span>`
     + `<div class="msg-body"><div class="msg-head"><span class="msg-sender">${escapeHtml(sender)}</span><span class="msg-time">${formatTime(message.ts)}</span>${clip}</div>`
-    + `<div class="msg-text">${highlight(message.text || '')}</div></div></div>`;
+    + `<div class="msg-text">${body}</div></div></div>`;
 }
 
 function initialsFor(name) {
@@ -468,9 +526,7 @@ function clearFilters() {
   renderPeopleChips();
   els.peopleInput.value = '';
   els.chatInput.value = '';
-  els.dateFrom.value = '';
-  els.dateTo.value = '';
-  els.hasMedia.checked = false;
+  applyPreset('');
   document.querySelector('input[name="group"][value=""]').checked = true;
 }
 
@@ -486,16 +542,52 @@ function toLocalDateInputValue(date) {
   return `${year}-${month}-${day}`;
 }
 
+const PRESET_LABELS = {'7': 'Last 7 days', '30': 'Last 30 days', '90': 'Last 90 days', '365': 'Last year'};
+
+function formatDateInputValue(value) {
+  // Parse as local (see toLocalDateInputValue) so the label can't drift a
+  // day from what the input itself displays.
+  const date = new Date(`${value}T00:00:00`);
+  return Number.isNaN(date.getTime())
+    ? value
+    : date.toLocaleDateString(undefined, {month: 'short', day: 'numeric', year: 'numeric'});
+}
+
+function renderDateSummary() {
+  if (state.datePreset === 'custom') {
+    const from = els.dateFrom.value ? formatDateInputValue(els.dateFrom.value) : 'Anything';
+    const to = els.dateTo.value ? formatDateInputValue(els.dateTo.value) : 'now';
+    els.dateSummary.textContent = !els.dateFrom.value && !els.dateTo.value
+      ? 'All time'
+      : `${from} → ${to}`;
+    return;
+  }
+  els.dateSummary.textContent = PRESET_LABELS[state.datePreset] || 'All time';
+}
+
+// `days` is '' (All), 'custom', or a day count. The raw date inputs stay
+// hidden unless the range is custom: showing them for "All" meant the
+// control displayed a concrete day (today) even though no date filter was
+// actually applied, which read as an active filter when it wasn't.
 function applyPreset(days) {
+  state.datePreset = days;
+  document.querySelectorAll('.presets button').forEach(
+    button => button.classList.toggle('active', button.dataset.days === days)
+  );
+  els.dates.classList.toggle('hidden', days !== 'custom');
+
+  if (days === 'custom') {
+    renderDateSummary();
+    return;
+  }
   if (!days) {
     els.dateFrom.value = '';
     els.dateTo.value = '';
-    return;
+  } else {
+    els.dateFrom.value = toLocalDateInputValue(new Date(Date.now() - Number(days) * 86400 * 1000));
+    els.dateTo.value = toLocalDateInputValue(new Date());
   }
-  const end = new Date();
-  const start = new Date(Date.now() - Number(days) * 86400 * 1000);
-  els.dateFrom.value = toLocalDateInputValue(start);
-  els.dateTo.value = toLocalDateInputValue(end);
+  renderDateSummary();
 }
 
 function escapeHtml(value) {
@@ -522,6 +614,9 @@ els.peopleInput.addEventListener('input', debounce(suggestPeople, 150));
 els.chatInput.addEventListener('input', debounce(suggestChats, 150));
 document.getElementById('clear-filters').onclick = clearFilters;
 document.querySelectorAll('.presets button').forEach(button => button.onclick = () => applyPreset(button.dataset.days));
+[els.dateFrom, els.dateTo].forEach(input => input.addEventListener('change', renderDateSummary));
+// A card that fits at one window width can overflow at another.
+window.addEventListener('resize', debounce(applyHitClamping, 150));
 document.querySelectorAll('[data-drawer-close]').forEach(el => el.addEventListener('click', () => els.drawer.classList.add('hidden')));
 document.addEventListener('click', event => {
   const target = event.target;
@@ -539,10 +634,11 @@ function debounce(fn, delay) {
   };
 }
 
-// Date inputs should start empty (no implicit range filter) -- clear any
-// value WebKit's form-state restoration may have applied on load so a fresh
-// search never silently inherits a previous session's date range.
-els.dateFrom.value = '';
-els.dateTo.value = '';
+// Start on "All" (no implicit range filter): this also clears any value
+// WebKit's form-state restoration may have applied on load, marks the All
+// preset as selected, hides the raw date inputs and renders the "All time"
+// summary -- so a fresh search never silently inherits a previous
+// session's date range or *looks* like it has one.
+applyPreset('');
 
 pollHealth();
