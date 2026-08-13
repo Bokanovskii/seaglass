@@ -39,7 +39,26 @@ the architecture reference's performance section for the measured numbers.
   FTS5's `contentless_delete` support. Verified working with Homebrew's
   `python3.14`.
 
-## Setup
+## Quick start
+
+```bash
+git clone https://github.com/Bokanovskii/seaglass.git
+cd seaglass
+./setup.sh
+```
+
+That's it — this one script creates a venv, installs everything, runs a
+capability preflight (catches missing Full Disk Access etc. with a clear
+message), snapshots your `chat.db` safely, builds the index (first run
+only — safe to re-run any time to pick up new messages), and launches the
+desktop app. See `./setup.sh --help`-style comments at the top of the
+script for what each step does and how to override paths (e.g.
+`SEAGLASS_CHAT_DB_SRC`, `SEAGLASS_HOME`).
+
+## Manual setup
+
+If you'd rather run the steps yourself (e.g. for the MCP server only,
+without the desktop app):
 
 ```bash
 python3 -m venv .venv
@@ -77,16 +96,17 @@ development-plans/       # design docs (see Status above)
 
 ## Desktop app
 
-Install the app extras in the same venv you already use for seaglass:
+The quickest way to get the desktop app running is `./setup.sh` (see
+"Quick start" above) — it handles the venv, install, chat.db snapshot,
+index build, and launch in one command.
+
+To run it manually instead: install the app extras in the same venv you
+already use for seaglass, then point it at an index (build one with
+`seaglass build <chat_db_snapshot> <index_db>` if you don't have one yet):
 
 ```bash
 source .venv/bin/activate
 pip install -e ".[app,dev]"
-```
-
-Build an index first, then launch the desktop app:
-
-```bash
 seaglass-app --index-db /path/to/index.db --chat-db /path/to/chat.db
 ```
 
