@@ -188,6 +188,86 @@ class TestBuildIndex:
         ids = [row[0] for row in con.execute("SELECT id FROM chunks ORDER BY id")]
         assert ids == list(range(1, total_count + 1))
 
+    def test_new_messages_merged_into_an_existing_non_tail_chunk_are_indexed(self, tmp_path):
+        """Regression test: new messages arriving in a chat whose last
+        chunk was already committed used to be silently dropped, because
+        the old design skipped any chunk id <= build_cursor based purely
+        on global sequential *position*, with no way to notice that the
+        *content* at an already-committed position had changed. Here,
+        chat 1 is NOT the last chat touched (chat 2 exists after it), so
+        its tail chunk is a "non-last-globally" position -- exactly the
+        case that reproduced the user's "N new messages never clears"
+        bug: new messages land inside an already-chunked position rather
+        than appending as a brand new trailing chunk.
+        """
+        chat_db_path = _build_fixture_chat_db(tmp_path, n_chats=2, n_messages_per_chat=5)
+        index_db_path = tmp_path / "index.db"
+        model = FakeEmbeddingModel()
+        first = build_index(chat_db_path, index_db_path, embedding_model=model)
+        assert first > 0
+
+        con = open_index_db(index_db_path)
+        chat1_msg_count_before = con.execute(
+            "SELECT COUNT(*) FROM chunk_message cm JOIN chunks c ON c.id = cm.chunk_id "
+            "WHERE c.chat_id = 1"
+        ).fetchone()[0]
+        assert chat1_msg_count_before == 5
+
+        # Append 2 new messages to chat 1 (not the globally-last chat),
+        # close enough in time that the chunker merges them into the
+        # SAME existing chunk rather than opening a new one.
+        chat_con = sqlite3.connect(chat_db_path)
+        apple_epoch_seconds_start = 700000000
+        for i, rowid in enumerate((100, 101)):
+            date = apple_epoch_seconds_start + (5 + i) * 30
+            chat_con.execute(
+                "INSERT INTO message (ROWID, text, attributedBody, date, date_edited, "
+                "date_retracted, is_from_me, handle_id, associated_message_type) "
+                "VALUES (?, ?, NULL, ?, NULL, NULL, 0, 1, 0)",
+                (rowid, f"chat 1 new message {i}", date),
+            )
+            chat_con.execute(
+                "INSERT INTO chat_message_join (chat_id, message_id) VALUES (1, ?)", (rowid,)
+            )
+        chat_con.commit()
+        chat_con.close()
+
+        second = build_index(chat_db_path, index_db_path, embedding_model=model)
+        assert second > 0, "new messages merged into an existing chunk must still be written"
+
+        con = open_index_db(index_db_path)
+        chat1_msg_count_after = con.execute(
+            "SELECT COUNT(*) FROM chunk_message cm JOIN chunks c ON c.id = cm.chunk_id "
+            "WHERE c.chat_id = 1"
+        ).fetchone()[0]
+        assert chat1_msg_count_after == 7
+
+        # The rewritten chunk's rows must be consistent across all four
+        # derived tables (no stale duplicates, no orphans).
+        chunk_ids = [
+            row[0] for row in con.execute("SELECT id FROM chunks WHERE chat_id = 1")
+        ]
+        assert len(chunk_ids) == len(set(chunk_ids))
+        for cid in chunk_ids:
+            vec_count = con.execute(
+                "SELECT COUNT(*) FROM chunks_vec WHERE rowid = ?", (cid,)
+            ).fetchone()[0]
+            assert vec_count == 1
+            fts_count = con.execute(
+                "SELECT COUNT(*) FROM chunks_fts WHERE rowid = ?", (cid,)
+            ).fetchone()[0]
+            assert fts_count == 1
+
+        # New messages must actually be findable via FTS.
+        hits = con.execute(
+            "SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH 'new'"
+        ).fetchall()
+        assert len(hits) > 0
+
+        # A third, no-op build should now find nothing new.
+        third = build_index(chat_db_path, index_db_path, embedding_model=model)
+        assert third == 0
+
     def test_int8_embeddings_are_retrievable_via_constrained_knn(self, tmp_path):
         chat_db_path = _build_fixture_chat_db(tmp_path, n_chats=1, n_messages_per_chat=4)
         index_db_path = tmp_path / "index.db"

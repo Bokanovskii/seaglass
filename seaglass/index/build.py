@@ -5,21 +5,42 @@ Ties together extraction (imessage/source.py), chunking
 embedding (index/embed.py) into a crash-recoverable build of `index.db`.
 See development-plans/PLAN.md §6 Phase 3.
 
-**Crash recovery.** Chunks are assigned deterministic, stable ids: a
-simple 1-indexed position counter over a fixed global order (ascending
-`chat_id`, chronological within each chat). Regenerating from an
-unchanged chat.db snapshot always assigns the same id to the same
-chunk. Each batch of `BATCH_SIZE` chunks is written in one transaction
+**Crash recovery & incremental (Phase 7) sync.** Ids are per-chat-content
+identity, not a raw position: for each chat, `iter_pending_chunks`
+re-derives that chat's *current* chunk list from chat.db and compares it,
+chunk-by-chunk, against whatever is already committed in `chunks` for
+that `chat_id` (ordered by `id`, which increases monotonically with
+`start_ts` within a chat since message ROWIDs are globally chronological
+-- see schema.sql). Three outcomes per position:
+
+* identical `msg_ids` to what's already committed -> skip entirely, no
+  re-render, no re-embed of already-durable work.
+* the existing chunk at that position is the *tail* (last committed
+  chunk for that chat) and its `msg_ids` differ -> this is exactly the
+  case new messages arriving in an existing conversation produce: the
+  chunker merged them into what was previously the last chunk rather
+  than starting a new one. Rewritten in place, reusing the SAME `id`
+  (delete + reinsert across `chunks`, `chunk_message`, `chunks_vec`,
+  `chunks_fts`, atomically in the same batch transaction).
+* no existing chunk at that position -> brand new chunk, assigned the
+  next available id (`MAX(id) FROM chunks` + 1, monotonically
+  increasing within the run).
+
+This replaces an earlier, buggier design that assigned chunk ids from a
+single global sequential position counter and skipped any id
+`<= build_cursor` unconditionally -- that scheme silently dropped new
+messages whenever they landed in an already-chunked position (the
+common case for any chat that isn't the very last one touched) instead
+of appending as a new trailing chunk. `meta.build_cursor` is still kept
+as an informational high-water mark (`MAX(id) FROM chunks`), but is no
+longer used to decide what to skip.
+
+Each batch of `BATCH_SIZE` pending chunks is written in one transaction
 covering `chunks`, `chunk_message`, `chunks_vec`, then `chunks_fts` last
-(PLAN.md §6 Phase 3 ordering). `meta.build_cursor` is persisted only
-after a batch's transaction commits, so a crash mid-batch loses at most
-one in-flight, uncommitted batch -- never a partially-written one. On
-restart, `build_index` reconciles `build_cursor` against
-`MAX(id) FROM chunks` and trusts the data over the recorded cursor
-(PLAN.md's "verify the cursor ... and roll back any partial batch"),
-then re-walks the same deterministic order, skipping any chunk whose id
-is already `<= build_cursor` -- no re-embedding, no re-render, of
-already-durable work.
+(PLAN.md §6 Phase 3 ordering) -- rewrites additionally delete the old
+rows for that id from all four tables inside the same transaction, so a
+crash mid-batch loses at most one in-flight batch, never leaves a chunk
+half-deleted/half-rewritten.
 
 **Snapshot first.** Per PLAN.md §6 Phase 3, `chat_db_path` here should be
 a build-time copy, not the live database -- this module doesn't make the
@@ -67,6 +88,7 @@ class RenderedChunk:
     id: int
     body_semantic: str
     body_lexical: str
+    is_rewrite: bool = False
 
 
 def open_index_db(index_db_path: Path, *, check_same_thread: bool = True, create: bool = True) -> sqlite3.Connection:
@@ -105,10 +127,9 @@ def _set_meta(con: sqlite3.Connection, key: str, value: str) -> None:
 
 
 def _reconcile_build_cursor(con: sqlite3.Connection) -> int:
-    """Trust the data over the recorded cursor: if `chunks` contains rows
-    beyond the recorded `build_cursor` (which atomic per-batch commits
-    should prevent, but a hand-edited/corrupted index.db could produce),
-    advance the cursor to match rather than risk colliding ids.
+    """Keep `meta.build_cursor` as an informational high-water mark
+    (`MAX(id) FROM chunks`). No longer used to decide what to skip during
+    a build (see module docstring) -- only for status/observability.
     """
     recorded = int(_get_meta(con, "build_cursor") or 0)
     max_id_row = con.execute("SELECT MAX(id) FROM chunks").fetchone()
@@ -129,6 +150,13 @@ def iter_chunks_by_chat(
     deterministic order (ascending `chat_id`, chronological within each
     chat). `messages_by_id` covers only that chat's messages, fetched once
     per chat rather than once per chunk.
+
+    Pure re-derivation of the current chunk list from chat.db -- no
+    comparison against what's already in index.db. `build_index` uses
+    `iter_pending_chunks` (below) for the actual incremental-write
+    decision; this function remains a standalone building block (and is
+    exercised directly by tests) for "what would a full re-chunk of this
+    chat.db produce right now".
     """
     chunker_kwargs = chunker_kwargs or {}
     chat_ids = [
@@ -146,12 +174,96 @@ def iter_chunks_by_chat(
             yield chunk, messages_by_id
 
 
+@dataclasses.dataclass
+class PendingChunk:
+    """One chunk that needs (re-)writing this run, plus enough context to
+    decide whether it's a brand-new id or a rewrite of an existing one.
+    """
+
+    chunk: Chunk
+    messages_by_id: Dict[int, "source.Message"]
+    id: int
+    is_rewrite: bool  # True: reuse an existing id, deleting its old rows first
+
+
+def iter_pending_chunks(
+    chat_con: sqlite3.Connection,
+    index_con: sqlite3.Connection,
+    *,
+    chunker_kwargs: Optional[dict] = None,
+) -> Iterator[PendingChunk]:
+    """Per chat, re-derive the chat's current chunk list from chat.db and
+    diff it against what's already committed in `chunks` for that
+    `chat_id` (ordered by `id` -- monotonically increasing with `start_ts`
+    within a chat, since message ROWIDs are globally chronological).
+
+    Only chunks that are new or changed are yielded -- see module
+    docstring for the three possible outcomes per position. This is what
+    lets a sync correctly pick up new messages that got merged into an
+    already-committed chat's tail chunk, instead of silently skipping
+    them because their *position* was already <= some global cursor.
+    """
+    chunker_kwargs = chunker_kwargs or {}
+    next_id = (index_con.execute("SELECT MAX(id) FROM chunks").fetchone()[0] or 0) + 1
+
+    chat_ids = [
+        row[0]
+        for row in chat_con.execute(
+            "SELECT DISTINCT chat_id FROM im.chat_message_join ORDER BY chat_id"
+        )
+    ]
+    for chat_id in chat_ids:
+        messages = list(source.iter_messages(chat_con, chat_id=chat_id))
+        if not messages:
+            continue
+        messages_by_id = {m.rowid: m for m in messages}
+        fresh_chunks = list(chunk_messages(messages, **chunker_kwargs))
+
+        existing_rows = index_con.execute(
+            "SELECT id, group_concat(msg_id) FROM chunks c "
+            "JOIN chunk_message cm ON cm.chunk_id = c.id "
+            "WHERE c.chat_id = ? GROUP BY c.id ORDER BY c.id",
+            (chat_id,),
+        ).fetchall()
+        # chunk_message stores msg_ids unordered per chunk_id -- and even
+        # within a chat, message ROWID order does not always match
+        # chronological (ts) order in real chat.db data (edits/resends/
+        # sync artifacts can leave ROWIDs out of date order). Compare by
+        # *set* membership, not order, to decide "unchanged"; the actual
+        # rendered order always comes from `fresh.msg_ids` (chunker's
+        # chronological order), never from what's stored, so this is safe
+        # either way.
+        existing_msg_ids_by_position: List[Tuple[int, frozenset]] = [
+            (row_id, frozenset(int(x) for x in blob.split(",")))
+            for row_id, blob in existing_rows
+        ]
+
+        for position, fresh in enumerate(fresh_chunks):
+            if position < len(existing_msg_ids_by_position):
+                existing_id, existing_msg_ids = existing_msg_ids_by_position[position]
+                if existing_msg_ids == frozenset(fresh.msg_ids):
+                    continue  # unchanged, already durable -- skip
+                # Content at this position differs from what's committed
+                # -- either this is the tail chunk and new messages merged
+                # into it, or (rarer) chat.db content mutated (edit/
+                # retraction) shifting boundaries earlier than the tail.
+                # Either way, rewrite this id in place: safe because every
+                # downstream table keys off chunk id, and the delete-then-
+                # reinsert happens atomically within the batch transaction.
+                yield PendingChunk(fresh, messages_by_id, existing_id, is_rewrite=True)
+            else:
+                yield PendingChunk(fresh, messages_by_id, next_id, is_rewrite=False)
+                next_id += 1
+
+
 def _render_chunk(
     chunk_id: int,
     chunk: Chunk,
     messages_by_id: Dict[int, "source.Message"],
     attachments_by_msg: Dict[int, List["source.AttachmentRow"]],
     places_by_attachment: Dict[int, str],
+    *,
+    is_rewrite: bool = False,
 ) -> RenderedChunk:
     ordered_messages = [messages_by_id[mid] for mid in chunk.msg_ids]
     return RenderedChunk(
@@ -159,7 +271,9 @@ def _render_chunk(
         id=chunk_id,
         body_semantic=render.format_semantic(ordered_messages),
         body_lexical=render.format_lexical(ordered_messages, attachments_by_msg, places_by_attachment),
+        is_rewrite=is_rewrite,
     )
+
 
 
 def _resolve_places(
@@ -225,9 +339,24 @@ def _write_batch(
 ) -> None:
     """Write one batch inside a single transaction: chunks, chunk_message,
     chunks_vec, then chunks_fts last (PLAN.md §6 Phase 3 ordering).
+
+    For any `rendered.is_rewrite` entry, first deletes that id's existing
+    rows from all four tables -- required so a chat's tail chunk can be
+    "reopened and extended" (Phase 7) with the same id rather than
+    silently accumulating stale duplicate rows or being skipped.
+    `chunks_fts` is contentless (`contentless_delete=1`), so a plain
+    `DELETE ... WHERE rowid = ?` is sufficient there (no need to hand back
+    the original body).
     """
     index_con.execute("BEGIN")
     try:
+        rewrite_ids = [r.id for r in rendered_batch if r.is_rewrite]
+        for rid in rewrite_ids:
+            index_con.execute("DELETE FROM chunks WHERE id = ?", (rid,))
+            index_con.execute("DELETE FROM chunk_message WHERE chunk_id = ?", (rid,))
+            index_con.execute("DELETE FROM chunks_vec WHERE rowid = ?", (rid,))
+            index_con.execute("DELETE FROM chunks_fts WHERE rowid = ?", (rid,))
+
         for rendered, vector in zip(rendered_batch, embeddings_int8):
             compressed = compressor.compress(rendered.body_semantic.encode("utf-8"))
             index_con.execute(
@@ -255,7 +384,7 @@ def _write_batch(
                 "INSERT INTO chunks_fts (rowid, body) VALUES (?, ?)",
                 (rendered.id, rendered.body_lexical),
             )
-        last_id = rendered_batch[-1].id
+        last_id = max(r.id for r in rendered_batch)
         _set_meta(index_con, "build_cursor", str(last_id))
         index_con.execute("COMMIT")
     except Exception:
@@ -319,7 +448,6 @@ def build_index(
     calibrated = _get_meta(index_con, "int8_absmax") is not None
 
     compressor = zstandard.ZstdCompressor()
-    position = 0  # 1-indexed chunk id, stable across restarts
     chunks_written = 0
     batch: List[RenderedChunk] = []
     # IMPROVEMENT-11 fix: calibration must be computed from a real sample
@@ -331,15 +459,15 @@ def build_index(
     # calibrate once and flush everything buffered so far.
     pending_calibration: List[RenderedChunk] = []
 
-    for chunk, messages_by_id in iter_chunks_by_chat(chat_con, chunker_kwargs=chunker_kwargs):
-        position += 1
-        chunk_id = position
-        if chunk_id <= build_cursor:
-            continue  # already durably written in a prior run
+    for pending in iter_pending_chunks(chat_con, index_con, chunker_kwargs=chunker_kwargs):
+        chunk, messages_by_id, chunk_id = pending.chunk, pending.messages_by_id, pending.id
 
         attachments = source.fetch_attachments_for_messages(chat_con, chunk.msg_ids)
         places_by_attachment = _resolve_places(index_con, chunk_id, attachments)
-        rendered = _render_chunk(chunk_id, chunk, messages_by_id, attachments, places_by_attachment)
+        rendered = _render_chunk(
+            chunk_id, chunk, messages_by_id, attachments, places_by_attachment,
+            is_rewrite=pending.is_rewrite,
+        )
 
         if not calibrated:
             pending_calibration.append(rendered)
