@@ -65,6 +65,71 @@ def _normalise_handle(raw: str, region: str = DEFAULT_REGION) -> str:
     return normalised or raw
 
 
+
+def contacts_authorization_status() -> int:
+    """0=notDetermined 1=restricted 2=denied 3=authorized, -1 if unavailable."""
+    if _Contacts is None:
+        return -1
+    try:
+        return int(
+            _Contacts.CNContactStore.authorizationStatusForEntityType_(
+                _Contacts.CNEntityTypeContacts
+            )
+        )
+    except Exception:  # noqa: BLE001 - status is advisory only
+        return -1
+
+
+def request_contacts_access(timeout: float = 60.0) -> dict:
+    """Present the system Contacts prompt and report what happened.
+
+    Returns `status` (a CNAuthorizationStatus) plus `granted` and
+    `can_prompt`. `can_prompt` is False once the user has answered: macOS
+    only ever shows the prompt once, so from then on the only route is the
+    Settings pane, and the UI needs to know which of the two to offer.
+    """
+    status = contacts_authorization_status()
+    if status == 3:
+        return {'granted': True, 'status': status, 'can_prompt': False}
+    if status != 0:
+        # Already answered (denied/restricted) or unavailable: prompting
+        # again is a silent no-op, so don't pretend otherwise.
+        return {'granted': False, 'status': status, 'can_prompt': False}
+    store = _Contacts.CNContactStore.alloc().init()
+    _request_access(store, timeout=timeout)
+    status = contacts_authorization_status()
+    return {'granted': status == 3, 'status': status, 'can_prompt': False}
+
+
+def _request_access(store, timeout: float = 30.0) -> None:
+    """Ask for Contacts access and block until the user answers.
+
+    Enumerating without asking just returns an empty list for an app whose
+    grant is still undetermined -- which looks exactly like "you have no
+    contacts", and is how every sender ended up rendered as a raw phone
+    number the first time seaglass ran under its own app bundle identity
+    (grants are per app identity, so an .app inherits none of the terminal's).
+
+    Blocking matters: the completion handler fires on another thread, and
+    warmup goes on to enumerate immediately, so returning early would race
+    the user's answer and read an unauthorised store anyway.
+    """
+    import threading
+
+    answered = threading.Event()
+
+    def completion(granted, error):  # noqa: ANN001 - ObjC callback signature
+        answered.set()
+
+    try:
+        store.requestAccessForEntityType_completionHandler_(
+            _Contacts.CNEntityTypeContacts, completion
+        )
+        answered.wait(timeout)
+    except Exception:  # noqa: BLE001 - a prompt failure must not break startup
+        pass
+
+
 class ContactIndex:
     """In-memory contact roster, loaded once from the Contacts framework.
 
@@ -101,6 +166,11 @@ class ContactIndex:
                 "System Settings > Privacy & Security > Contacts"
             )
         store = _Contacts.CNContactStore.alloc().init()
+        if status == 0:
+            # Best effort only, with a short timeout: during warmup there is
+            # usually no Cocoa event loop yet to present the prompt on (see
+            # request_contacts_access), so this must not stall startup.
+            _request_access(store, timeout=2.0)
         keys = [
             _Contacts.CNContactGivenNameKey,
             _Contacts.CNContactFamilyNameKey,

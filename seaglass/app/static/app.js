@@ -169,11 +169,13 @@ async function refreshStatus() {
   // Without Contacts access every sender renders as a raw phone number,
   // which reads like a bug rather than a missing permission.
   const contactsWarn = status.contacts_available === false
-    ? `<span class="status-sep">·</span><span class="status-warn" title="Grant Contacts access to Seaglass in System Settings > Privacy &amp; Security > Contacts, then restart it.">names unavailable</span>`
+    ? `<span class="status-sep">·</span><button type="button" id="open-contacts" class="status-warn" title="Grant Contacts access to Seaglass, then restart it. Click to open the setting.">names unavailable</button>`
     : '';
   const syncBtn = `<button type="button" id="status-sync" class="status-sync" title="Re-index new messages now">`
     + `${iconSvg('i-refresh', 'icon icon-sm')}<span>Sync</span></button>`;
   els.statusBar.innerHTML = `<span class="status-dot${status.hydration_available ? '' : ' is-off'}"></span><span>Ready</span><span class="status-sep">·</span><span>${Number(status.n_chunks || 0).toLocaleString()} chunks</span><span class="status-sep">·</span><span>${Number(status.n_chats || 0).toLocaleString()} chats</span>${stale}${contactsWarn}<span class="status-spacer"></span>${syncBtn}`;
+  const contactsButton = document.getElementById('open-contacts');
+  if (contactsButton) contactsButton.onclick = grantContacts;
   const statusSync = document.getElementById('status-sync');
   if (statusSync) {
     statusSync.disabled = syncInProgress;
@@ -186,8 +188,15 @@ async function refreshStatus() {
     els.syncBanner.classList.remove('hidden');
     els.syncBanner.innerHTML = `<span class="banner-icon">${iconSvg('i-refresh')}</span>`
       + `<span class="banner-text"><strong>Can't check for new messages.</strong> `
-      + `Seaglass needs Full Disk Access to read Messages: System Settings &rsaquo; Privacy &amp; Security &rsaquo; Full Disk Access, `
-      + `then enable Seaglass and restart it. Search still works on what's already indexed.</span>`;
+      + `Seaglass needs Full Disk Access to read Messages. Enable Seaglass in the list, then restart it. `
+      + `Search still works on what's already indexed.</span>`
+      + `<span class="banner-actions">`
+      + `<button id="open-fda" class="btn btn-sm btn-primary">Open Settings</button>`
+      + `<button id="relaunch" class="btn btn-sm">Relaunch</button></span>`;
+    const fdaButton = document.getElementById('open-fda');
+    if (fdaButton) fdaButton.onclick = () => openSettings('full_disk_access');
+    const relaunchButton = document.getElementById('relaunch');
+    if (relaunchButton) relaunchButton.onclick = relaunchApp;
     return;
   }
   if (status.n_messages_since_index > 0) {
@@ -197,6 +206,58 @@ async function refreshStatus() {
     document.getElementById('sync-now').onclick = syncNow;
   } else {
     els.syncBanner.classList.add('hidden');
+  }
+}
+
+// Contacts is the one permission with no manual route: System Settings
+// lists only apps that have already asked, with no "+" to add one. So the
+// only way to grant it is to make the app ask, and the only way to make it
+// ask is from here -- warmup runs before there is an event loop to show a
+// prompt on.
+async function grantContacts() {
+  let result;
+  try {
+    result = await api('/api/system/request-contacts', {method: 'POST'});
+  } catch (err) {
+    syncBannerMessage(`Couldn't request Contacts access: ${err.message}`);
+    return;
+  }
+  if (result.granted) {
+    // The contact index and every cached chat title were built without
+    // names, so they only pick up after a restart.
+    syncBannerMessage('Contacts access granted — relaunching to load names…', {spin: true});
+    await relaunchApp();
+    return;
+  }
+  if (result.can_prompt === false && result.status !== 0) {
+    // Already answered once; macOS never prompts again, so Settings is
+    // now the only route.
+    await openSettings('contacts');
+  }
+}
+
+// A privacy grant only applies to a *newly launched* process, so the app
+// has to restart before a freshly granted permission does anything. Doing
+// that by hand right after granting it is a poor finish to the flow.
+async function relaunchApp() {
+  syncBannerMessage('Relaunching…', {spin: true});
+  try {
+    await api('/api/system/relaunch', {method: 'POST'});
+  } catch (err) {
+    // The server may drop the connection as it exits -- that means it
+    // worked, so only a pre-flight failure is worth reporting.
+    console.warn('relaunch request ended', err);
+  }
+}
+
+// macOS can deep-link straight to a Privacy pane, which beats narrating a
+// five-step path through System Settings. Best-effort: if it fails the
+// banner text still says where to go.
+async function openSettings(pane) {
+  try {
+    await api('/api/system/open-settings', {method: 'POST', body: JSON.stringify({pane})});
+  } catch (err) {
+    console.warn('could not open System Settings', err);
   }
 }
 

@@ -98,3 +98,47 @@ def test_start_build_reports_conflict_when_already_running():
     app.state.build_state.running = True
     response = client.post('/api/index/build', headers={'Authorization': f'Bearer token123', 'Host': '127.0.0.1:8765'})
     assert response.status_code == 409
+
+
+def test_open_settings_rejects_unknown_pane(monkeypatch):
+    """A pane name is interpolated into a URL handed to `open`, so only an
+    allow-listed set may ever reach it."""
+    import seaglass.app.server as server_module
+
+    calls = []
+    monkeypatch.setattr(server_module.subprocess, 'Popen', lambda *a, **k: calls.append(a))
+    client = _client()
+    response = client.post(
+        '/api/system/open-settings',
+        json={'pane': 'x"; rm -rf ~'},
+        headers={'Authorization': 'Bearer token123', 'Host': '127.0.0.1:8765'},
+    )
+    assert response.status_code == 400
+    assert calls == []
+
+
+def test_open_settings_opens_known_pane(monkeypatch):
+    import seaglass.app.server as server_module
+
+    calls = []
+    monkeypatch.setattr(server_module.subprocess, 'Popen', lambda *a, **k: calls.append(a[0]))
+    client = _client()
+    response = client.post(
+        '/api/system/open-settings',
+        json={'pane': 'contacts'},
+        headers={'Authorization': 'Bearer token123', 'Host': '127.0.0.1:8765'},
+    )
+    assert response.status_code == 200
+    assert response.json()['opened'] is True
+    assert calls and 'Privacy_Contacts' in calls[0][-1]
+
+
+def test_bundle_path_requires_launch_services_marker(monkeypatch):
+    """The bundle is identified by the env var LaunchServices exports, since
+    the executable path is the interpreter's either way."""
+    from seaglass.app.server import _bundle_path
+
+    monkeypatch.delenv('__CFBundleIdentifier', raising=False)
+    assert _bundle_path() is None
+    monkeypatch.setenv('__CFBundleIdentifier', 'com.apple.Terminal')
+    assert _bundle_path() is None

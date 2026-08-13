@@ -131,11 +131,21 @@ def install(destination: Path | None = None, venv_bin: Path | None = None) -> Pa
         "LSUIElement": False,
         "NSHighResolutionCapable": True,
         "NSAppleEventsUsageDescription": "Seaglass reads your local Messages database to search it.",
+        # Without this key macOS refuses the Contacts prompt outright -- it
+        # flashes on screen and vanishes, leaving no way to grant access,
+        # since System Settings only lists apps that have already asked.
+        "NSContactsUsageDescription": "Seaglass uses your contacts to show names instead of phone numbers in search results.",
     }
     if icon_file:
         info["CFBundleIconFile"] = icon_file
     with (contents / "Info.plist").open("wb") as handle:
         plistlib.dump(info, handle)
+
+    # Ad-hoc sign the finished bundle. The privacy system identifies an app
+    # by its signature, so an unsigned or stale-signed bundle can have its
+    # grants quietly dropped. This must run after the Info.plist is written,
+    # since the signature seals it.
+    os.system(f"codesign --force --sign - {str(bundle)!r} >/dev/null 2>&1 || true")
 
     # Nudge LaunchServices so Spotlight/the Dock pick it up immediately
     # instead of whenever it next rescans.

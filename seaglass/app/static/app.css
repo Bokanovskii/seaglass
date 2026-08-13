@@ -1485,4 +1485,18 @@ footer#status-bar {
 
 .status-sync:disabled { opacity: 0.5; cursor: default; }
 
-.status-warn { color: var(--accent); cursor: help; }
+/* A button, not a label: clicking it deep-links to the exact Privacy pane
+   that needs the grant. Styled as plain text so it reads as status. */
+.status-warn {
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  color: var(--accent);
+  cursor: pointer;
+  text-decoration: underline;
+  text-decoration-style: dotted;
+  text-underline-offset: 2px;
+}
+
+.status-warn:hover { color: var(--accent-strong, var(--accent)); }

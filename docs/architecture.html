@@ -337,6 +337,52 @@
         snapshot of the live <code>chat.db</code> — the live file itself is touched only for cheap,
         read-only "how far behind are we" checks between builds, never for content.
       </p>
+
+      <h3>macOS privacy grants, and why the app ships as a bundle</h3>
+      <p>
+        Both of the things above depend on permissions macOS grants per <em>app identity</em>, not
+        per user. A <code>.app</code> inherits none of the access the terminal that built it had,
+        which makes the failure modes look like seaglass bugs rather than missing grants:
+      </p>
+      <ul>
+        <li><strong>Full Disk Access</strong> gates the live <code>chat.db</code>. Without it the
+        staleness check above silently reads nothing, so the app claims to be up to date forever.</li>
+        <li><strong>Contacts</strong> gates name resolution
+        (<code>seaglass/imessage/contacts.py</code>). Without it every sender renders as a raw phone
+        number.</li>
+      </ul>
+      <div class="callout decision">
+        <strong>Both denials are surfaced, never absorbed.</strong> <code>status()</code> reports
+        <code>live_chat_readable</code> and <code>contacts_available</code>, and the UI turns each
+        into a banner or chip with a button that deep-links to the exact Settings pane
+        (<code>POST /api/system/open-settings</code>, whitelisted panes only). A grant only takes
+        effect for a <em>newly launched</em> process, so the banner also offers
+        <code>POST /api/system/relaunch</code>, which waits for this pid to actually exit before
+        reopening — otherwise the replacement finds a live lock file and just opens a browser tab at
+        the old instance. Shutdown closes the webview window rather than raising SIGTERM: Python
+        runs signal handlers on the main thread, and that thread is parked inside the Cocoa event
+        loop.
+      </div>
+      <div class="callout gotcha">
+        <strong>Contacts can only be granted by asking.</strong> Its Settings pane has no "+" — it
+        lists only apps that have already requested access. So <code>POST
+        /api/system/request-contacts</code> triggers the system prompt on demand, from the running
+        app. It cannot happen during warmup, which runs on a background thread before there is an
+        event loop to present a prompt on. The prompt is also refused outright (it flashes and
+        vanishes) unless the bundle's <code>Info.plist</code> carries
+        <code>NSContactsUsageDescription</code>, and the bundle is ad-hoc code-signed so the privacy
+        database has a stable identity to attach the grant to.
+      </div>
+      <div class="callout gotcha">
+        <strong>A bundle's <code>CFBundleExecutable</code> must be Mach-O.</strong> Current macOS
+        refuses to launch one whose executable is a shell script
+        (<code>_LSOpenURLsWithCompletionHandler … error -10669</code>), so
+        <code>seaglass/app/installapp.py</code> compiles a tiny C stub at install time that
+        <code>execl</code>s the real launcher. Launching from a terminal instead
+        (<code>start.sh</code>) works and keeps the terminal's grants, but the Dock tile then reads
+        "Python", because it comes from LaunchServices' record of the running binary — CPython's own
+        <code>Python.app</code>.
+      </div>
     </section>
 
     <section id="storage">

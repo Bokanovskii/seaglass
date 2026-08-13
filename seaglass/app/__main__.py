@@ -66,6 +66,15 @@ def _set_macos_app_name(name: str = 'Seaglass') -> None:
             if info is not None:
                 info['CFBundleName'] = name
                 info['CFBundleDisplayName'] = name
+                # macOS refuses to show a privacy prompt for an app with no
+                # usage description, so a launch that resolves to some other
+                # main bundle (the bare interpreter, say) could never ask for
+                # Contacts. The .app carries this in its Info.plist too.
+                info.setdefault(
+                    'NSContactsUsageDescription',
+                    'Seaglass uses your contacts to show names instead of '
+                    'phone numbers in search results.',
+                )
     except Exception:
         pass
     _set_macos_launch_services_name(name)

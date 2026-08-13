@@ -1,11 +1,15 @@
 from __future__ import annotations
 
-import dataclasses
-
 import concurrent.futures
+import dataclasses
+import os
 import queue
 import secrets
+import shlex
+import signal
+import subprocess
 import threading
+import time
 from dataclasses import asdict
 from pathlib import Path
 
@@ -124,6 +128,47 @@ class SearchAssistManager:
         if isinstance(payload, dict) and payload.get('status') == 'unavailable':
             return AssistResult(status='unavailable', reason=payload.get('reason'))
         return payload
+
+
+def _bundle_path() -> str | None:
+    """The .app this process was launched from, if any.
+
+    LaunchServices exports `__CFBundleIdentifier` when it starts a bundled
+    app, and that is inherited across the exec from the bundle's stub to
+    the interpreter -- so it, not the executable path, is what identifies a
+    bundle launch.
+    """
+    if os.environ.get('__CFBundleIdentifier') != 'dev.seaglass.app':
+        return None
+    for candidate in (Path.home() / 'Applications' / 'Seaglass.app', Path('/Applications/Seaglass.app')):
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
+def _shutdown_soon(delay: float = 0.4) -> None:
+    """Exit the app from a worker thread.
+
+    SIGTERM is not enough here: Python runs signal handlers on the main
+    thread, and the main thread is parked inside the Cocoa event loop, so
+    the handler would not run until the window closed -- the exact thing
+    being asked for. Closing the webview window is what unblocks it, which
+    lets `__main__` release the lock on its way out.
+    """
+    time.sleep(delay)  # let the response reach the frontend first
+    try:
+        import webview
+
+        for window in list(webview.windows):
+            window.destroy()
+    except Exception:  # noqa: BLE001 - browser/headless mode has no window
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    def _force():
+        time.sleep(8.0)
+        os._exit(0)
+
+    threading.Thread(target=_force, daemon=True).start()
 
 
 def _coerce(cls, values):
@@ -283,6 +328,81 @@ def create_app(engine, warmup_state, config, token: str):
             setattr(config, key, value)
         save_config(config)
         return config.to_dict()
+
+    # Only these panes, and only by key: the value is interpolated into a
+    # URL handed to `open`, so accepting an arbitrary string from the page
+    # would be a command/URL injection surface for no benefit.
+    _SETTINGS_PANES = {
+        'full_disk_access': 'x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles',
+        'contacts': 'x-apple.systempreferences:com.apple.preference.security?Privacy_Contacts',
+    }
+
+    @app.post('/api/system/open-settings')
+    async def open_settings(body: dict):
+        """Deep-link into the exact Privacy pane a missing grant needs.
+
+        Telling someone to "go to System Settings > Privacy & Security >
+        Full Disk Access" is a five-step scavenger hunt; macOS has a URL
+        scheme for landing directly on the pane, so use it.
+        """
+        url = _SETTINGS_PANES.get(str(body.get('pane') or ''))
+        if url is None:
+            raise HTTPException(status_code=400, detail='unknown settings pane')
+
+        subprocess.Popen(['open', url])
+        return {'opened': True}
+
+    @app.post('/api/system/request-contacts')
+    async def request_contacts():
+        """Show the system Contacts prompt, on demand.
+
+        Contacts has no "+" button in System Settings -- an app only
+        appears in that list once it has *asked*, so without this there is
+        no way for the user to grant access at all.
+
+        It has to happen here rather than during warmup: warmup runs on a
+        background thread before `webview.start()` spins up the Cocoa event
+        loop, and a TCC prompt cannot be presented until there is one. So
+        the request is driven from the UI, once the app is fully running.
+        """
+        from seaglass.imessage.contacts import request_contacts_access
+
+        return request_contacts_access()
+
+    @app.post('/api/system/relaunch')
+    async def relaunch():
+        """Quit and reopen. Needed after a privacy grant.
+
+        macOS decides an app's TCC access when it launches, so enabling
+        Full Disk Access does nothing for the process that is already
+        running -- the app has to be restarted, and telling the user to go
+        do that by hand right after they granted the permission is a poor
+        finish to the flow.
+
+        The relaunch is handed to a detached `sh` so it survives this
+        process exiting. It waits for *this* pid to actually disappear
+        rather than sleeping a fixed amount: the replacement checks the
+        lock file on startup and, finding a live instance, would just open
+        a browser tab at the old one and exit.
+        """
+        import sys
+
+        bundle = _bundle_path()
+        if bundle:
+            launch = f'open -n {shlex.quote(bundle)}'
+        else:
+            argv = ' '.join(shlex.quote(part) for part in [sys.executable, *sys.argv])
+            launch = f'{argv} &'
+        pid = os.getpid()
+        # Bounded so a shutdown that hangs leaves no orphan waiter.
+        command = (
+            f'for _ in $(seq 100); do kill -0 {pid} 2>/dev/null || break; sleep 0.2; done; '
+            f'sleep 0.5; {launch}'
+        )
+        subprocess.Popen(['/bin/sh', '-c', command], start_new_session=True)
+
+        threading.Thread(target=_shutdown_soon, daemon=True).start()
+        return {'relaunching': True}
 
     app.mount('/static', StaticFiles(directory=STATIC_DIR), name='static')
     return app
