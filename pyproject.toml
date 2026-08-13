@@ -48,6 +48,14 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 include = ["seaglass*"]
 
+# Non-Python runtime assets. Without these a non-editable install builds a
+# wheel with no schema.sql (every index operation fails) and no static/
+# (the desktop UI serves nothing) -- an editable install hides this because
+# paths resolve straight back into the source tree.
+[tool.setuptools.package-data]
+"seaglass.index" = ["schema.sql"]
+"seaglass.app" = ["static/*", "static/icons/*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
