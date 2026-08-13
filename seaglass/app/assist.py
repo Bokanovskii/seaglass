@@ -131,7 +131,14 @@ def _parse_dates(date_from: str | None, date_to: str | None, corpus_bounds: tupl
 
 def ensure_cache(path: Path = APP_DB_PATH) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(path)
+    # Created once in SearchAssistManager and read/written from whichever
+    # thread handles the request (uvicorn's event-loop thread, which is a
+    # background thread distinct from the one that constructed this
+    # connection) -- sqlite3 connections are thread-affine by default, so
+    # this must opt out of that check. All access here is effectively
+    # single-threaded in practice (uvicorn runs one event loop), so no
+    # additional locking is needed.
+    con = sqlite3.connect(path, check_same_thread=False)
     con.execute(
         'CREATE TABLE IF NOT EXISTS ghcp_cache (key TEXT PRIMARY KEY, query TEXT, response_json TEXT, created_at REAL)'
     )

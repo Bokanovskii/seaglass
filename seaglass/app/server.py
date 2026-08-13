@@ -158,17 +158,27 @@ def create_app(engine, warmup_state, config, token: str):
         def on_complete():
             # Once a build finishes successfully, (re)warm the engine so
             # search reflects the freshly written index without requiring
-            # the user to restart the app.
+            # the user to restart the app. This mutates engine.index_con /
+            # chat_con / embedding_model etc. in place, so it MUST run on
+            # pipeline_pool (the same single-worker executor that serializes
+            # every engine.search()/status() call) rather than directly on
+            # this build thread -- otherwise a concurrent search could read
+            # from (or crash on) connections that re-warming is closing out
+            # from under it.
             if build_state.stage != 'done':
                 return
-            warmup_state.state = 'STARTING'
-            warmup_state.error = None
-            for step in warmup_state.steps:
-                step.state = 'pending'
-                step.error = None
-            from seaglass.app.warmup import run_warmup
-            from seaglass.llm.ghcp import detect_ghcp
-            run_warmup(engine, warmup_state, lambda: detect_ghcp(config.copilot_bin))
+
+            def _rewarm():
+                warmup_state.state = 'STARTING'
+                warmup_state.error = None
+                for step in warmup_state.steps:
+                    step.state = 'pending'
+                    step.error = None
+                from seaglass.app.warmup import run_warmup
+                from seaglass.llm.ghcp import detect_ghcp
+                run_warmup(engine, warmup_state, lambda: detect_ghcp(config.copilot_bin))
+
+            pipeline_pool.submit(_rewarm)
 
         thread = threading.Thread(
             target=run_build,

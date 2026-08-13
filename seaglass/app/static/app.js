@@ -505,4 +505,10 @@ function debounce(fn, delay) {
   };
 }
 
+// Date inputs should start empty (no implicit range filter) -- clear any
+// value WebKit's form-state restoration may have applied on load so a fresh
+// search never silently inherits a previous session's date range.
+els.dateFrom.value = '';
+els.dateTo.value = '';
+
 pollHealth();
