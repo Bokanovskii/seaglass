@@ -581,6 +581,15 @@ def build_index(
     if limit_chunks is None:
         _prune_stale_chunks(index_con, stale_ids)
 
+    # Fold the WAL back into index.db. The app holds long-lived readers on
+    # this file, so checkpoint-on-last-close never fires and the -wal would
+    # otherwise only grow across syncs. Best-effort: a reader mid-query
+    # just means we retry on the next build.
+    try:
+        index_con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    except sqlite3.Error:
+        pass
+
     return chunks_written
 
 

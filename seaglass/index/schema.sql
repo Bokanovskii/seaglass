@@ -4,6 +4,10 @@
 -- single source of truth.
 
 PRAGMA journal_mode = WAL;
+-- Cap WAL growth. The app keeps long-lived reader connections open on
+-- index.db, which suppresses SQLite's checkpoint-on-last-close, so
+-- without a limit the -wal file only ever grows across repeated syncs.
+PRAGMA journal_size_limit = 16777216;
 
 -- ── owned tables ───────────────────────────────────────────────
 
