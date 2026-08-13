@@ -39,14 +39,21 @@ def _set_macos_app_name(name: str = 'Seaglass') -> None:
     switcher and the menu bar.
 
     For a non-bundled interpreter macOS takes the display name from the
-    *running binary's* bundle -- which is CPython's own, hence "Python".
-    There is no NSApplication setter for it, but AppKit reads the name out
-    of the main bundle's info dictionary lazily, so overwriting
-    `CFBundleName` in that (mutable) dictionary before the app finishes
-    launching is what actually takes effect.
+    *running binary's* bundle -- CPython's own, hence "Python". Two
+    separate things have to be corrected, because they read from two
+    different places:
 
-    Must run before `webview.start()` creates the NSApplication. Purely
-    cosmetic, so every failure path is swallowed.
+    * The **menu bar** reads the main bundle's info dictionary, which is
+      mutable, so overwriting `CFBundleName` there is enough.
+    * The **Dock tile and Cmd+Tab switcher** read the name LaunchServices
+      has on record for the running process, which the info dictionary
+      does not touch -- that is why the Dock kept saying "Python" even
+      with the window title reading "Seaglass". Overriding it needs
+      `_LSSetApplicationInformationItem` on the current process's ASN.
+
+    Purely cosmetic, so every failure path is swallowed. The
+    LaunchServices call in particular is a private API: if a future macOS
+    drops it, the app must still start, just with the old name.
     """
     try:
         from Foundation import NSBundle
@@ -54,13 +61,43 @@ def _set_macos_app_name(name: str = 'Seaglass') -> None:
         return
     try:
         bundle = NSBundle.mainBundle()
-        if bundle is None:
+        if bundle is not None:
+            info = bundle.localizedInfoDictionary() or bundle.infoDictionary()
+            if info is not None:
+                info['CFBundleName'] = name
+                info['CFBundleDisplayName'] = name
+    except Exception:
+        pass
+    _set_macos_launch_services_name(name)
+
+
+def _set_macos_launch_services_name(name: str) -> None:
+    """The Dock/Cmd+Tab half of `_set_macos_app_name` -- see there."""
+    try:
+        import ctypes
+        import ctypes.util
+
+        from Foundation import NSString
+
+        lib_path = ctypes.util.find_library('ApplicationServices')
+        if not lib_path:
             return
-        info = bundle.localizedInfoDictionary() or bundle.infoDictionary()
-        if info is None:
-            return
-        info['CFBundleName'] = name
-        info['CFBundleDisplayName'] = name
+        lib = ctypes.cdll.LoadLibrary(lib_path)
+        lib._LSGetCurrentApplicationASN.restype = ctypes.c_void_p
+        lib._LSSetApplicationInformationItem.restype = ctypes.c_int
+        lib._LSSetApplicationInformationItem.argtypes = [
+            ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p
+        ]
+        asn = lib._LSGetCurrentApplicationASN()
+        display_key = ctypes.c_void_p.in_dll(lib, '_kLSDisplayNameKey')
+        value = NSString.stringWithString_(name)
+        lib._LSSetApplicationInformationItem(
+            -2,  # kLSDefaultSessionID
+            ctypes.c_void_p(asn),
+            display_key,
+            ctypes.c_void_p(value.__c_void_p__().value),
+            None,
+        )
     except Exception:
         pass
 
