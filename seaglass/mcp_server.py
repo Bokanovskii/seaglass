@@ -63,13 +63,13 @@ from typing import List, Optional
 
 from mcp.server import MCPServer
 
-from seaglass.imessage.attributedbody import decode_attributed_body
 from seaglass.imessage.contacts import ContactIndex, ContactsUnavailableError
 from seaglass.imessage.source import apple_to_unix, connect_readonly
 from seaglass.index.build import open_index_db
 from seaglass.index.embed import EmbeddingModel
 from seaglass.search.format import format_search_result
-from seaglass.search.hydrate import HydratedMessage, hydrate_sessions, _resolve_sender
+from seaglass.search.hydrate import hydrate_sessions
+from seaglass.search.conversation import fetch_conversation
 from seaglass.search.parse import parse_query
 from seaglass.search.rank import aggregate_sessions, expand_sessions, rerank_candidates
 from seaglass.search.rerank import CrossEncoderReranker
@@ -290,93 +290,14 @@ def get_conversation(chat_id: int, around_ts: Optional[float] = None, limit: int
             "get_conversation requires SEAGLASS_CHAT_DB to be set -- "
             "no chat.db snapshot is configured for this server."
         )
-    contact_index = _get_contact_index()
+    return fetch_conversation(
+        chat_con,
+        chat_id=chat_id,
+        around_ts=around_ts,
+        limit=limit,
+        contact_index=_get_contact_index(),
+    )
 
-    if around_ts is not None:
-        # Rather than guessing a recent window and hoping around_ts falls
-        # inside it (previously: only the newest 2000 rows were fetched,
-        # so drilling into an old thread in a chat with >2000 messages
-        # silently returned unrelated recent messages instead) -- pull
-        # just (ROWID, date) for the WHOLE chat (cheap: two columns, no
-        # join, uses the indexed chat_message_join), convert every date
-        # with apple_to_unix in Python (the ambiguous seconds/ns handling
-        # only needs to run once per message, not per query), find the
-        # closest position to around_ts, then fetch full rows for just
-        # that window by ROWID.
-        id_date_rows = chat_con.execute(
-            """
-            SELECT m.ROWID, m.date
-            FROM im.message m
-            JOIN im.chat_message_join cmj ON cmj.message_id = m.ROWID
-            WHERE cmj.chat_id = ?
-            ORDER BY m.date ASC
-            """,
-            (chat_id,),
-        ).fetchall()
-        if not id_date_rows:
-            target_ids: List[int] = []
-        else:
-            converted = [(rowid, apple_to_unix(date)) for rowid, date in id_date_rows]
-            # closest position by absolute distance to around_ts
-            closest_idx = min(range(len(converted)), key=lambda i: abs(converted[i][1] - around_ts))
-            half = limit // 2
-            lo = max(0, closest_idx - half)
-            hi = min(len(converted), lo + limit)
-            lo = max(0, hi - limit)  # re-clamp lo if hi hit the end first
-            target_ids = [rowid for rowid, _ in converted[lo:hi]]
-        if not target_ids:
-            return {"chat_id": chat_id, "n_messages": 0, "messages": []}
-        placeholders = ",".join("?" for _ in target_ids)
-        query = f"""
-            SELECT m.ROWID, m.text, m.attributedBody, m.date, m.is_from_me, h.id
-            FROM im.message m
-            LEFT JOIN im.handle h ON h.ROWID = m.handle_id
-            WHERE m.ROWID IN ({placeholders})
-        """
-        rows = chat_con.execute(query, target_ids).fetchall()
-    else:
-        query = """
-            SELECT m.ROWID, m.text, m.attributedBody, m.date, m.is_from_me, h.id
-            FROM im.message m
-            JOIN im.chat_message_join cmj ON cmj.message_id = m.ROWID
-            LEFT JOIN im.handle h ON h.ROWID = m.handle_id
-            WHERE cmj.chat_id = ?
-            ORDER BY m.date DESC
-            LIMIT ?
-        """
-        rows = chat_con.execute(query, (chat_id, limit)).fetchall()
-
-    messages = []
-    for rowid, text, attributed_body, date, is_from_me, handle in rows:
-        if not text and attributed_body:
-            text = decode_attributed_body(attributed_body)
-        sender = _resolve_sender(is_from_me, handle, contact_index)
-        messages.append(
-            HydratedMessage(
-                message_id=rowid,
-                ts=apple_to_unix(date),
-                is_from_me=bool(is_from_me),
-                sender=sender,
-                text=text,
-                has_attachment=False,
-            )
-        )
-
-    messages.sort(key=lambda m: m.ts)
-    return {
-        "chat_id": chat_id,
-        "n_messages": len(messages),
-        "messages": [
-            {
-                "message_id": m.message_id,
-                "ts": m.ts,
-                "is_from_me": m.is_from_me,
-                "sender": m.sender,
-                "text": m.text,
-            }
-            for m in messages
-        ],
-    }
 
 
 @server.tool()

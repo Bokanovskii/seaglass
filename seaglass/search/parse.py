@@ -85,6 +85,8 @@ class ParsedQuery:
     date_from: Optional[float] = None  # unix seconds, inclusive, padded
     date_to: Optional[float] = None
     has_media: bool = False
+    is_group: Optional[bool] = None
+    chat_ids: Optional[List[int]] = None
 
 
 def _extract_media_filter(text: str) -> bool:

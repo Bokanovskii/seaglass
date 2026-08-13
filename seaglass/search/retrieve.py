@@ -36,6 +36,7 @@ DENSE_TOP_K = 200
 SPARSE_TOP_K = 200
 RRF_K = 60
 FUSED_TOP_K = 50
+CANDIDATE_INLINE_LIMIT = 2000
 
 
 @dataclasses.dataclass(frozen=True)
@@ -59,6 +60,24 @@ def resolve_participant_chat_ids(chat_con, handle_ids: Sequence[str]) -> Set[int
     """
     return {row[0] for row in chat_con.execute(query, list(handle_ids))}
 
+
+
+
+def resolve_group_chat_ids(chat_con, is_group: bool) -> Set[int]:
+    rows = chat_con.execute(
+        """
+        SELECT c.ROWID, c.style, COUNT(DISTINCT chj.handle_id)
+        FROM im.chat c
+        LEFT JOIN im.chat_handle_join chj ON chj.chat_id = c.ROWID
+        GROUP BY c.ROWID, c.style
+        """
+    ).fetchall()
+    matched = set()
+    for chat_id, style, participant_count in rows:
+        chat_is_group = int((style or 0) not in (45,)) if style is not None else participant_count > 1
+        if bool(chat_is_group) is bool(is_group):
+            matched.add(chat_id)
+    return matched
 
 def build_candidate_chunk_ids(
     index_con,
@@ -84,8 +103,18 @@ def build_candidate_chunk_ids(
         conditions.append("has_attachment = 1")
 
     chat_id_filter: Optional[Set[int]] = None
-    if parsed_query.people_participant and chat_con is not None:
-        chat_id_filter = resolve_participant_chat_ids(chat_con, parsed_query.people_participant)
+    if chat_con is not None:
+        filters: list[Set[int]] = []
+        if parsed_query.people_participant:
+            filters.append(resolve_participant_chat_ids(chat_con, parsed_query.people_participant))
+        if getattr(parsed_query, "is_group", None) is not None:
+            filters.append(resolve_group_chat_ids(chat_con, parsed_query.is_group))
+        if getattr(parsed_query, "chat_ids", None):
+            filters.append(set(parsed_query.chat_ids))
+        if filters:
+            chat_id_filter = filters[0]
+            for subset in filters[1:]:
+                chat_id_filter &= subset
 
     if not conditions and chat_id_filter is None:
         return None
@@ -126,6 +155,9 @@ def dense_search(
     if candidate_ids is not None:
         if not candidate_ids:
             return []
+        if len(candidate_ids) > CANDIDATE_INLINE_LIMIT:
+            base = dense_search(index_con, query_vector_int8, None, top_k=max(top_k * 3, top_k))
+            return [chunk_id for chunk_id in base if chunk_id in candidate_ids][:top_k]
         placeholders = ",".join("?" for _ in candidate_ids)
         query = (
             f"SELECT rowid FROM chunks_vec WHERE rowid IN ({placeholders}) "
@@ -153,6 +185,9 @@ def sparse_search(
     if candidate_ids is not None:
         if not candidate_ids:
             return []
+        if len(candidate_ids) > CANDIDATE_INLINE_LIMIT:
+            base = sparse_search(index_con, query_text, None, top_k=max(top_k * 3, top_k))
+            return [chunk_id for chunk_id in base if chunk_id in candidate_ids][:top_k]
         placeholders = ",".join("?" for _ in candidate_ids)
         query = (
             f"SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH ? AND rowid IN ({placeholders}) "
@@ -200,6 +235,7 @@ def retrieve(
     sparse_top_k: int = SPARSE_TOP_K,
     rrf_k: int = RRF_K,
     fused_top_k: int = FUSED_TOP_K,
+    extra_sparse_queries: Sequence[str] = (),
 ) -> List[RetrievalResult]:
     """The Phase 4a baseline pipeline: pre-filter -> dense + sparse ->
     RRF fuse -> top `fused_top_k`. No reranker (Phase 4b).
@@ -216,5 +252,10 @@ def retrieve(
 
     dense_ids = dense_search(index_con, query_vector_int8, candidate_ids, top_k=dense_top_k)
     sparse_ids = sparse_search(index_con, parsed_query.semantic, candidate_ids, top_k=sparse_top_k)
+    ranked_lists = [dense_ids, sparse_ids]
+    for extra_query in extra_sparse_queries:
+        extra_ids = sparse_search(index_con, extra_query, candidate_ids, top_k=sparse_top_k)
+        if extra_ids:
+            ranked_lists.append(extra_ids)
 
-    return rrf_fuse([dense_ids, sparse_ids], k=rrf_k, top_k=fused_top_k)
+    return rrf_fuse(ranked_lists, k=rrf_k, top_k=fused_top_k)
