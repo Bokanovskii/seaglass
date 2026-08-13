@@ -184,3 +184,17 @@ def test_page_cache_is_not_shared_across_different_filters(tmp_path, monkeypatch
     grouped = engine.search('discussion', SearchFilters(is_group=True), SearchOptions())
     solo = engine.search('discussion', SearchFilters(is_group=False), SearchOptions())
     assert not ({s['chat_id'] for s in grouped['sessions']} & {s['chat_id'] for s in solo['sessions']})
+
+
+def test_status_reports_live_chat_readability(tmp_path, monkeypatch):
+    """A dead live-chat.db connection (the usual cause: Full Disk Access not
+    granted to *this* app identity) made the sync banner report "up to
+    date" forever. The UI needs to be able to tell the difference.
+    """
+    engine = _engine(tmp_path, monkeypatch)
+    assert engine.status()['live_chat_readable'] is True
+
+    monkeypatch.setattr(engine, '_live_chat_connection', lambda: None)
+    status = engine.status()
+    assert status['live_chat_readable'] is False
+    assert status['n_messages_since_index'] == 0

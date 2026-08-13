@@ -153,14 +153,43 @@ let syncInProgress = false;
 // Incremented on every syncNow(); a poll loop whose token is stale exits so
 // double-clicks / multiple entry points can never stack concurrent loops.
 let syncPollToken = 0;
+// Last /api/status payload, so other UI can reason about permissions.
+let lastStatus = null;
 
 async function refreshStatus() {
   const status = await api('/api/status');
+  lastStatus = status;
   const stale = status.n_messages_since_index
     ? `<span class="status-sep">·</span><span class="status-stale">${status.n_messages_since_index.toLocaleString()} msgs since last index build</span>`
     : '';
-  els.statusBar.innerHTML = `<span class="status-dot${status.hydration_available ? '' : ' is-off'}"></span><span>Ready</span><span class="status-sep">·</span><span>${Number(status.n_chunks || 0).toLocaleString()} chunks</span><span class="status-sep">·</span><span>${Number(status.n_chats || 0).toLocaleString()} chats</span>${stale}`;
+  // The sync button is always present, not just when new messages are
+  // detected: detection needs the live chat.db, and if that is unreadable
+  // (or the user just wants to force one) there would otherwise be no way
+  // to trigger a sync at all short of restarting the app.
+  // Without Contacts access every sender renders as a raw phone number,
+  // which reads like a bug rather than a missing permission.
+  const contactsWarn = status.contacts_available === false
+    ? `<span class="status-sep">·</span><span class="status-warn" title="Grant Contacts access to Seaglass in System Settings > Privacy &amp; Security > Contacts, then restart it.">names unavailable</span>`
+    : '';
+  const syncBtn = `<button type="button" id="status-sync" class="status-sync" title="Re-index new messages now">`
+    + `${iconSvg('i-refresh', 'icon icon-sm')}<span>Sync</span></button>`;
+  els.statusBar.innerHTML = `<span class="status-dot${status.hydration_available ? '' : ' is-off'}"></span><span>Ready</span><span class="status-sep">·</span><span>${Number(status.n_chunks || 0).toLocaleString()} chunks</span><span class="status-sep">·</span><span>${Number(status.n_chats || 0).toLocaleString()} chats</span>${stale}${contactsWarn}<span class="status-spacer"></span>${syncBtn}`;
+  const statusSync = document.getElementById('status-sync');
+  if (statusSync) {
+    statusSync.disabled = syncInProgress;
+    statusSync.onclick = syncNow;
+  }
   if (syncInProgress) return;  // the sync poll loop owns the banner right now
+  if (!status.live_chat_readable) {
+    // Silently reporting "up to date" when we cannot actually see the live
+    // database is the one failure mode the user can't debug themselves.
+    els.syncBanner.classList.remove('hidden');
+    els.syncBanner.innerHTML = `<span class="banner-icon">${iconSvg('i-refresh')}</span>`
+      + `<span class="banner-text"><strong>Can't check for new messages.</strong> `
+      + `Seaglass needs Full Disk Access to read Messages: System Settings &rsaquo; Privacy &amp; Security &rsaquo; Full Disk Access, `
+      + `then enable Seaglass and restart it. Search still works on what's already indexed.</span>`;
+    return;
+  }
   if (status.n_messages_since_index > 0) {
     els.syncBanner.classList.remove('hidden');
     const plural = status.n_messages_since_index === 1 ? '' : 's';
@@ -182,6 +211,8 @@ async function syncNow() {
   const token = ++syncPollToken;
   const button = document.getElementById('sync-now');
   if (button) { button.disabled = true; button.textContent = 'Syncing…'; }
+  const statusButton = document.getElementById('status-sync');
+  if (statusButton) statusButton.disabled = true;
   syncBannerMessage('Syncing…', {spin: true});
   try {
     await api('/api/index/build', {method: 'POST'});

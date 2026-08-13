@@ -1457,3 +1457,32 @@ footer#status-bar {
 .load-more:hover:not(:disabled) { background: var(--accent); color: #fff; }
 .load-more:disabled { opacity: .6; cursor: default; }
 .load-more-count { font-size: var(--fs-xs); color: var(--text-muted); }
+
+/* The status bar's sync control is always present, even when no new
+   messages have been detected: detection itself needs the live chat.db,
+   so "nothing to sync" and "can't tell" look identical from here. */
+.status-spacer { flex: 1 1 auto; }
+
+.status-sync {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.15rem 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 0.78rem;
+  cursor: pointer;
+}
+
+.status-sync:hover:not(:disabled) {
+  background: var(--surface-hover);
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+.status-sync:disabled { opacity: 0.5; cursor: default; }
+
+.status-warn { color: var(--accent); cursor: help; }

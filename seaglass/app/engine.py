@@ -136,6 +136,7 @@ class SearchEngine:
                 'n_messages_since_index': 0,
                 'contacts_available': False,
                 'hydration_available': False,
+                'live_chat_readable': False,
                 'index_ready': False,
             }
         n_chunks = self.index_con.execute('SELECT COUNT(*) FROM chunks').fetchone()[0]
@@ -154,6 +155,11 @@ class SearchEngine:
             'n_messages_since_index': newer_messages,
             'contacts_available': self.contact_index is not None,
             'hydration_available': self.chat_con is not None,
+            # Distinct from hydration: the *live* chat.db is what tells us
+            # whether new messages have arrived. If it is unreadable the
+            # sync banner silently reports "up to date" forever, which is
+            # worse than saying nothing -- so the UI needs to know.
+            'live_chat_readable': self._live_chat_connection() is not None,
             'index_ready': True,
         }
 

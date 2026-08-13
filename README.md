@@ -112,6 +112,20 @@ The quickest way to get the desktop app running is `./setup.sh` (see
 the index is a separate, explicit step you trigger from inside the app
 (or via the CLI), since it can take a while on a large message history.
 
+Once set up, use `./start.sh` to launch — it skips the dependency install
+and preflight that `setup.sh` redoes every time. (There is deliberately no
+`./seaglass`: `seaglass/` is the Python package directory, so no file of
+that name can sit beside it.)
+
+`./start.sh --install-app` additionally installs `~/Applications/Seaglass.app`,
+a thin wrapper around this checkout, so seaglass can be launched from
+Spotlight and pinned to the Dock like any other app. **A bundle is a
+separate app identity as far as macOS privacy is concerned**, so grant it
+Full Disk Access and Contacts (System Settings › Privacy & Security) —
+launching from a terminal inherited *Terminal's* grants, and without its
+own the app shows raw phone numbers instead of names and can't detect new
+messages. The status bar says so when either is missing.
+
 To run it manually instead: install the app extras in the same venv you
 already use for seaglass, then point it at where you want the index and
 chat.db snapshot to live (they don't need to exist yet):
@@ -122,5 +136,5 @@ pip install -e ".[app,dev]"
 seaglass-app --index-db /path/to/index.db --chat-db /path/to/chat_snapshot.db --chat-db-source /path/to/chat.db
 ```
 
-By default this opens a native `pywebview` window. Use `--browser` if you want a browser tab for debugging. On first run, if no index exists yet, the app shows a "Build index now" screen instead of the warmup screen — building runs in the background with live progress, and the app automatically warms up and becomes searchable as soon as it finishes. Once ready, the app shows a real warmup screen while it loads model weights, warms SQLite, and prepares contacts, and its status bar always reports how in-sync the index is, with a "Sync now" button to pick up new messages any time. If `chat.db` or Full Disk Access is unavailable, the app explains that hydration is limited and tells you how to fix it. If GitHub Copilot CLI is missing, search still works normally; only optional query assist stays off.
+By default this opens a native `pywebview` window. Use `--browser` if you want a browser tab for debugging. On first run, if no index exists yet, the app shows a "Build index now" screen instead of the warmup screen — building runs in the background with live progress, and the app automatically warms up and becomes searchable as soon as it finishes. Once ready, the app shows a real warmup screen while it loads model weights, warms SQLite, and prepares contacts, and its status bar always reports how in-sync the index is, with a "Sync now" button to pick up new messages any time. A Sync button also sits permanently in the status bar, so a re-index can be forced at any point rather than only when new messages happen to be detected. If `chat.db` or Full Disk Access is unavailable, the app explains that hydration is limited and tells you how to fix it. If GitHub Copilot CLI is missing, search still works normally; only optional query assist stays off.
 
