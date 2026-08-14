@@ -218,3 +218,118 @@ def _hydrate_chunks(
             )
         )
     return messages
+
+
+def hydrate_recent_messages(
+    chat_con,
+    *,
+    since_ts: float,
+    until_ts: Optional[float] = None,
+    limit: int = 400,
+    contact_index: Optional[ContactIndex] = None,
+) -> List[tuple]:
+    """The newest messages in `chat.db`, straight from `chat.db`.
+
+    Everything else in this module reaches messages *through* the index's
+    `chunk_message` join, which means a message that has not been chunked
+    yet cannot appear in a result at all. For a filters-only query --
+    "latest from Vamski", which needs no models and no ranking -- that is
+    the one thing the caller actually asked for, and it is exactly the
+    thing a stale index is missing. Reading the tail here lets that query
+    be answered completely without waiting for a sync.
+
+    Returns `(chat_id, HydratedMessage)` pairs, newest first.
+
+    The *scan* is by `ROWID` because `message.date` mixes seconds and
+    nanoseconds depending on the macOS version at write time (see
+    `imessage.source.apple_to_unix`), so it cannot be compared in SQL
+    across that boundary. The *result* is then sorted by real timestamp in
+    Python, because ROWID order is not date order: measured against a real
+    chat.db, 3000 consecutive rows contained 1234 places where the older
+    ROWID held the newer message. iCloud backfill is why -- a conversation
+    synced from another device is appended now but dated whenever it
+    happened.
+
+    That is also why the horizon is applied as a filter rather than as an
+    early `break`. Breaking at the first row at or before `since_ts` would
+    be correct only if ROWID order were date order; during a backfill it
+    would stop at a freshly-appended old message and silently drop every
+    genuinely new message behind it -- losing exactly the messages this
+    function exists to find.
+    """
+    if limit <= 0:
+        return []
+    rows = chat_con.execute(
+        f"""
+        SELECT m.ROWID, m.text, m.attributedBody, m.date, m.is_from_me, h.id,
+               EXISTS (SELECT 1 FROM im.message_attachment_join maj
+                       WHERE maj.message_id = m.ROWID),
+               (SELECT cmj.chat_id FROM im.chat_message_join cmj
+                WHERE cmj.message_id = m.ROWID LIMIT 1)
+        FROM im.message m
+        LEFT JOIN im.handle h ON h.ROWID = m.handle_id
+        ORDER BY m.ROWID DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    if not rows:
+        return []
+    attachment_kinds = _fetch_attachment_kinds(chat_con, [row[0] for row in rows])
+
+    out: List[tuple] = []
+    for rowid, text, attributed_body, date, is_from_me, handle, has_attachment, chat_id in rows:
+        ts = apple_to_unix(date)
+        if ts <= since_ts:
+            continue
+        if until_ts is not None and ts > until_ts:
+            continue
+        if chat_id is None:
+            continue
+        if not text and attributed_body:
+            text = decode_attributed_body(attributed_body)
+        kind = attachment_kinds.get(rowid) if has_attachment else None
+        if not (text or "").strip() and not kind:
+            # Same system-row filter hydration applies everywhere else: a
+            # group rename or a shared-location start carries neither text
+            # nor an attachment and renders as an empty bubble.
+            continue
+        out.append((
+            chat_id,
+            HydratedMessage(
+                message_id=rowid,
+                ts=ts,
+                is_from_me=bool(is_from_me),
+                sender=_resolve_sender(is_from_me, handle, contact_index),
+                text=text,
+                has_attachment=bool(has_attachment),
+                attachment_kind=kind,
+                handle=handle,
+            ),
+        ))
+    out.sort(key=lambda pair: pair[1].ts, reverse=True)
+    return out
+
+
+def sessions_from_messages(pairs: Sequence[tuple], *, score: float = 0.0) -> List[HydratedSession]:
+    """Group `(chat_id, HydratedMessage)` pairs into the same
+    `(chat_id, day)` sessions the ranked path produces, newest first, so
+    they can be merged with -- and are indistinguishable from -- sessions
+    that came through the index."""
+    from seaglass.search.rank import _day_key
+
+    grouped: Dict[tuple, List[HydratedMessage]] = {}
+    for chat_id, message in pairs:
+        grouped.setdefault((chat_id, _day_key(message.ts)), []).append(message)
+    sessions = [
+        HydratedSession(
+            chat_id=chat_id,
+            day=day,
+            score=score,
+            hit_messages=sorted(messages, key=lambda m: m.ts, reverse=True),
+            context_messages=[],
+        )
+        for (chat_id, day), messages in grouped.items()
+    ]
+    sessions.sort(key=lambda s: max(m.ts for m in s.hit_messages), reverse=True)
+    return sessions

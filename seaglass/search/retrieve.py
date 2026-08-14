@@ -106,6 +106,35 @@ def resolve_group_chat_ids(chat_con, is_group: bool) -> Set[int]:
             matched.add(chat_id)
     return matched
 
+def resolve_chat_id_filter(chat_con, parsed_query) -> Optional[Set[int]]:
+    """Which chats a query is allowed to answer from, or None for "any".
+
+    Shared rather than inlined because the filters-only path answers from
+    chat.db directly and must scope to exactly the same chats as the index
+    would. Two copies of this would drift, and the drift would be silent:
+    the answer would still look plausible, just drawn from a chat the user
+    excluded.
+
+    An empty set is meaningful -- it means "a filter resolved to no chats"
+    and callers must fail closed on it, not treat it as unfiltered.
+    """
+    if chat_con is None:
+        return None
+    filters: list[Set[int]] = []
+    if parsed_query.people_participant:
+        filters.append(resolve_participant_chat_ids(chat_con, parsed_query.people_participant))
+    if getattr(parsed_query, "is_group", None) is not None:
+        filters.append(resolve_group_chat_ids(chat_con, parsed_query.is_group))
+    if getattr(parsed_query, "chat_ids", None):
+        filters.append(set(parsed_query.chat_ids))
+    if not filters:
+        return None
+    chat_id_filter = filters[0]
+    for subset in filters[1:]:
+        chat_id_filter &= subset
+    return chat_id_filter
+
+
 def build_candidate_chunk_ids(
     index_con,
     parsed_query: ParsedQuery,
@@ -129,19 +158,7 @@ def build_candidate_chunk_ids(
     if parsed_query.has_media:
         conditions.append("has_attachment = 1")
 
-    chat_id_filter: Optional[Set[int]] = None
-    if chat_con is not None:
-        filters: list[Set[int]] = []
-        if parsed_query.people_participant:
-            filters.append(resolve_participant_chat_ids(chat_con, parsed_query.people_participant))
-        if getattr(parsed_query, "is_group", None) is not None:
-            filters.append(resolve_group_chat_ids(chat_con, parsed_query.is_group))
-        if getattr(parsed_query, "chat_ids", None):
-            filters.append(set(parsed_query.chat_ids))
-        if filters:
-            chat_id_filter = filters[0]
-            for subset in filters[1:]:
-                chat_id_filter &= subset
+    chat_id_filter = resolve_chat_id_filter(chat_con, parsed_query)
 
     if not conditions and chat_id_filter is None:
         return None

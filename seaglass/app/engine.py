@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+import dataclasses
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field, replace
@@ -16,7 +17,11 @@ from seaglass.index.build import open_index_db
 from seaglass.index.embed import EmbeddingModel
 from seaglass.search.conversation import fetch_conversation
 from seaglass.search.format import format_search_result
-from seaglass.search.hydrate import hydrate_sessions
+from seaglass.search.hydrate import (
+    hydrate_recent_messages,
+    hydrate_sessions,
+    sessions_from_messages,
+)
 from seaglass.mlxmem import release_mlx_cache
 from seaglass.search.parse import ParsedQuery, parse_query
 from seaglass.search.rank import (
@@ -31,10 +36,16 @@ from seaglass.search.rank import (
 from seaglass.search.rerank import CrossEncoderReranker
 from seaglass.search.retrieve import (
     build_candidate_chunk_ids,
+    resolve_chat_id_filter,
     exact_phrase_chunk_ids,
     recency_ranked,
     retrieve,
 )
+
+# A filters-only answer reads unindexed messages straight from chat.db.
+# Capped so a long-neglected index degrades to "most of the tail" rather
+# than reading the whole database into memory on one query.
+LIVE_TAIL_MAX_MESSAGES = 2000
 
 
 @dataclass
@@ -362,6 +373,8 @@ class SearchEngine:
                 'has_more': False,
                 'next_offset': max(0, options.offset),
                 'effective_filters': _effective_filters(parsed),
+                'unindexed_included': 0,
+                'served_from': 'index',
                 'parse_source': 'deterministic',
                 # An empty result must have the same shape as a full one, or
                 # every consumer needs two code paths and the one it reaches
@@ -406,6 +419,48 @@ class SearchEngine:
         )
         return self._finish(ordered, options, timings, t0, candidate_ids, parsed, aggregate_started)
 
+    def _live_tail_sessions(self, parsed, options) -> list:
+        """The matching messages that exist in chat.db but are not indexed yet.
+
+        A filters-only query needs no models and no ranking -- it is a
+        lookup, and chat.db can answer it completely at any moment. Going
+        through the index instead meant the one query most sensitive to
+        staleness ("what did she just say") was the one query guaranteed
+        to miss the answer, and the only remedy was to stop and sync.
+
+        Bounded by the number of messages the index is actually behind, so
+        a current index costs one cached integer and no query at all.
+        """
+        behind = self._freshness_fields()['n_messages_since_index']
+        if not behind:
+            return []
+        con = self._live_chat_connection()
+        if con is None:
+            return []
+        horizon = self.index_con.execute('SELECT MAX(end_ts) FROM chunks').fetchone()[0]
+        if horizon is None:
+            return []
+        pairs = hydrate_recent_messages(
+            con,
+            since_ts=float(horizon),
+            until_ts=parsed.date_to,
+            # Read a little past the reported gap: the count is cached for
+            # up to FRESHNESS_TTL_S, so more can have arrived since.
+            limit=min(int(behind) * 2 + 50, LIVE_TAIL_MAX_MESSAGES),
+            contact_index=self.contact_index,
+        )
+        if parsed.date_from is not None:
+            pairs = [(cid, m) for cid, m in pairs if m.ts >= parsed.date_from]
+        # people_participant / is_group / chat_ids narrow the *candidate
+        # chunks* upstream, so the tail never passed through them. Reuse
+        # the index's own resolver rather than reimplementing it, so the
+        # two paths cannot disagree about which chats a query may answer
+        # from. An empty set means a filter matched no chat: fail closed.
+        allowed = resolve_chat_id_filter(con, parsed)
+        if allowed is not None:
+            pairs = [(cid, m) for cid, m in pairs if cid in allowed]
+        return sessions_from_messages(pairs)
+
     def _browse_recent(self, text, parsed, candidate_ids, options, timings, t0) -> dict:
         """Filters-only (or empty) search: newest matching chunks, no models."""
         aggregate_started = time.time()
@@ -421,6 +476,7 @@ class SearchEngine:
             RankedChunk(chunk_id=cid, chat_id=chat_id, start_ts=start_ts, rerank_score=float(len(rows) - i))
             for i, (cid, chat_id, start_ts) in enumerate(rows)
         ]
+        live_tail = self._live_tail_sessions(parsed, options)
         timings['browse'] = round(time.time() - aggregate_started, 4)
         ordered = order_sessions(ordered_chunks, head_size=options.max_sessions, recent_slots=0)
         # Descending pseudo-scores do *not* survive aggregation: it sums a
@@ -436,7 +492,8 @@ class SearchEngine:
             ),
             reverse=True,
         )
-        return self._finish(ordered, options, timings, t0, candidate_ids, parsed, aggregate_started)
+        return self._finish(ordered, options, timings, t0, candidate_ids, parsed,
+                            aggregate_started, live_tail=live_tail)
 
     def _chunk_rows(self, ids):
         if not ids:
@@ -450,7 +507,8 @@ class SearchEngine:
         }
         return [by_id[i] for i in ids if i in by_id]
 
-    def _finish(self, ordered, options, timings, t0, candidate_ids, parsed, aggregate_started) -> dict:
+    def _finish(self, ordered, options, timings, t0, candidate_ids, parsed, aggregate_started,
+                live_tail=None) -> dict:
         offset = max(0, options.offset)
         sessions = ordered[offset: offset + options.max_sessions]
         total_sessions = len(ordered)
@@ -460,6 +518,14 @@ class SearchEngine:
         hydrate_started = time.time()
         if self.chat_con is not None:
             hydrated = hydrate_sessions(self.index_con, self.chat_con, sessions, contact_index=self.contact_index)
+            if live_tail:
+                # Merged before the filters below, not after, so tail
+                # messages are narrowed by sender/from_me/media on
+                # exactly the same terms as indexed ones. Appending
+                # them to the finished payload instead would let a
+                # message the query excluded ride along purely because
+                # it was too new to have been chunked.
+                hydrated = _merge_sessions(live_tail, hydrated)
             if parsed.people_sender:
                 # "messages from Jakie" asks for what Jakie wrote. Chunk
                 # candidates can only be narrowed to *chats* they are in, so
@@ -526,6 +592,14 @@ class SearchEngine:
             'has_more': offset + options.max_sessions < total_sessions,
             'next_offset': offset + options.max_sessions,
             'effective_filters': _effective_filters(parsed),
+            # How many not-yet-indexed messages this answer read straight
+            # from chat.db. A caller that would otherwise warn "the index
+            # is N behind, go sync" can tell from this that the gap did
+            # not affect the answer it is holding.
+            'unindexed_included': sum(
+                len(session.hit_messages) for session in (live_tail or [])
+            ),
+            'served_from': 'chat_db+index' if live_tail else 'index',
             'parse_source': 'deterministic',
             'timings': timings,
             'elapsed_s': round(time.time() - t0, 2),
@@ -617,6 +691,33 @@ class SearchEngine:
         if meta:
             payload.update({'title': meta.title, 'is_group': meta.is_group, 'participants': list(meta.participants)})
         return payload
+
+
+def _merge_sessions(tail, indexed):
+    """Fold live-chat.db sessions into the indexed ones on `(chat_id, day)`.
+
+    A day that is partly indexed and partly not is one conversation, not
+    two: returning it twice would show the caller the same day as two
+    cards, and would let the newer half outrank the older half of itself.
+    Messages are deduplicated by id, because a sync landing mid-query can
+    put the same message on both sides.
+    """
+    merged = list(indexed)
+    by_key = {(session.chat_id, session.day): index for index, session in enumerate(merged)}
+    for session in tail:
+        key = (session.chat_id, session.day)
+        if key not in by_key:
+            by_key[key] = len(merged)
+            merged.append(session)
+            continue
+        existing = merged[by_key[key]]
+        seen = {m.message_id for m in existing.hit_messages}
+        combined = existing.hit_messages + [
+            m for m in session.hit_messages if m.message_id not in seen
+        ]
+        combined.sort(key=lambda m: m.ts, reverse=True)
+        merged[by_key[key]] = dataclasses.replace(existing, hit_messages=combined)
+    return merged
 
 
 def _filter_by_from_me(sessions, from_me: bool):
