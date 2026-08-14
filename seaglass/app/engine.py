@@ -47,6 +47,28 @@ from seaglass.search.retrieve import (
 # than reading the whole database into memory on one query.
 LIVE_TAIL_MAX_MESSAGES = 2000
 
+# Contacts live in the macOS Contacts store, not in our index, so they change
+# under a long-running app -- an iCloud sync can add hundreds at once. A stale
+# ContactIndex does not degrade gracefully: an unknown name still fuzzy-matches,
+# so "latest from Ben Gibson" silently searches some *other* Ben. Re-reading
+# costs ~300ms, so do it on a TTL rather than per query.
+CONTACTS_TTL_SECONDS = 300.0
+
+
+def _contacts_fingerprint(contact_index) -> object:
+    """Cheap identity for a loaded contact set.
+
+    Compared to decide whether a reload actually changed anything, so the
+    common "nothing changed" reload does not needlessly rebuild chat titles
+    or throw away the ranked-page cache.
+    """
+    if contact_index is None:
+        return None
+    return frozenset(
+        (c.display_name, tuple(sorted(c.handles)))
+        for c in getattr(contact_index, '_contacts', [])
+    )
+
 
 @dataclass
 class SearchOptions:
@@ -85,6 +107,9 @@ class SearchEngine:
         # candidate lists and only the newest queries are ever paged.
         self._page_cache: 'OrderedDict[tuple, list]' = OrderedDict()
         self._page_cache_lock = threading.RLock()
+        self._contacts_lock = threading.RLock()
+        self._contacts_loaded_at: float = 0.0
+        self._contacts_fingerprint: object = None
 
     def warmup(self, progress: Callable[[str], object]) -> None:
         # A rebuild can prune or renumber chunk ids, so any cached ranking
@@ -114,12 +139,14 @@ class SearchEngine:
         with progress('load_contacts'):
             try:
                 self.contact_index = ContactIndex.load()
+                self._contacts_fingerprint = _contacts_fingerprint(self.contact_index)
             except ContactsUnavailableError as exc:
                 self.warnings.append('Contacts unavailable — sender names will show raw handles')
                 self.contact_index = None
+                self._contacts_fingerprint = None
+            self._contacts_loaded_at = time.time()
         with progress('build_chatmeta'):
-            present_chat_ids = {row[0] for row in self.index_con.execute('SELECT DISTINCT chat_id FROM chunks')}
-            self.chatmeta = ChatMetadataCache.build(self.chat_con, present_chat_ids, contact_index=self.contact_index) if self.chat_con else ChatMetadataCache({})
+            self._build_chatmeta()
         with progress('warm_sqlite'):
             self.index_con.execute('SELECT COUNT(*), SUM(LENGTH(body_semantic)) FROM chunks').fetchone()
             self.index_con.execute('SELECT COUNT(*) FROM chunks_vec').fetchone()
@@ -287,6 +314,9 @@ class SearchEngine:
             return None, 0
 
     def suggest_contacts(self, q: str, limit: int = 10) -> list[dict]:
+        # Autocomplete is the one place a missing contact is obvious, so it
+        # should never be the stalest view of the address book.
+        self.maybe_refresh_contacts()
         if self.contact_index is None:
             return []
         starts = [c for c in getattr(self.contact_index, '_contacts', []) if c.display_name.lower().startswith(q.lower())]
@@ -316,9 +346,55 @@ class SearchEngine:
                     break
         return matches
 
+    def _build_chatmeta(self) -> None:
+        """(Re)build chat titles, which embed contact-resolved names."""
+        if not self.chat_con:
+            self.chatmeta = ChatMetadataCache({})
+            return
+        present_chat_ids = {row[0] for row in self.index_con.execute('SELECT DISTINCT chat_id FROM chunks')}
+        self.chatmeta = ChatMetadataCache.build(
+            self.chat_con, present_chat_ids, contact_index=self.contact_index
+        )
+
+    def refresh_contacts(self) -> bool:
+        """Re-read the Contacts store; rebuild what depends on it.
+
+        Nothing in index.db records a name -- chunk bodies say "Me"/"Them" --
+        so added, renamed and deleted contacts never require a reindex. This
+        reload is the whole fix. Returns True if the contact set changed.
+        """
+        try:
+            loaded = ContactIndex.load()
+        except ContactsUnavailableError:
+            with self._contacts_lock:
+                self._contacts_loaded_at = time.time()
+            return False
+        fingerprint = _contacts_fingerprint(loaded)
+        with self._contacts_lock:
+            self._contacts_loaded_at = time.time()
+            if fingerprint == self._contacts_fingerprint:
+                return False
+            self.contact_index = loaded
+            self._contacts_fingerprint = fingerprint
+            self._build_chatmeta()
+        # Cached rankings carry resolved sender names and titles with them.
+        self.invalidate_page_cache()
+        return True
+
+    def maybe_refresh_contacts(self, now: float | None = None) -> bool:
+        """Refresh contacts if the cached set has aged past the TTL."""
+        now = time.time() if now is None else now
+        with self._contacts_lock:
+            if now - self._contacts_loaded_at < CONTACTS_TTL_SECONDS:
+                return False
+        return self.refresh_contacts()
+
     def search(self, text: str, filters: SearchFilters, options: SearchOptions) -> dict:
         timings = {}
         t0 = time.time()
+        # Before parsing: parsing is where a name becomes a handle filter, so
+        # a stale contact set here is a silently wrong answer, not a slow one.
+        self.maybe_refresh_contacts()
         parse_started = time.time()
         parsed = parse_query(text, contact_index=self.contact_index)
         parsed = apply_filters(parsed, filters, contact_index=self.contact_index)

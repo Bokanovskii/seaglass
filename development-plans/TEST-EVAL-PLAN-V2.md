@@ -590,3 +590,104 @@ Measured under a *deliberately stale* index the numbers are lower
 keeps the recency guarantees exact when the index is hours behind, which
 is the whole point of it, while a limit-20 caller necessarily trades some
 breadth for that freshness.
+
+---
+
+## 13. Contacts change under a running app; the index does not
+
+Prompted by "I just got a bunch more iCloud contacts — does the index
+handle new/deleted/changed contacts?"
+
+### 13.1 The index needs no rebuild, ever
+
+Chunk bodies are **name-free**: speakers are written as `Me:` / `Them:`,
+and no contact name or handle is embedded in `body_semantic` or stored in
+`chunks`. Names are resolved at *hydration* time from `ContactIndex`.
+
+So added, renamed and deleted contacts require **no reindex and no
+re-embed** — the entire correctness question is whether the in-memory
+`ContactIndex` is current.
+
+### 13.2 The real bug: a stale contact set is a *wrong answer*, not a raw handle
+
+`ContactIndex.load()` was called exactly once, in `warmup()`, and cached
+on the engine for the process lifetime. `ChatMetadataCache` (chat titles)
+was built from that same snapshot, once.
+
+The failure mode is not graceful. An unknown name still **fuzzy matches**
+at threshold 60, so the query resolves to *somebody else*. Measured on
+the real machine mid-iCloud-sync:
+
+- **142 of 642 contacts** could not be resolved by the running app.
+- `latest from Ben Gibson` → `people_participant: ['+14254492699',
+  '+33783059969']` — *Ben Galindo-Navarro* and *Ben Klamka (Bordeaux)* —
+  and **0 results**. The real Ben Gibson is `+13036380094`.
+
+A user reads that as "I have no messages from Ben", which is false.
+
+### 13.3 Fix: TTL refresh on the paths where a name turns into a filter
+
+`refresh_contacts()` re-reads the store, and rebuilds chat titles and
+drops the ranked-page cache *only if the contact set actually changed*
+(compared by fingerprint of `(display_name, sorted handles)`, so a rename
+or an added second number counts, but ordering does not).
+
+`maybe_refresh_contacts()` applies a **300s TTL** and is called from:
+
+- `search()`, **before `parse_query`** — parse is where a name becomes a
+  handle filter, so refreshing afterwards would still answer wrongly;
+- `suggest_contacts()` — autocomplete is where a missing contact is most
+  visible;
+- `POST /api/system/request-contacts`, unconditionally on grant — warmup
+  runs before any Cocoa event loop, so a first-run user is always denied
+  there and previously saw raw handles until they thought to restart.
+
+A failed read also resets the TTL, so a denied grant does not turn every
+query into another blocking attempt.
+
+### 13.4 Cost
+
+| operation | measured |
+|---|---|
+| `ContactIndex.load()` (642 contacts) | ~300–540 ms |
+| full refresh incl. 747 chat titles | 538 ms |
+| call within the TTL | 0.00 ms |
+
+So the worst case is ~0.5 s added to one query per five minutes, and only
+when contacts changed does anything downstream get rebuilt. Chosen over a
+background thread deliberately: refreshing *after* serving would leave the
+query that triggered it answering with the stale set — which is the exact
+bug being fixed.
+
+### 13.5 Verified
+
+- 20 tests in `tests/test_contacts_refresh.py`, **7 mutations applied and
+  all caught**. One test (`a failed read does not retry`) initially
+  survived its mutation because both branches returned `False`; rewritten
+  to count actual reads before being believed.
+- Live, after restart: `Ben Gibson` → `+13036380094`, **8 sessions**
+  (was 0), and contacts the running app cannot resolve went **142 → 0**.
+
+### 13.6 Not a regression: the residual `lexical_presence` failures
+
+The contacts work touches `engine.py` and `server.py` only, but two
+`lexical_presence` cases fail per run — and **a different two each run**,
+because the lexical suite samples random message fragments. Diagnosed at
+the parse layer:
+
+| fragment used as a query | date filter it produces |
+|---|---|
+| `not contagious after 12-24 of antibiotics` | Dec 21–27 2025 |
+| `landed. Expecting ~20min wait (~2:30p) for` | ±3d around now |
+| `tomorrow how do you feel about` | ±3d around now |
+
+The filter excludes the very message being searched for, so both
+retrieval arms are asked the wrong question. This is **§12.4**, and the
+new evidence is that it is not a one-off: it costs roughly 2/24 lexical
+cases on any given run, making it the dominant residual failure.
+
+Reading `~20min` as a date is unambiguously wrong. `tomorrow` is more
+delicate — extracting it is correct for a *user* query and wrong only
+when the text is a pasted quote. Still deferred, because retuning date
+extraction risks every legitimate date query and needs its own evaluation
+pass rather than a fix smuggled into a contacts change.

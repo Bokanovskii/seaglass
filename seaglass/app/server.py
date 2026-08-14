@@ -412,7 +412,13 @@ def create_app(engine, warmup_state, config, token: str):
         """
         from seaglass.imessage.contacts import request_contacts_access
 
-        return request_contacts_access()
+        result = request_contacts_access()
+        if result.get('granted'):
+            # Warmup gave up on contacts before the grant existed. Without
+            # this the user grants access and still sees raw handles until
+            # they think to restart the app.
+            engine.refresh_contacts()
+        return result
 
     @app.post('/api/system/relaunch')
     async def relaunch():
