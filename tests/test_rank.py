@@ -431,3 +431,98 @@ class TestExactPhraseLookup:
         # embedded quotes are escaped, not left to break the MATCH syntax
         assert exact_phrase_chunk_ids(con, '"classic"', [1]) == {1}
         assert exact_phrase_chunk_ids(con, '*', [1]) == set()
+
+
+class TestReservationPrefersRecentMatches:
+    """The recency reservation exists so a message from today can still be
+    found. It is not a licence to spend the page on recent messages that
+    have nothing to do with the query."""
+
+    def _ranked(self, now, day):
+        # Five strong-but-old sessions, then three recent ones: two with no
+        # verbatim match and one, slightly older, that has one.
+        ranked = [
+            RankedChunk(chunk_id=i, chat_id=i, start_ts=int(now - (500 + i) * day), rerank_score=6.0)
+            for i in range(1, 9)
+        ]
+        ranked += [
+            RankedChunk(chunk_id=90, chat_id=90, start_ts=int(now - 1 * day), rerank_score=-6.0),
+            RankedChunk(chunk_id=91, chat_id=91, start_ts=int(now - 2 * day), rerank_score=-6.0),
+            RankedChunk(chunk_id=92, chat_id=92, start_ts=int(now - 3 * day), rerank_score=-6.0),
+        ]
+        return ranked
+
+    def test_a_recent_verbatim_match_takes_the_slot_over_a_newer_non_match(self):
+        now = 1_700_000_000.0
+        day = 86400.0
+        ranked = self._ranked(now, day)
+
+        # 92 is the oldest of the three recent sessions but the only one
+        # holding the words the user typed.
+        head = order_sessions(
+            ranked, head_size=8, now=now, recent_slots=2, lexical_chunk_ids={92}
+        )[:8]
+        assert 92 in {s.chat_id for s in head}
+
+        # Without any lexical signal the reservation falls back to pure
+        # recency, which is the existing behaviour.
+        blind = order_sessions(ranked, head_size=8, now=now, recent_slots=2)[:8]
+        assert 90 in {s.chat_id for s in blind}
+
+    def test_the_reservation_does_not_swamp_a_small_page(self):
+        now = 1_700_000_000.0
+        day = 86400.0
+        ranked = self._ranked(now, day)
+
+        # Grogu asks for four sessions. Two fixed slots would be half the
+        # answer; at most one may be spent on recency.
+        head = order_sessions(ranked, head_size=4, now=now, recent_slots=2)[:4]
+        recent = {90, 91, 92} & {s.chat_id for s in head}
+        assert len(recent) <= 1
+        assert len(head) == 4
+
+    def test_the_default_page_size_is_unchanged(self):
+        now = 1_700_000_000.0
+        day = 86400.0
+        ranked = self._ranked(now, day)
+
+        head = order_sessions(ranked, head_size=8, now=now, recent_slots=2)[:8]
+        assert len({90, 91, 92} & {s.chat_id for s in head}) == 2
+
+
+class TestTermSignalGuidesTheReservation:
+    """A verbatim whole-phrase match is too rare to steer the reservation:
+    nobody has ever typed "what did kaya say about the boat" into a text
+    message. The BM25 arm's term matches are the usable signal."""
+
+    def test_term_match_wins_the_slot_over_a_newer_non_match(self):
+        now = 1_700_000_000.0
+        day = 86400.0
+        ranked = [
+            RankedChunk(chunk_id=i, chat_id=i, start_ts=int(now - (500 + i) * day), rerank_score=6.0)
+            for i in range(1, 9)
+        ]
+        ranked += [
+            RankedChunk(chunk_id=90, chat_id=90, start_ts=int(now - 1 * day), rerank_score=-6.0),
+            RankedChunk(chunk_id=91, chat_id=91, start_ts=int(now - 2 * day), rerank_score=-6.0),
+            RankedChunk(chunk_id=92, chat_id=92, start_ts=int(now - 3 * day), rerank_score=-6.0),
+        ]
+
+        head = order_sessions(
+            ranked, head_size=8, now=now, recent_slots=2, term_chunk_ids={92}
+        )[:8]
+        assert 92 in {s.chat_id for s in head}
+
+    def test_term_matches_do_not_change_scores(self):
+        """The term signal picks *which* recent session is worth a slot. It
+        must never boost a score, or every chunk containing "the" gains."""
+        now = 1_700_000_000.0
+        ranked = [
+            RankedChunk(chunk_id=i, chat_id=i, start_ts=int(now - i * 86400), rerank_score=float(i))
+            for i in range(1, 6)
+        ]
+        without = order_sessions(ranked, head_size=8, now=now, recent_slots=0)
+        with_terms = order_sessions(
+            ranked, head_size=8, now=now, recent_slots=0, term_chunk_ids={1, 2, 3}
+        )
+        assert [s.score for s in without] == [s.score for s in with_terms]

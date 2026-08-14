@@ -387,6 +387,7 @@ def retrieve(
     fused_top_k: int = FUSED_TOP_K,
     extra_sparse_queries: Sequence[str] = (),
     recency_slots: int = RECENCY_RESERVED_SLOTS,
+    term_ids_out: Optional[List[int]] = None,
 ) -> List[RetrievalResult]:
     """The Phase 4a baseline pipeline: pre-filter -> dense + sparse ->
     RRF fuse -> top `fused_top_k`. No reranker (Phase 4b).
@@ -419,6 +420,13 @@ def retrieve(
         extra_ids = sparse_search(index_con, extra_query, candidate_ids, top_k=sparse_top_k)
         if extra_ids:
             ranked_lists.append(extra_ids)
+
+    if term_ids_out is not None:
+        # Which candidates matched on the query's terms at all. Session
+        # ranking must not *score* on this -- BM25 matches "the" -- but the
+        # recency reservation needs it to tell a recent session that is
+        # about the query from one that is merely recent.
+        term_ids_out.extend(dict.fromkeys(sparse_ids + phrase_ids))
 
     fused = rrf_fuse(ranked_lists, k=rrf_k, top_k=fused_top_k)
     matched = list(dict.fromkeys([cid for arm in ranked_lists for cid in arm]))

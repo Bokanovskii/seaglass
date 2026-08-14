@@ -338,6 +338,7 @@ class SearchEngine:
             )
 
         retrieve_started = time.time()
+        term_ids: list[int] = []
         fused = retrieve(
             self.index_con,
             parsed,
@@ -345,6 +346,7 @@ class SearchEngine:
             chat_con=self.chat_con,
             fused_top_k=options.fused_top_k,
             extra_sparse_queries=options.expansions,
+            term_ids_out=term_ids,
         )
         timings['retrieve'] = round(time.time() - retrieve_started, 4)
 
@@ -399,7 +401,9 @@ class SearchEngine:
         lexical_ids = exact_phrase_chunk_ids(
             self.index_con, parsed.semantic, [r.chunk_id for r in fused]
         )
-        ordered = self._ordered_sessions(ranked, scored, options, lexical_ids)
+        ordered = self._ordered_sessions(
+            ranked, scored, options, lexical_ids, term_ids=set(term_ids)
+        )
         return self._finish(ordered, options, timings, t0, candidate_ids, parsed, aggregate_started)
 
     def _browse_recent(self, text, parsed, candidate_ids, options, timings, t0) -> dict:
@@ -530,7 +534,8 @@ class SearchEngine:
         return payload
 
     @staticmethod
-    def _ordered_sessions(ranked, scored, options: SearchOptions, lexical_ids=None) -> list:
+    def _ordered_sessions(ranked, scored, options: SearchOptions, lexical_ids=None,
+                          term_ids=None) -> list:
         """Page 1 comes from the usual RERANK_TOP_K cut; later pages are the
         rest of the scored candidates in score order, appended.
 
@@ -543,7 +548,8 @@ class SearchEngine:
         unpaginated search while later pages keep going.
         """
         head = order_sessions(
-            ranked, head_size=options.max_sessions, lexical_chunk_ids=lexical_ids
+            ranked, head_size=options.max_sessions, lexical_chunk_ids=lexical_ids,
+            term_chunk_ids=term_ids,
         )
         if not scored or len(scored) <= len(ranked):
             return head
@@ -552,7 +558,8 @@ class SearchEngine:
         # page 1, and re-applying it here would pull recent-but-weak matches
         # ahead of stronger ones deep in the list.
         tail = order_sessions(
-            scored, head_size=0, recent_slots=0, lexical_chunk_ids=lexical_ids
+            scored, head_size=0, recent_slots=0, lexical_chunk_ids=lexical_ids,
+            term_chunk_ids=term_ids,
         )
         return head + [s for s in tail if (s.chat_id, s.day) not in seen]
 

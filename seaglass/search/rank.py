@@ -214,6 +214,7 @@ def aggregate_sessions(
     now: Optional[float] = None,
     recent_slots: int = RECENT_SESSION_SLOTS,
     lexical_chunk_ids: Optional[Iterable[int]] = None,
+    term_chunk_ids: Optional[Iterable[int]] = None,
 ) -> List[Session]:
     """The first page of `order_sessions` -- see there for the details."""
     return order_sessions(
@@ -222,6 +223,7 @@ def aggregate_sessions(
         now=now,
         recent_slots=recent_slots,
         lexical_chunk_ids=lexical_chunk_ids,
+        term_chunk_ids=term_chunk_ids,
     )[:max_sessions]
 
 
@@ -232,6 +234,7 @@ def order_sessions(
     now: Optional[float] = None,
     recent_slots: int = RECENT_SESSION_SLOTS,
     lexical_chunk_ids: Optional[Iterable[int]] = None,
+    term_chunk_ids: Optional[Iterable[int]] = None,
 ) -> List[Session]:
     """Step 6a: dedup by chunk_id (a chunk can only appear once in `ranked`
     already, since it came from a single top-k rerank pass, but this stays
@@ -247,9 +250,15 @@ def order_sessions(
     """
     now = time.time() if now is None else now
     lexical_chunk_ids = set(lexical_chunk_ids or ())
+    # Chunks that matched on the query's *terms* (the BM25 arm), as opposed
+    # to the whole phrase. Too weak to score on -- BM25 will match "the" --
+    # but exactly the right signal for choosing which recent session is
+    # worth a reserved slot.
+    term_chunk_ids = set(term_chunk_ids or ())
     groups: Dict[Tuple[int, str], Session] = {}
     latest_ts: Dict[Tuple[int, str], float] = {}
     lexical_ts: Dict[Tuple[int, str], float] = {}
+    term_keys: set = set()
     seen_chunk_ids: set = set()
     for chunk in ranked:
         if chunk.chunk_id in seen_chunk_ids:
@@ -265,6 +274,8 @@ def order_sessions(
         session.score += _sigmoid(chunk.rerank_score)
         session.hit_chunk_ids.append(chunk.chunk_id)
         latest_ts[key] = max(latest_ts.get(key, 0.0), float(chunk.start_ts))
+        if chunk.chunk_id in term_chunk_ids:
+            term_keys.add(key)
         if chunk.chunk_id in lexical_chunk_ids:
             # Freshness is judged on the newest verbatim match in the
             # session, not on the session's newest chunk overall.
@@ -277,7 +288,8 @@ def order_sessions(
 
     sessions = sorted(groups.values(), key=lambda s: s.score, reverse=True)
     return _reserve_recent_sessions(
-        sessions, latest_ts, head_size=head_size, slots=recent_slots
+        sessions, latest_ts, head_size=head_size, slots=recent_slots,
+        lexical_keys=set(lexical_ts) | term_keys,
     )
 
 
@@ -287,6 +299,7 @@ def _reserve_recent_sessions(
     *,
     head_size: int,
     slots: int,
+    lexical_keys: Optional[set] = None,
 ) -> List[Session]:
     """Reorder so the newest matches are guaranteed a place in the first
     `head_size` sessions. See RECENT_SESSION_SLOTS.
@@ -298,13 +311,30 @@ def _reserve_recent_sessions(
     if slots <= 0 or len(sessions) <= head_size:
         return sessions
 
+    # The reservation is a fixed count, so its share of the page grows as
+    # the page shrinks: two slots is a quarter of the default eight but
+    # half of the four Grogu asks for. Half an answer to "what did Kaya say
+    # about the boat" being whatever she said most recently is not a
+    # recency guarantee, it is a different query.
+    slots = min(slots, max(1, head_size // 3))
+
     keep = max(0, head_size - slots)
     selected = sessions[:keep]
     selected_keys = {(s.chat_id, s.day) for s in selected}
 
+    lexical_keys = lexical_keys or set()
     newest = sorted(
         (s for s in sessions if (s.chat_id, s.day) not in selected_keys),
-        key=lambda s: latest_ts[(s.chat_id, s.day)],
+        # Among the candidates the reservation may draw from, one that
+        # actually contains the words the user typed beats one that is
+        # merely newer. The boat conversation from two days ago lost its
+        # place to two days with no mention of a boat at all, which is the
+        # reservation defeating its own purpose: the point is to surface
+        # recent *matches*, not recent messages.
+        key=lambda s: (
+            (s.chat_id, s.day) in lexical_keys,
+            latest_ts[(s.chat_id, s.day)],
+        ),
         reverse=True,
     )
     for session in newest[: head_size - len(selected)]:
