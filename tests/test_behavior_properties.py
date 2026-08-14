@@ -243,3 +243,47 @@ class TestTheOracleAllowsTheEngineToReachPastTheIndex:
         scores = self._score(unindexed=0)
         assert scores["newest_is_true_newest"] == 0.0
         assert scores["newest_is_indexed"] == 0.0
+
+    def _recall(self, unindexed, index_con):
+        from seaglass.eval.behavior import score_against_oracle
+
+        # Truth head: the newest message is unindexed, the older one is.
+        newest = {"message_id": 2, "ts": 200.0, "text": "newest, not indexed"}
+        older = {"message_id": 1, "ts": 100.0, "text": "older, indexed"}
+        parsed = SimpleNamespace(
+            people_sender=["+1"], semantic="", date_from=None, date_to=None,
+            has_media=False, from_me=None,
+        )
+        case = Case(query="latest from x", cls="person_recency", expect_handles=["+1"])
+        # The engine answers with the newest message only, as a limited
+        # caller like grogu would.
+        return score_against_oracle(
+            parsed,
+            self._payload(2, 200.0, unindexed),
+            self._oracle([newest, older]),
+            index_horizon=None,
+            index_con=index_con,
+            case=case,
+        )
+
+    @staticmethod
+    def _index_con_with_only(msg_id):
+        import sqlite3
+
+        con = sqlite3.connect(":memory:")
+        con.execute("CREATE TABLE chunk_message (chunk_id INTEGER, msg_id INTEGER)")
+        con.execute("INSERT INTO chunk_message VALUES (1, ?)", (msg_id,))
+        return con
+
+    def test_recall_is_not_clipped_to_the_indexed_half_when_the_tail_ran(self):
+        """Clipping demanded the *older*, indexed message and marked a
+        correctly-newest answer a recall miss."""
+        con = self._index_con_with_only(1)
+        assert self._recall(unindexed=3, index_con=con)["recall_top"] == 0.5
+
+    def test_recall_is_still_clipped_for_an_index_only_answer(self):
+        con = self._index_con_with_only(1)
+        scores = self._recall(unindexed=0, index_con=con)
+        # Only message 1 is reachable, and the answer does not contain it.
+        assert scores["recall_top"] == 0.0
+        assert scores["indexed_coverage"] == 0.5

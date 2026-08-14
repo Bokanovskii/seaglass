@@ -551,8 +551,42 @@ Re-run a single-case recency failure before believing it. A failure that
 does not reproduce on a live corpus is evidence about the clock, not
 about the engine.
 
+### 12.5b Recall was clipped to the indexed half as well
+
+The same assumption as §12.1 lived a second time, twenty lines below it:
+`reachable` filtered the truth head to messages present in
+`chunk_message`. When the tail is live the newest messages are reachable
+*because* they are unindexed, so this demanded the older, indexed half of
+the head and marked a correctly-newest answer a recall miss. It hit grogu
+hardest — 31 cases — because its 20-message limit was entirely filled by
+newer, real results. Same fix, same guard: dropped only when the payload
+declares `unindexed_included`, with a test pinning that an index-only
+answer is still clipped.
+
+The lesson generalises past this one flag: **when a component gains a new
+capability, every place the harness encoded the old limit as an
+assumption becomes a false failure.** Grep for the assumption, do not fix
+the first instance and stop.
+
 ### 12.6 Result
 
-226 cases, app target: all sixteen properties at 1.00 except
-`lexical_presence` (23/24, §12.4). `newest_is_true_newest` went 0.79 →
-1.00. `precision` 0.99–1.00, `recall_top` 1.00.
+226 cases against a synced index, both targets, **zero failures**:
+
+| metric | app | grogu |
+|---|---|---|
+| properties | 16/16 at 1.00 | 16/16 at 1.00 |
+| `newest_is_true_newest` | 1.00 (was 0.79) | 1.00 |
+| `precision` | 1.00 | 1.00 |
+| `recall_top` | 1.00 | 1.00 |
+| `lexical_presence` | 24/24 | 24/24 |
+
+`recency_session_order` is checked only on the app (111 cases) and
+`context_after_hits` only on grogu (221) — each grades a shape only that
+target emits, which is correct, not a gap.
+
+Measured under a *deliberately stale* index the numbers are lower
+(`precision`/`recall_top` 0.966 for grogu, `indexed_coverage` 0.0) while
+`newest_is_true_newest` and `newest_present` stay at 1.00 — the tail
+keeps the recency guarantees exact when the index is hours behind, which
+is the whole point of it, while a limit-20 caller necessarily trades some
+breadth for that freshness.

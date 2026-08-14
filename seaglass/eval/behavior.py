@@ -440,7 +440,15 @@ def score_against_oracle(
             )
         }
         scores_extra["indexed_coverage"] = len(present) / len(head)
-        reachable = [mid for mid in head if mid in present] or head
+        # Same allowance as the horizon above: "the index never chunked it"
+        # only bounds what the engine can return while the index is the
+        # only thing it reads. Once the tail is live the newest messages
+        # are reachable *because* they are unindexed, so clipping recall to
+        # the indexed subset demands the older half of the head and marks a
+        # correctly-newest answer as a recall miss -- 31 grogu cases, whose
+        # limit of 20 messages was entirely filled by newer, real results.
+        if not payload.get("unindexed_included"):
+            reachable = [mid for mid in head if mid in present] or head
 
     truth_ids = {m["message_id"] for m in truth}
     got_ids = {m.get("message_id") for m in _hits(payload)}
