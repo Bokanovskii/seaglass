@@ -369,3 +369,84 @@ Three queries per target exceeded 10 s during the run, on *different*
 queries for each target, and all four re-ran in under 2 s: the machine
 stalled mid-run, not the code. Judge p50/p90, and re-measure outliers
 before believing them.
+
+## 11. Auditing the suite: what a clean report was hiding
+
+§10 ended with every property at 1.00 and 0 failing queries on both
+targets. That is the shape of a suite that has stopped measuring, so the
+next step was to audit the properties themselves rather than trust them.
+
+### 11.1 Properties that could not fail
+
+| property | what it actually asked | cases graded |
+| --- | --- | --- |
+| `freshness_declared` | `"index_stale" in payload` | 208, all pass by construction |
+| `ordering_declared` | `"ordering" in payload` | 208, all pass by construction |
+| `hits_before_context` | is the first session non-empty | duplicate of `no_empty_sessions` |
+| `lexical_presence` | verbatim phrase present | **6** of 208 |
+
+Three of sixteen properties were structurally incapable of failing, and
+they contributed three guaranteed 1.00 rows to every report. The fourth
+-- the property that has caught more real defects than any other -- was
+graded on six cases, all drawn from the newest 600 messages, i.e. one
+week of one conversation.
+
+### 11.2 The scorer was repairing the answer before grading it
+
+Worse than a weak property: `as_grogu_shows_it` split the flat list
+Grogu returns into `messages` and `context_messages`, and
+`_flat_in_caller_order` reassembled it as hits-then-context. Grogu's
+actual emitted order was discarded and replaced with the order the
+properties expected, so **no ordering defect in the code under test was
+observable**.
+
+### 11.3 Two real defects found underneath the clean report
+
+Both in `grogu_imessage.py`, both live while §10 reported 1.00.
+
+| # | defect | why the suite missed it |
+| --- | --- | --- |
+| 1 | Flattened output was grouped by session, so session 1's *context* -- usually a message the user sent themselves, matching nothing -- outranked session 2's actual **match**. The exact defect PR #30 fixed and PR #33 reintroduced. | The property named `hits_before_context` never checked it; the scorer re-sorted the output anyway. Grogu's own `test_hits_are_spent_before_context` compared a **set** at `limit=4`, so it graded budget allocation, never reading order. |
+| 2 | `match_score` ranking lived inside the budget-sharing path, so `_flatten_seaglass_result(payload)` with no limit returned messages in the order they were sent, with the match buried among its neighbours. | Every eval case drives `search_via_seaglass`, which always passes `limit=20`. The unlimited path had no coverage. |
+
+### 11.4 What changed
+
+- `freshness_declared` now requires staleness to agree with the count of
+  messages the answer could not see (`(behind > 0) == stale`, which is
+  exactly `engine._freshness_fields`' invariant).
+- `ordering_declared` now requires the value to be known, and a declared
+  chronological answer to actually be chronological -- for a target that
+  emits one flat list. A nested payload has no single order, which is
+  what `recency_order` / `recency_session_order` already grade.
+- `hits_before_context` is replaced by `context_after_hits`, read off the
+  order the caller actually receives.
+- `as_grogu_shows_it` records `_caller_order`; `_flat_in_caller_order`
+  reads it back verbatim.
+- Verbatim phrases: 6 -> **24**, strided across 4000 messages so they
+  span months and speakers, still deterministic.
+- `tests/test_behavior_properties.py` (17 tests) feeds each property a
+  payload violating exactly one invariant. A property that stops
+  discriminating now fails a test instead of reading 1.00 forever.
+
+### 11.5 Re-measured
+
+Against the *pre-fix* Grogu, the rewritten property scores **0.83** on
+`person_topical` and names the failing query -- where the old suite
+reported 1.00 on everything. Against the fixed code it returns to 1.00.
+
+Full run, 226 cases (208 + 18 new verbatim), both targets:
+
+| property | app | grogu | graded |
+| --- | --- | --- | --- |
+| `context_after_hits` | `--` | 1.00 | 224 |
+| `lexical_presence` | 1.00 | 1.00 | 24 |
+| `freshness_declared` | 1.00 | 1.00 | 226 |
+| `ordering_declared` | 1.00 | 1.00 | 226 |
+| everything else | 1.00 | 1.00 | as §10 |
+
+0 failing queries on both sides -- but now the properties have been shown
+to fail on code that deserves it.
+
+**The rule this earns:** a property that has never failed is not
+evidence, it is an untested assertion. Before believing a clean report,
+break the code on purpose and confirm the suite notices.
