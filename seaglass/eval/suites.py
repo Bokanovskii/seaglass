@@ -46,8 +46,16 @@ PERSON_DATE = [
     "texts from {name} last month",
 ]
 
+# Split by who the person is in the sentence. "what did Kaya say about
+# dinner" asks for *her* messages; "conversation with Kaya about plans" asks
+# for the conversation, in which other people legitimately speak. Scoring
+# both against "every hit was written by Kaya" made the second class fail
+# for being right.
 PERSON_TOPICAL = [
     "what did {name} say about dinner",
+]
+
+PERSON_TOPICAL_PARTICIPANT = [
     "{name} about work",
     "conversation with {name} about plans",
 ]
@@ -267,6 +275,37 @@ def _in_index(engine, phrase: str) -> bool:
     return row is not None
 
 
+# TEST-EVAL-PLAN-V2.md §4. The suite used to render every name in its
+# address-book capitalization, which is the one form the parser was known to
+# handle -- so it could only confirm the parser's own assumption. These are
+# the forms people actually type.
+SURFACE_FORMS = {
+    "plain": lambda name: name,
+    "lower": lambda name: name.lower(),
+    "upper": lambda name: name.upper(),
+    "punctuated": lambda name: name.lower() + "?",
+    "quoted": lambda name: '"' + name.lower() + '"',
+    "typo": lambda name: _typo(name),
+}
+
+# Applied to the person classes whose correctness does not depend on the
+# wording, one form per name so the suite grows by |forms| rather than by
+# |forms| x |templates| x |names|.
+SURFACE_TEMPLATES = [
+    "messages from {name}",
+    "recent messages from {name}",
+    "what did {name} say",
+]
+
+POSSESSIVE = ["{name}'s latest messages"]
+
+
+def _handles(engine, name: str) -> List[str]:
+    if engine.contact_index is None:
+        return []
+    return list(engine.contact_index.handle_ids_for_names(name, threshold=85.0))
+
+
 def build_suite(engine, path: Optional[Path] = None) -> List[Case]:
     if path is not None:
         raw = json.loads(path.read_text())
@@ -281,30 +320,69 @@ def build_suite(engine, path: Optional[Path] = None) -> List[Case]:
         for template in templates:
             if "{name}" in template:
                 for name in pool:
-                    cases.append(Case(template.format(name=name), cls, **kwargs))
+                    # Every person case now declares who it asked for, so a
+                    # dropped person filter fails loudly instead of making
+                    # the filter properties inapplicable (§3).
+                    cases.append(Case(
+                        template.format(name=name), cls,
+                        expect_handles=_handles(engine, name), expect_person=name,
+                        **kwargs,
+                    ))
             elif "{name_typo}" in template:
                 for name in pool:
-                    cases.append(Case(template.format(name_typo=_typo(name)), cls, **kwargs))
+                    cases.append(Case(
+                        template.format(name_typo=_typo(name)), cls,
+                        expect_handles=_handles(engine, name), expect_person=name,
+                        **kwargs,
+                    ))
             else:
                 cases.append(Case(template, cls, **kwargs))
 
-    add(PERSON_RECENCY, "person_recency", pool=recent)
-    add(PERSON_ONLY, "person_only")
-    add(PERSON_DATE, "person_date", pool=recent)
+    add(PERSON_RECENCY, "person_recency", pool=recent, oracle_scored=True)
+    add(PERSON_ONLY, "person_only", oracle_scored=True)
+    add(PERSON_DATE, "person_date", pool=recent, oracle_scored=True, expect_date=True)
     add(PERSON_TOPICAL, "person_topical", expects_results=False)
-    add(DATE_ONLY, "date_only")
+    add(PERSON_TOPICAL_PARTICIPANT, "person_topical_participant",
+        expects_results=False, expect_sender=False)
+    add(DATE_ONLY, "date_only", expect_date=True)
     add(TOPICAL, "topical", expects_results=False)
     add(TOPICAL_DATE, "topical_date", expects_results=False)
-    add(MEDIA, "media", expects_results=False)
-    add(SELF, "self", expects_results=False)
+    add(MEDIA, "media", expects_results=False, expect_media=True)
+    add(SELF, "self", expects_results=False, expect_from_me=True)
     add(AMBIGUOUS, "ambiguous", expects_results=False)
     add(NATURAL, "natural", expects_results=False)
     add(ADVERSARIAL, "adversarial", expects_results=False)
     add(GROUP, "group", expects_results=False)
-    add(SELF_TOPICAL, "self_topical", pool=recent, expects_results=False)
+    add(SELF_TOPICAL, "self_topical", pool=recent, expects_results=False,
+        expect_from_me=True)
     add(PERSON_MEDIA, "person_media", pool=recent, expects_results=False)
-    add(TIME_OF_DAY, "time_of_day", expects_results=False)
+    add(TIME_OF_DAY, "time_of_day", expects_results=False, expect_date=True)
     add(NAME_TYPO, "name_typo", pool=recent, expects_results=False)
     for phrase in _corpus_phrases(engine):
         cases.append(Case(phrase, "lexical", lexical=phrase, expects_results=False))
+
+    # Surface forms: the same intent, typed the way people type it.
+    for name in recent:
+        handles = _handles(engine, name)
+        for form, render in SURFACE_FORMS.items():
+            for template in SURFACE_TEMPLATES:
+                # "what did kaya? say" is not a query anyone types; trailing
+                # punctuation only belongs on a trailing name.
+                if form == "punctuated" and not template.rstrip().endswith("{name}"):
+                    continue
+                cases.append(Case(
+                    template.format(name=render(name)),
+                    f"surface_{form}",
+                    expect_handles=handles,
+                    expect_person=name,
+                    form=form,
+                    oracle_scored="say" not in template,
+                    expects_results=False,
+                ))
+        for template in POSSESSIVE:
+            cases.append(Case(
+                template.format(name=name.lower()), "surface_possessive",
+                expect_handles=handles, expect_person=name, form="possessive",
+                oracle_scored=True, expects_results=False,
+            ))
     return cases

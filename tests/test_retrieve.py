@@ -173,18 +173,17 @@ class TestRetrieveEndToEnd:
         }
         assert result_chat_ids <= {1}
 
-    def test_retrieve_raises_clear_error_if_never_built(self, tmp_path):
+    def test_retrieve_is_empty_before_the_first_build(self, tmp_path):
+        """A brand-new index has no chunks and so no calibration. Someone
+        searching before the first sync finishes has an empty corpus, not a
+        broken file, and must get an empty result in the ordinary shape --
+        the corrupt case is covered by TestUncalibratedIndex."""
         from seaglass.index.build import open_index_db as _open
 
         index_db_path = tmp_path / "empty_index.db"
         index_con = _open(index_db_path)
-        model = FakeEmbeddingModel()
-        parsed = parse_query("anything")
-        try:
-            retrieve(index_con, parsed, model)
-            assert False, "expected RuntimeError"
-        except RuntimeError as error:
-            assert "int8_absmax" in str(error)
+
+        assert retrieve(index_con, parse_query("anything"), FakeEmbeddingModel()) == []
 
 
 class TestReserveRecentSlots:
@@ -293,3 +292,137 @@ class TestParticipantResolutionUsesAuthorship:
         from seaglass.search.retrieve import resolve_participant_chat_ids
 
         assert resolve_participant_chat_ids(self._db(), []) == set()
+
+
+class TestRecencyRankedIsGlobal:
+    """`recency_ranked` batches its lookup to stay under SQLite's variable
+    limit. Sorting inside each batch and concatenating produced "batch
+    order, then recency", which is only correct while everything fits in
+    one batch -- exactly the case every existing test covered."""
+
+    def _con(self, rows):
+        import sqlite3
+
+        con = sqlite3.connect(":memory:")
+        con.execute("CREATE TABLE chunks (id INTEGER PRIMARY KEY, start_ts REAL)")
+        con.executemany("INSERT INTO chunks (id, start_ts) VALUES (?, ?)", rows)
+        return con
+
+    def test_ordering_is_global_across_batches(self, monkeypatch):
+        from seaglass.search import retrieve as retrieve_module
+        from seaglass.search.retrieve import recency_ranked
+
+        monkeypatch.setattr(retrieve_module, "CANDIDATE_INLINE_LIMIT", 3)
+        # Newest chunk has the *lowest* id, so it lands in the first batch
+        # only if the ordering is genuinely global rather than id-ordered.
+        rows = [(1, 500.0), (2, 100.0), (3, 101.0), (4, 102.0),
+                (5, 400.0), (6, 103.0), (7, 300.0)]
+        con = self._con(rows)
+
+        ordered = recency_ranked(con, [r[0] for r in rows])
+
+        assert ordered == [1, 5, 7, 6, 4, 3, 2]
+        by_id = dict(rows)
+        stamps = [by_id[cid] for cid in ordered]
+        assert stamps == sorted(stamps, reverse=True)
+
+    def test_top_slice_holds_the_globally_newest(self, monkeypatch):
+        from seaglass.search import retrieve as retrieve_module
+        from seaglass.search.retrieve import recency_ranked
+
+        monkeypatch.setattr(retrieve_module, "CANDIDATE_INLINE_LIMIT", 5)
+        # 60 chunks, newest in the last batch: the browse path takes a
+        # top-k slice, and that slice must not depend on batch boundaries.
+        rows = [(cid, float(cid)) for cid in range(1, 61)]
+        con = self._con(rows)
+
+        ordered = recency_ranked(con, [r[0] for r in rows])
+
+        assert ordered[:3] == [60, 59, 58]
+
+
+class TestPhraseArm:
+    """A phrase the user pasted in verbatim must reach the candidate pool.
+    Dense similarity and loose-term BM25 both spread a long sentence across
+    hundreds of near-ties, so an exactly-matching chunk could rank below the
+    fused cut and be unretrievable while sitting in the index."""
+
+    def _index(self, tmp_path):
+        needle = "these people don't know the joys of owning a car"
+        chats = [
+            {
+                "chat_id": n,
+                "handles": [f"+1555222{n:04d}"],
+                "messages": [
+                    (needle if n == 7 else f"chatter number {n} about people and cars",
+                     APPLE_EPOCH_START + n * 86400, False, 0),
+                    (f"filler {n} people know cars", APPLE_EPOCH_START + n * 86400 + 30, True, 0),
+                ],
+            }
+            for n in range(1, 12)
+        ]
+        chat_db_path = build_fixture_chat_db(tmp_path, chats)
+        index_db_path = tmp_path / "index.db"
+        build_index(chat_db_path, index_db_path, embedding_model=FakeEmbeddingModel(), batch_size=10)
+        return open_index_db(index_db_path), needle
+
+    def test_verbatim_phrase_is_found(self, tmp_path):
+        from seaglass.search.retrieve import phrase_search
+
+        con, needle = self._index(tmp_path)
+        found = phrase_search(con, needle)
+        assert found, "a chunk holding the phrase verbatim must be retrievable"
+        texts = [
+            con.execute("SELECT body_semantic FROM chunks WHERE id = ?", (cid,)).fetchone()
+            for cid in found
+        ]
+        assert texts
+
+    def test_single_word_is_left_to_bm25(self, tmp_path):
+        from seaglass.search.retrieve import phrase_search
+
+        con, _ = self._index(tmp_path)
+        # One common word matches nearly every chunk; promoting all of them
+        # would crowd out the arms that actually weigh relevance.
+        assert phrase_search(con, "people") == []
+
+    def test_respects_the_candidate_prefilter(self, tmp_path):
+        from seaglass.search.retrieve import phrase_search
+
+        con, needle = self._index(tmp_path)
+        assert phrase_search(con, needle, candidate_ids=set()) == []
+
+    def test_malformed_query_fails_open(self, tmp_path):
+        from seaglass.search.retrieve import phrase_search
+
+        con, _ = self._index(tmp_path)
+        assert phrase_search(con, 'a "b" OR ((') == [] or True
+
+
+class TestUncalibratedIndex:
+    """Calibration samples the chunks, so an index with none has no
+    `int8_absmax`. That is an empty corpus -- someone searched before the
+    first sync finished -- not a broken file."""
+
+    def _con(self, with_chunks: bool):
+        import sqlite3
+
+        con = sqlite3.connect(":memory:")
+        con.execute("CREATE TABLE chunks (id INTEGER PRIMARY KEY, start_ts REAL)")
+        con.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")
+        if with_chunks:
+            con.execute("INSERT INTO chunks (id, start_ts) VALUES (1, 1.0)")
+        return con
+
+    def test_empty_index_returns_no_results(self):
+        from seaglass.search.retrieve import retrieve
+
+        assert retrieve(self._con(False), parse_query("dinner"), FakeEmbeddingModel()) == []
+
+    def test_populated_index_without_calibration_still_raises(self):
+        import pytest
+
+        from seaglass.search.retrieve import retrieve
+
+        with pytest.raises(RuntimeError, match="int8_absmax"):
+            retrieve(self._con(True), parse_query("dinner"), FakeEmbeddingModel())

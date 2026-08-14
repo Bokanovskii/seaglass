@@ -306,7 +306,9 @@ def _running_app_lock() -> Optional[dict]:
     return lock
 
 
-def _search_via_running_app(query: str, *, max_sessions: int, redact: bool) -> Optional[dict]:
+def _search_via_running_app(
+    query: str, *, max_sessions: int, redact: bool, offset: int = 0
+) -> Optional[dict]:
     """Answer from the already-running desktop app, if there is one.
 
     The app holds the embedding model, the cross-encoder and a warm SQLite
@@ -354,7 +356,11 @@ def _search_via_running_app(query: str, *, max_sessions: int, redact: bool) -> O
             {
                 "query": query,
                 "filters": {},
-                "options": {"max_sessions": max_sessions, "redact": redact},
+                "options": {
+                    "max_sessions": max_sessions,
+                    "redact": redact,
+                    "offset": offset,
+                },
                 "assist": "off",
             },
             timeout=120.0,

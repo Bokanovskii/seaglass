@@ -25,10 +25,12 @@ except ImportError:  # pragma: no cover
     phonenumbers = None
 
 try:
-    from rapidfuzz import fuzz, process as rf_process
+    from rapidfuzz import distance as rf_distance, fuzz, process as rf_process, utils as rf_utils
 except ImportError:  # pragma: no cover
     fuzz = None
     rf_process = None
+    rf_utils = None
+    rf_distance = None
 
 DEFAULT_REGION = "US"
 
@@ -64,6 +66,15 @@ def _normalise_handle(raw: str, region: str = DEFAULT_REGION) -> str:
     normalised = _normalise_phone(raw, region)
     return normalised or raw
 
+
+
+def _fold_name(raw: str) -> str:
+    """Case- and accent-folded name, punctuation stripped, for exact
+    comparison. "Kaya-Rose O'Neill" and "kaya rose oneill" fold alike."""
+    decomposed = unicodedata.normalize("NFKD", raw or "")
+    stripped = "".join(c for c in decomposed if not unicodedata.combining(c))
+    cleaned = re.sub(r"[^\w\s]+", " ", stripped)
+    return " ".join(cleaned.lower().split())
 
 
 def contacts_authorization_status() -> int:
@@ -223,18 +234,81 @@ class ContactIndex:
     def fuzzy_match(self, query_tokens: str, threshold: float = 88.0) -> List[Contact]:
         """Fuzzy name -> contact match, used only above `threshold`
         (PLAN.md §6 Phase 4: "prefer omitting [the filter] to guessing").
+
+        Matching is case-insensitive. rapidfuzz applies no processor by
+        default, so without one "kaya" scored 0 against "Kaya Doe" while
+        "Kaya" scored 86 -- people type their friends' names in lower case
+        constantly, and every such query silently lost its person filter.
         """
         if rf_process is None or not self._names:
             return []
         matches = rf_process.extract(
-            query_tokens, self._names, scorer=fuzz.WRatio, score_cutoff=threshold, limit=5
+            query_tokens,
+            self._names,
+            scorer=fuzz.WRatio,
+            processor=rf_utils.default_process,
+            score_cutoff=threshold,
+            limit=5,
         )
         matched_names = {name for name, score, _ in matches}
         return [c for c in self._contacts if c.display_name in matched_names]
+
+    def handle_ids_for_similar_given_name(self, name: str) -> List[str]:
+        """Handles for contacts whose *given* name is one typo away.
+
+        Fuzzy WRatio against the full display name cannot separate these:
+        "Kaay" scores 77 against "Kaya Makivic" while "my mom" scores 85
+        against "Rogers Mom", so no threshold admits the typo without
+        admitting the wrong answer. Comparing against the given name with a
+        bounded edit distance does separate them -- one transposition, same
+        first letter, long enough that the edit is not most of the word.
+        """
+        wanted = _fold_name(name)
+        if len(wanted) < 4 or " " in wanted or rf_distance is None:
+            return []
+        handles: List[str] = []
+        for contact in self._contacts:
+            folded = _fold_name(contact.display_name)
+            if not folded:
+                continue
+            given = folded.split()[0]
+            if len(given) < 4 or given[0] != wanted[0]:
+                continue
+            # Optimal string alignment: a transposition is one edit, which
+            # is exactly the mistake people make typing a name.
+            if rf_distance.OSA.distance(wanted, given, score_cutoff=1) <= 1:
+                handles.extend(contact.handles)
+        return handles
 
     def handle_ids_for_names(self, query_tokens: str, threshold: float = 88.0) -> List[str]:
         """Convenience: fuzzy name match -> the handle strings to filter on."""
         handles: List[str] = []
         for contact in self.fuzzy_match(query_tokens, threshold):
             handles.extend(contact.handles)
+        return handles
+
+    def handle_ids_for_exact_name(self, name: str) -> List[str]:
+        """Handles for contacts whose name matches `name` exactly, ignoring
+        case and punctuation.
+
+        Used for name candidates that carry no capitalization evidence
+        ("from kaya"), where fuzzy matching is too loose to be safe -- a
+        lower-cased "the trip" partial-matches real contact names well above
+        the fuzzy threshold. An exact hit has no such failure mode.
+
+        Only the whole name and the *given* name count. Matching any token
+        read "from my mom" as the contact "Rogers Mom" -- somebody else's
+        mother, confidently and wrongly.
+        """
+        wanted = _fold_name(name)
+        if not wanted:
+            return []
+        handles: List[str] = []
+        for contact in self._contacts:
+            folded = _fold_name(contact.display_name)
+            if not folded:
+                continue
+            given = folded.split()[0]
+            if wanted == folded or (len(given) > 2 and wanted == given):
+                handles.extend(contact.handles)
         return handles

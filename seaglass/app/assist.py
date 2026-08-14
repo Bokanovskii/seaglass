@@ -8,7 +8,16 @@ from datetime import datetime
 from pathlib import Path
 
 from seaglass.app.config import APP_DB_PATH
-from seaglass.search.parse import DATE_PAD_DAYS, ParsedQuery
+from seaglass.search.parse import (
+    DATE_PAD_DAYS,
+    ParsedQuery,
+    _FILLER_WORDS,
+    _NOT_A_NAME,
+    _PARTICIPANT_PATTERN,
+    _SENDER_PATTERNS,
+    _name_candidates,
+    resolve_name,
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -37,12 +46,47 @@ class AssistCircuitBreaker:
 
 
 def should_assist(mode: str, parsed: ParsedQuery) -> bool:
+    """Is the LLM round trip worth its latency for this query?
+
+    `force` always asks. `auto` asks only when the deterministic parse looks
+    inadequate for the query it was given -- the fast paths (filter-only and
+    confidently-parsed queries) answer in well under a second, and spending
+    seconds of Copilot latency to re-derive filters the regex already found
+    makes the common case worse for nothing.
+
+    The old rule ("4+ words and no filters at all") had it backwards: it
+    read *any* extracted filter as "no help needed", so "recent messages
+    from kaya" -- where the date resolved but the person did not -- never
+    asked, which is exactly the query that needed asking.
+    """
     if mode == 'force':
         return True
     if mode != 'auto':
         return False
-    token_count = len(parsed.raw.split())
-    return token_count >= 4 and not parsed.people_participant and parsed.date_from is None and not parsed.has_media
+    if len(parsed.raw.split()) < 3:
+        return False
+    if _names_someone_unresolved(parsed):
+        return True
+    # Nothing structured came out of a query long enough to contain
+    # structure: either it is purely topical (assist can still supply
+    # keyword expansions) or the parser missed something.
+    has_filters = bool(parsed.people_participant or parsed.people_sender) or parsed.date_from is not None or parsed.has_media
+    return not has_filters and len(parsed.raw.split()) >= 4
+
+
+def _names_someone_unresolved(parsed: ParsedQuery) -> bool:
+    """A name-shaped word survived into the residual with no person filter
+    to show for it -- a misspelling, a nickname, or a contact we cannot see."""
+    if parsed.people_participant or parsed.people_sender or parsed.from_me:
+        return False
+    for pattern in _SENDER_PATTERNS + [_PARTICIPANT_PATTERN]:
+        for match in pattern.finditer(parsed.raw):
+            for candidate in _name_candidates(match.group(1)):
+                word = candidate.lower()
+                if word in _NOT_A_NAME or all(w in _FILLER_WORDS for w in word.split()):
+                    continue
+                return True
+    return False
 
 
 def build_prompt(query: str, *, today: str, weekday: str, tz_name: str) -> str:
@@ -64,7 +108,21 @@ def build_prompt(query: str, *, today: str, weekday: str, tz_name: str) -> str:
     )
 
 
-def merge_ghcp_parse(deterministic: ParsedQuery, raw: dict, contact_index, corpus_bounds) -> tuple[ParsedQuery, list[str], list[str]]:
+@dataclasses.dataclass
+class MergedParse:
+    """The result of folding a Copilot parse into the deterministic one."""
+
+    parse: ParsedQuery
+    changes: list[str] = dataclasses.field(default_factory=list)
+    expansions: list[str] = dataclasses.field(default_factory=list)
+    unresolved_people: list[str] = dataclasses.field(default_factory=list)
+
+    def __iter__(self):
+        # Kept unpackable as (merged, changes, expansions).
+        return iter((self.parse, self.changes, self.expansions))
+
+
+def merge_ghcp_parse(deterministic: ParsedQuery, raw: dict, contact_index, corpus_bounds) -> MergedParse:
     from dataclasses import replace
 
     merged = replace(deterministic)
@@ -72,9 +130,15 @@ def merge_ghcp_parse(deterministic: ParsedQuery, raw: dict, contact_index, corpu
     expansions: list[str] = []
 
     people = []
+    unresolved: list[str] = []
     for name in raw.get('people') or []:
-        found = contact_index.handle_ids_for_names(name, threshold=85.0) if contact_index is not None else []
-        people.extend(found)
+        found, _resolved = resolve_name(str(name), contact_index)
+        if found:
+            people.extend(found)
+        else:
+            # Saying "Copilot read this as people: kaya" while no contact
+            # could be resolved promises a filter that was never applied.
+            unresolved.append(str(name))
     if people:
         merged.people_participant = people
         changes.append('people')
@@ -104,7 +168,79 @@ def merge_ghcp_parse(deterministic: ParsedQuery, raw: dict, contact_index, corpu
             expansions.append(token)
         if len(expansions) == 5:
             break
-    return merged, changes, expansions
+    return MergedParse(parse=merged, changes=changes, expansions=expansions, unresolved_people=unresolved)
+
+
+def describe_parse(merged: ParsedQuery, contact_index, unresolved: list[str] | None = None) -> str:
+    """A one-line summary of what was actually applied.
+
+    Built from the *merged* parse rather than Copilot's raw JSON, so the
+    banner cannot claim a person filter that resolved to nobody.
+    """
+    parts: list[str] = []
+    names: list[str] = []
+    seen: set[str] = set()
+    for handle in list(merged.people_sender) + list(merged.people_participant):
+        name = contact_index.resolve_handle(handle) if contact_index is not None else None
+        name = name or handle
+        if name not in seen:
+            seen.add(name)
+            names.append(name)
+    if names:
+        parts.append(', '.join(names[:3]))
+    if merged.from_me:
+        parts.append('sent by me')
+    if merged.date_from is not None and merged.date_to is not None:
+        fmt = '%b %-d'
+        parts.append(
+            datetime.fromtimestamp(merged.date_from).strftime(fmt)
+            + ' – '
+            + datetime.fromtimestamp(merged.date_to).strftime(fmt)
+        )
+    if merged.has_media:
+        parts.append('with media')
+    is_group = getattr(merged, 'is_group', None)
+    if is_group is not None:
+        parts.append('group chats' if is_group else '1:1 chats')
+    if merged.semantic.strip():
+        parts.append(f'“{merged.semantic.strip()}”')
+    else:
+        parts.append('most recent')
+    if unresolved:
+        parts.append('no contact matched ' + ', '.join(unresolved))
+    return ' · '.join(parts)
+
+
+def assisted_search_args(merged: ParsedQuery, base_filters):
+    """Turn a merged parse into the (text, filters) pair `engine.search`
+    actually honours.
+
+    The engine re-parses whatever text it is given, so handing it the
+    original query text threw the whole merge away and applied nothing but
+    the keyword expansions -- the banner said "people: kaya · Aug 6 → Aug 13"
+    while the results were the un-assisted ones. Passing the topical residual
+    as the text and every extracted filter as *filters* is what makes the
+    assisted parse take effect.
+
+    Filters the user set explicitly in the UI win: they are a deliberate act,
+    the parse is an inference.
+    """
+    from dataclasses import replace as _replace
+
+    filters = _replace(base_filters)
+    if not filters.people_handles and not filters.people_names and merged.people_participant:
+        filters.people_handles = list(merged.people_participant)
+    if not filters.people_sender and merged.people_sender:
+        filters.people_sender = list(merged.people_sender)
+    if filters.from_me is None:
+        filters.from_me = merged.from_me
+    if filters.date_from is None and filters.date_to is None:
+        filters.date_from, filters.date_to = merged.date_from, merged.date_to
+    if filters.has_media is None and merged.has_media:
+        filters.has_media = True
+    if filters.is_group is None:
+        filters.is_group = getattr(merged, 'is_group', None)
+    return merged.semantic, filters
 
 
 def _semantic_overlaps(raw_query: str, semantic: str) -> bool:

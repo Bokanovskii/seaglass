@@ -21,8 +21,10 @@ from pydantic import BaseModel, Field
 from seaglass.app.assist import (
     AssistCircuitBreaker,
     AssistResult,
+    assisted_search_args,
     build_prompt,
     cache_key,
+    describe_parse,
     ensure_cache,
     get_cached_parse,
     merge_ghcp_parse,
@@ -33,6 +35,7 @@ from seaglass.app.config import save_config
 from seaglass.app.engine import SearchOptions
 from seaglass.app.filters import SearchFilters
 from seaglass.app.indexstate import IndexBuildState, run_build
+from seaglass.search.parse import parse_query
 from seaglass.llm.ghcp import call_ghcp_json_object
 
 STATIC_DIR = Path(__file__).resolve().parent / 'static'
@@ -91,12 +94,14 @@ class SearchAssistManager:
         self.cache = ensure_cache()
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         self.pending: dict[str, concurrent.futures.Future] = {}
+        self.submitted: dict[str, tuple[str, object]] = {}
         self.breaker = AssistCircuitBreaker()
 
     def submit(self, query: str, parsed, assist_mode: str) -> str | None:
         if self.breaker.open or not should_assist(assist_mode, parsed):
             return None
         token = secrets.token_urlsafe(16)
+        self.submitted[token] = (query, parsed)
         prompt = build_prompt(query, today=__import__('datetime').date.today().isoformat(), weekday=__import__('datetime').date.today().strftime('%A'), tz_name='local')
         key = cache_key(query, prompt_version='v1', today=__import__('datetime').date.today().isoformat(), aliases_mtime=0)
         cached = get_cached_parse(self.cache, key)
@@ -128,6 +133,23 @@ class SearchAssistManager:
         if isinstance(payload, dict) and payload.get('status') == 'unavailable':
             return AssistResult(status='unavailable', reason=payload.get('reason'))
         return payload
+
+    def merge(self, token: str, raw: dict, query: str | None = None):
+        """Fold a Copilot parse into the deterministic parse of the query it
+        was asked about.
+
+        The deterministic side used to be `parse_query('')` -- a parse of the
+        empty string -- so every filter the regex parser had already found was
+        dropped on the way through, and `changes` described a diff against
+        nothing.
+        """
+        submitted = self.submitted.get(token)
+        text = query if query is not None else (submitted[0] if submitted else '')
+        if submitted is not None and (query is None or query == submitted[0]):
+            deterministic = submitted[1]
+        else:
+            deterministic = parse_query(text, contact_index=self.engine.contact_index)
+        return merge_ghcp_parse(deterministic, raw, self.engine.contact_index, self.engine.corpus_bounds)
 
 
 def _bundle_path() -> str | None:
@@ -271,7 +293,7 @@ def create_app(engine, warmup_state, config, token: str):
         if int(body.options.get('offset') or 0) > 0:
             payload['assist_token'] = None
             return payload
-        parsed = __import__('seaglass.search.parse', fromlist=['parse_query']).parse_query(body.query, contact_index=engine.contact_index)
+        parsed = parse_query(body.query, contact_index=engine.contact_index)
         assist_token = assist_manager.submit(body.query, parsed, body.assist)
         payload['assist_token'] = assist_token
         return payload
@@ -283,25 +305,47 @@ def create_app(engine, warmup_state, config, token: str):
             return Response(status_code=204)
         if isinstance(result, AssistResult):
             return asdict(result)
-        deterministic = __import__('seaglass.search.parse', fromlist=['parse_query']).parse_query('', contact_index=engine.contact_index)
-        merged, changes, expansions = merge_ghcp_parse(deterministic, result, engine.contact_index, engine.corpus_bounds)
-        return {'status': 'ready' if changes or expansions else 'unchanged', 'parse': result, 'changes': changes, 'expansions': expansions, 'confidence': result.get('confidence')}
+        merged = assist_manager.merge(assist_token, result)
+        applied = bool(merged.changes or merged.expansions)
+        return {
+            'status': 'ready' if applied else 'unchanged',
+            'parse': result,
+            'changes': merged.changes,
+            'expansions': merged.expansions,
+            'unresolved_people': merged.unresolved_people,
+            'description': describe_parse(merged.parse, engine.contact_index, merged.unresolved_people),
+            'confidence': result.get('confidence'),
+        }
 
     @app.post('/api/search/apply-assist')
     async def apply_assist(body: dict):
-        assist_token = body['assist_token']
+        assist_token = body.get('assist_token')
+        if not assist_token:
+            # A malformed client request is a 400. Letting the KeyError
+            # escape turned a typo in the request body into a 500, which
+            # reads as "the search engine broke".
+            raise HTTPException(status_code=400, detail='assist_token is required')
         pending = assist_manager.get(assist_token)
         if pending is None or isinstance(pending, AssistResult):
             raise HTTPException(status_code=404, detail='Assist result unavailable')
-        deterministic = __import__('seaglass.search.parse', fromlist=['parse_query']).parse_query(body['query'], contact_index=engine.contact_index)
-        merged, changes, expansions = merge_ghcp_parse(deterministic, pending, engine.contact_index, engine.corpus_bounds)
+        merged = assist_manager.merge(assist_token, pending, query=body.get('query'))
         loop = __import__('asyncio').get_running_loop()
         filters = _coerce(SearchFilters, body.get('filters'))
         options = _coerce(SearchOptions, body.get('options'))
-        options.expansions = expansions
-        payload = await loop.run_in_executor(pipeline_pool, engine.search, merged.raw, filters, options)
+        options.expansions = merged.expansions
+        # The engine re-parses the text it is handed, so the merged filters
+        # have to travel as filters -- passing the original query text here
+        # applied nothing but the keyword expansions.
+        text, filters = assisted_search_args(merged.parse, filters)
+        payload = await loop.run_in_executor(pipeline_pool, engine.search, text, filters, options)
         payload['parse_source'] = 'ghcp'
-        payload['assist_changes'] = changes
+        payload['assist_changes'] = merged.changes
+        payload['assist_description'] = describe_parse(merged.parse, engine.contact_index, merged.unresolved_people)
+        # What "load more" must page, or the next page silently reverts to
+        # the un-assisted query.
+        payload['applied_query'] = text
+        payload['applied_filters'] = dataclasses.asdict(filters)
+        payload['request_id'] = body.get('request_id')
         return payload
 
     @app.get('/api/conversation')

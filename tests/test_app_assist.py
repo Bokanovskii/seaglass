@@ -1,6 +1,18 @@
 from __future__ import annotations
 
-from seaglass.app.assist import AssistCircuitBreaker, build_prompt, cache_key, ensure_cache, get_cached_parse, merge_ghcp_parse, put_cached_parse, should_assist
+from seaglass.app.assist import (
+    AssistCircuitBreaker,
+    assisted_search_args,
+    build_prompt,
+    cache_key,
+    describe_parse,
+    ensure_cache,
+    get_cached_parse,
+    merge_ghcp_parse,
+    put_cached_parse,
+    should_assist,
+)
+from seaglass.app.filters import SearchFilters
 from seaglass.imessage.contacts import Contact, ContactIndex
 from seaglass.search.parse import ParsedQuery
 
@@ -54,3 +66,82 @@ def test_circuit_breaker_opens_after_three_failures():
     breaker = AssistCircuitBreaker()
     breaker.record_failure(); breaker.record_failure(); breaker.record_failure()
     assert breaker.open is True
+
+
+def test_should_assist_auto_fires_when_a_name_went_unresolved():
+    # The query that exposed this: "recent messages from kaya" resolved a
+    # date but no person, and the old rule read *any* extracted filter as
+    # "no help needed" -- so the one query that needed assist never asked.
+    parsed = ParsedQuery(raw='recent messages from kaya', semantic='')
+    parsed.date_from = 1.0
+    assert should_assist('auto', parsed) is True
+
+
+def test_should_assist_auto_skips_a_confident_parse():
+    parsed = ParsedQuery(raw='messages from Alice yesterday', semantic='')
+    parsed.people_participant = ['+15551234567']
+    parsed.date_from = 1.0
+    assert should_assist('auto', parsed) is False
+
+
+def test_should_assist_auto_skips_short_queries():
+    assert should_assist('auto', ParsedQuery(raw='lease', semantic='lease')) is False
+
+
+def test_should_assist_force_always_asks():
+    parsed = ParsedQuery(raw='messages from Alice yesterday', semantic='')
+    parsed.people_participant = ['+15551234567']
+    parsed.date_from = 1.0
+    assert should_assist('force', parsed) is True
+    assert should_assist('off', parsed) is False
+
+
+def test_merge_reports_people_it_could_not_resolve():
+    parsed = ParsedQuery(raw='messages from nobody', semantic='messages')
+    merged = merge_ghcp_parse(parsed, {'people': ['Nobody'], 'semantic': 'messages'}, _contacts(), (0, 2000000000))
+    assert merged.unresolved_people == ['Nobody']
+    assert merged.parse.people_participant == []
+
+
+def test_merge_resolves_a_lower_case_name():
+    # Copilot copies the name span verbatim from the query, so it hands back
+    # "alice" for "messages from alice" -- which used to resolve to nothing,
+    # leaving a banner that promised a filter that could never be applied.
+    parsed = ParsedQuery(raw='messages from alice', semantic='messages')
+    merged = merge_ghcp_parse(parsed, {'people': ['alice chen'], 'semantic': 'messages'}, _contacts(), (0, 2000000000))
+    assert merged.parse.people_participant == ['+15551234567']
+
+
+def test_assisted_search_args_move_the_parse_into_filters():
+    parsed = ParsedQuery(raw='recent messages from alice', semantic='')
+    parsed.people_participant = ['+15551234567']
+    parsed.people_sender = ['+15551234567']
+    parsed.date_from, parsed.date_to = 100.0, 200.0
+    text, filters = assisted_search_args(parsed, SearchFilters())
+    # The engine re-parses whatever text it gets, so anything not expressed
+    # as a filter is dropped.
+    assert text == ''
+    assert filters.people_handles == ['+15551234567']
+    assert filters.people_sender == ['+15551234567']
+    assert (filters.date_from, filters.date_to) == (100.0, 200.0)
+
+
+def test_assisted_search_args_defer_to_filters_the_user_set():
+    parsed = ParsedQuery(raw='lease with alice', semantic='lease')
+    parsed.people_participant = ['+15551234567']
+    parsed.date_from, parsed.date_to = 100.0, 200.0
+    explicit = SearchFilters(people_handles=['+15557654321'], date_from=1.0, date_to=2.0)
+    _text, filters = assisted_search_args(parsed, explicit)
+    assert filters.people_handles == ['+15557654321']
+    assert (filters.date_from, filters.date_to) == (1.0, 2.0)
+
+
+def test_describe_parse_names_resolved_contacts_and_flags_the_rest():
+    parsed = ParsedQuery(raw='photos from alice', semantic='photos')
+    parsed.people_participant = ['+15551234567']
+    parsed.has_media = True
+    described = describe_parse(parsed, _contacts(), ['zzz'])
+    assert 'Alice Chen' in described
+    assert 'with media' in described
+    assert 'no contact matched zzz' in described
+    assert '+15551234567' not in described

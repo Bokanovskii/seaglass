@@ -270,6 +270,51 @@ def exact_phrase_chunk_ids(
     return matched
 
 
+def phrase_search(
+    index_con, phrase: str, candidate_ids: Optional[Set[int]] = None, top_k: int = 20
+) -> List[int]:
+    """Chunks containing `phrase` verbatim, best BM25 first.
+
+    A fourth retrieval arm, and the only one that can answer "find the
+    message where someone said exactly this". Dense similarity spreads a
+    long sentence across hundreds of near-ties and BM25 over loose terms
+    does the same, so a phrase the user pasted in could rank below the
+    fused cut and never reach the reranker at all: "these people don't
+    know the joys" sat in the index, matched FTS, and was unretrievable.
+
+    Restricted to multi-word phrases -- a single word is what `sparse_search`
+    already ranks, and promoting every chunk containing one common word
+    would crowd out the arms that weigh relevance.
+    """
+    phrase = phrase.strip()
+    if len(phrase.split()) < 2:
+        return []
+    escaped = '"' + phrase.replace('"', '""') + '"'
+    sql = "SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH ? ORDER BY rank LIMIT ?"
+    params: List[object] = [escaped, top_k]
+    if candidate_ids is not None:
+        if not candidate_ids:
+            return []
+        ids = list(candidate_ids)
+        if len(ids) <= CANDIDATE_INLINE_LIMIT:
+            placeholders = ",".join("?" for _ in ids)
+            sql = (
+                f"SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH ? "
+                f"AND rowid IN ({placeholders}) ORDER BY rank LIMIT ?"
+            )
+            params = [escaped, *ids, top_k]
+    try:
+        rows = index_con.execute(sql, params).fetchall()
+    except Exception:
+        # A phrase bonus is an enhancement; a query FTS5 cannot parse must
+        # never break the search that would otherwise work.
+        return []
+    matched = [row[0] for row in rows]
+    if candidate_ids is not None and len(candidate_ids) > CANDIDATE_INLINE_LIMIT:
+        matched = [cid for cid in matched if cid in candidate_ids]
+    return matched
+
+
 def rrf_fuse(
     ranked_lists: Sequence[Sequence[int]],
     k: int = RRF_K,
@@ -309,18 +354,25 @@ def recency_ranked(index_con, chunk_ids: Iterable[int]) -> List[int]:
     ids = list(chunk_ids)
     if not ids:
         return []
-    ordered: List[int] = []
+    # Each batch must be merged into one global ordering, not appended.
+    # Sorting inside the batch and concatenating makes the result "batch
+    # order, then recency", so a caller taking the top 50 got the newest
+    # chunks *of whichever batch happened to come first* -- and batch order
+    # comes from set iteration, i.e. chunk id. With 3,011 candidates,
+    # "what did I tell Vamski" answered with yesterday's conversation and
+    # dropped today's entirely.
+    rows: List[tuple] = []
     for start in range(0, len(ids), CANDIDATE_INLINE_LIMIT):
         batch = ids[start:start + CANDIDATE_INLINE_LIMIT]
         placeholders = ",".join("?" for _ in batch)
-        ordered.extend(
-            row[0]
-            for row in index_con.execute(
-                f"SELECT id FROM chunks WHERE id IN ({placeholders}) ORDER BY start_ts DESC",
+        rows.extend(
+            index_con.execute(
+                f"SELECT id, start_ts FROM chunks WHERE id IN ({placeholders})",
                 batch,
             )
         )
-    return ordered
+    rows.sort(key=lambda row: row[1], reverse=True)
+    return [row[0] for row in rows]
 
 
 def retrieve(
@@ -343,6 +395,14 @@ def retrieve(
 
     absmax_row = index_con.execute("SELECT value FROM meta WHERE key = 'int8_absmax'").fetchone()
     if absmax_row is None:
+        # An index with no chunks has never been calibrated, because
+        # calibration samples the chunks. That is an empty corpus, not a
+        # broken file: someone searched before the first sync finished, and
+        # they should get "no results yet" in the ordinary payload shape
+        # rather than a stack trace. A *populated* index with no absmax is
+        # still corrupt and still says so.
+        if index_con.execute("SELECT 1 FROM chunks LIMIT 1").fetchone() is None:
+            return []
         raise RuntimeError("index.db has no meta.int8_absmax -- has build_index() ever run?")
     absmax = float(absmax_row[0])
 
@@ -352,6 +412,9 @@ def retrieve(
     dense_ids = dense_search(index_con, query_vector_int8, candidate_ids, top_k=dense_top_k)
     sparse_ids = sparse_search(index_con, parsed_query.semantic, candidate_ids, top_k=sparse_top_k)
     ranked_lists = [dense_ids, sparse_ids]
+    phrase_ids = phrase_search(index_con, parsed_query.semantic, candidate_ids)
+    if phrase_ids:
+        ranked_lists.append(phrase_ids)
     for extra_query in extra_sparse_queries:
         extra_ids = sparse_search(index_con, extra_query, candidate_ids, top_k=sparse_top_k)
         if extra_ids:

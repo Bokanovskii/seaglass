@@ -15,6 +15,7 @@ const state = {
   requestId: null,
   assistToken: null,
   results: [],
+  lastPayload: null,
   shownResults: 0,
   // pagination
   pageQuery: '',
@@ -379,6 +380,8 @@ async function search() {
     return;
   }
   state.requestId = crypto.randomUUID();
+  state.assistToken = null;
+  els.assistBanner.classList.add('hidden');
   setBusy(true);
   let payload;
   try {
@@ -477,6 +480,7 @@ function updateResultsMeta(payload) {
 function renderResults(payload) {
   state.results = payload.sessions || [];
   state.shownResults = payload.n_results || 0;
+  state.lastPayload = payload;
   updateResultsMeta(payload);
   if (!payload.sessions?.length) {
     els.results.innerHTML = `<div class="empty-state"><div class="empty-icon">${iconSvg('i-search')}</div><div class="empty-title">No matching messages</div><p class="empty-hint">Nothing matched this search and the filters you have applied. Try loosening a filter, widening the date range, or rephrasing the query.</p></div>`;
@@ -703,37 +707,63 @@ function highlight(text) {
   return output;
 }
 
+// The assisted parse is *used*, not offered. Asking the user to press
+// "Apply" made Copilot's work optional and, worse, the un-assisted results
+// stayed on screen underneath a banner describing filters that had never
+// run. Force always applies; auto applies when the backend decided the
+// query needed the help. The banner just reports what was applied.
 async function pollAssist(tokenValue) {
   const result = await api(`/api/assist/${tokenValue}`);
+  if (state.assistToken !== tokenValue) return;  // a newer search owns the page
   if (result === null) {
     setTimeout(() => pollAssist(tokenValue), 1000);
     return;
   }
-  if (result.status === 'ready') {
-    els.assistBanner.classList.remove('hidden');
-    els.assistBanner.innerHTML = `<span class="banner-icon">${iconSvg('i-sparkle')}</span><span class="banner-text">Copilot read this as <span class="assist-parse">${escapeHtml(describeAssist(result))}</span></span><span class="banner-actions"><button id="apply-assist" class="btn btn-sm btn-primary">Apply</button><button id="dismiss-assist" class="btn btn-sm btn-ghost">Dismiss</button></span>`;
-    document.getElementById('apply-assist').onclick = () => applyAssist(tokenValue);
-    document.getElementById('dismiss-assist').onclick = () => els.assistBanner.classList.add('hidden');
+  if (result.status !== 'ready') return;
+  await applyAssist(tokenValue, result);
+}
+
+function showAssistBanner(description, onUndo) {
+  els.assistBanner.classList.remove('hidden');
+  els.assistBanner.innerHTML = `<span class="banner-icon">${iconSvg('i-sparkle')}</span>`
+    + `<span class="banner-text">Copilot read this as <span class="assist-parse">${escapeHtml(description)}</span></span>`
+    + `<span class="banner-actions"><button id="undo-assist" class="btn btn-sm btn-ghost">Undo</button></span>`;
+  document.getElementById('undo-assist').onclick = onUndo;
+}
+
+async function applyAssist(tokenValue, result) {
+  const baseline = state.lastPayload;
+  let payload;
+  try {
+    payload = await api('/api/search/apply-assist', {
+      method: 'POST',
+      body: JSON.stringify({
+        assist_token: tokenValue,
+        query: els.query.value,
+        filters: buildFilters(),
+        options: {},
+        request_id: state.requestId,
+      })
+    });
+  } catch (err) {
+    return;  // the deterministic results are already on screen
   }
-}
-
-function describeAssist(result) {
-  const parse = result.parse || {};
-  const parts = [];
-  if ((parse.people || []).length) parts.push(`people: ${parse.people.join(', ')}`);
-  if (parse.date_from && parse.date_to) parts.push(`${parse.date_from} → ${parse.date_to}`);
-  if (typeof parse.is_group === 'boolean') parts.push(parse.is_group ? 'group chats' : '1:1 chats');
-  if (parse.semantic) parts.push(parse.semantic);
-  return parts.join(' · ');
-}
-
-async function applyAssist(tokenValue) {
-  const payload = await api('/api/search/apply-assist', {
-    method: 'POST',
-    body: JSON.stringify({ assist_token: tokenValue, query: els.query.value, filters: buildFilters(), options: {} })
-  });
+  // A newer search started while Copilot was thinking; its results own the
+  // page now.
+  if (state.assistToken !== tokenValue || payload.request_id !== state.requestId) return;
+  const baselineQuery = state.pageQuery;
+  const baselineFilters = state.pageFilters;
+  if (payload.applied_query !== undefined) {
+    state.pageQuery = payload.applied_query;
+    state.pageFilters = payload.applied_filters;
+  }
   renderResults(payload);
-  els.assistBanner.classList.add('hidden');
+  showAssistBanner(payload.assist_description || result.description || '', () => {
+    els.assistBanner.classList.add('hidden');
+    state.pageQuery = baselineQuery;
+    state.pageFilters = baselineFilters;
+    if (baseline) renderResults(baseline);
+  });
 }
 
 async function openConversation(event) {

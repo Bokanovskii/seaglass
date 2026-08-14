@@ -22,13 +22,37 @@ _MEDIA_KEYWORDS = {"photo", "photos", "picture", "pictures", "pic", "pics",
 
 # Preposition heuristic (PLAN.md §6 Phase 4): "from"/"with" implies
 # participant filter; "about"/"re"/bare mention stays in the residual.
-# NOTE (BUG-10 fix): only the preposition itself is case-insensitive here
-# (scoped inline flag) -- the capitalized-name group must stay
-# case-SENSITIVE, or the whole point of requiring a capitalized name is
-# defeated and ordinary lowercase words after "with"/"from" ("with the
-# trip", "from yesterday") get misread as a person's name.
-_PARTICIPANT_PATTERN = re.compile(
-    r"\b(?i:from|with)\s+([A-Z][\w'-]*(?:\s+[A-Z][\w'-]*)?)"
+#
+# The name group is case-INSENSITIVE. It used to require a capital letter,
+# on the theory that this was what stopped "from yesterday" or "with the
+# trip" being read as a person -- but people type "from kaya" constantly,
+# and every such query silently lost its person filter and answered with
+# somebody else's messages. Capitalization is now treated as *evidence*
+# rather than a requirement: a capitalized candidate is resolved fuzzily as
+# before, while a lower-case one must match a contact name exactly
+# (`_resolve_name`). Neither path can invent a person the user never named.
+_NAME_GROUP = r"([^\W\d_][\w'-]*(?:\s+[^\W\d_][\w'-]*)?)"
+
+# Pasted names arrive quoted -- `messages from "kaya"` -- and the quote
+# used to block the name group entirely.
+_QUOTE = r"[\"“”'‘’]?"
+
+_PARTICIPANT_PATTERN = re.compile(r"\b(?:from|with)\s+" + _QUOTE + _NAME_GROUP, re.I)
+
+# "kaya's messages" is a sender query, and one of the most natural ways to
+# ask. The group here excludes the apostrophe so the possessive suffix is
+# not swallowed into the name.
+# "Sraddha about work" names a participant with no preposition at all, and
+# "what did I tell Kaya" names the *recipient*. Both were parsed as pure
+# topic text, so the person was searched for as a word rather than filtered on.
+_ADDRESSED_PATTERNS = [
+    re.compile(r"\b" + _NAME_GROUP + r"\s+about\b", re.I),
+    re.compile(r"\b(?:tell|told|ask|asked|text|texted|message|messaged|send|sent)\s+" + _NAME_GROUP + r"\b", re.I),
+]
+
+_POSSESSIVE_PATTERN = re.compile(
+    r"\b([^\W\d_][\w-]*)['’]s\b\s*(?:messages?|texts?|replies|reply|stuff|photos?|pictures?|last|latest|recent)",
+    re.I,
 )
 
 # "from Kaya" and "what did Vamski say" ask for messages Kaya/Vamski
@@ -47,13 +71,23 @@ _SELF_PATTERNS = [
 ]
 
 # "I" is capitalised like a name, so the sender patterns below would hand it
-# to the contact index and fuzzy-match a real person.
-_NOT_A_NAME = frozenset({"i", "me", "you", "we", "they", "who", "someone", "anyone"})
+# to the contact index and fuzzy-match a real person. The temporal words are
+# here because the name group no longer requires a capital: "from yesterday"
+# is a date, not a person, whatever the contact list happens to contain.
+_NOT_A_NAME = frozenset(
+    """i me you we they who someone anyone everyone nobody
+    yesterday today tonight tomorrow now then
+    monday tuesday wednesday thursday friday saturday sunday
+    january february march april may june july august september october
+    november december
+    morning afternoon evening night weekend week month year""".split()
+)
 
 _SENDER_PATTERNS = [
-    re.compile(r"\bfrom\s+([A-Z][\w'-]*(?:\s+[A-Z][\w'-]*)?)"),
-    re.compile(r"\b([A-Z][\w'-]*(?:\s+[A-Z][\w'-]*)?)\s+(?:sent|said|says|texted|wrote|mentioned)\b"),
-    re.compile(r"\bdid\s+([A-Z][\w'-]*(?:\s+[A-Z][\w'-]*)?)\s+(?:say|send|text|write|mention)\b"),
+    re.compile(r"\bfrom\s+" + _QUOTE + _NAME_GROUP, re.I),
+    re.compile(_QUOTE + _NAME_GROUP + _QUOTE + r"\s+(?:sent|said|says|texted|wrote|mentioned)\b", re.I),
+    re.compile(r"\bdid\s+" + _QUOTE + _NAME_GROUP + _QUOTE + r"\s+(?:say|send|text|write|mention)\b", re.I),
+    _POSSESSIVE_PATTERN,
 ]
 
 # Words that describe *which* messages are wanted rather than what they
@@ -67,7 +101,8 @@ _FILLER_WORDS = frozenset(
     newest of on or our recent recently say said says send sent show similar so some stuff
     text texted texts that the these thing things this those to told tell up us was we were
     what whats when where
-    which who whose with write wrote you your last""".split()
+    which who whose with write wrote you your last
+    everything anymore find search look see pull please pls just about""".split()
 )
 
 
@@ -75,7 +110,11 @@ def _is_contentless(residual: str) -> bool:
     # Apostrophes are stripped so "what's" reads as the filler "whats"
     # rather than as a topic word.
     words = [w.replace("'", "") for w in re.findall(r"[a-zA-Z']+", residual.lower())]
-    return bool(words) and all(word in _FILLER_WORDS for word in words if word)
+    # A single letter is never a topic. "kaya's latest messages" leaves an
+    # orphaned "s" behind, which made the residual look contentful and sent
+    # a pure recency query through the embedder instead of browse.
+    words = [w for w in words if len(w) > 1]
+    return bool(words) and all(word in _FILLER_WORDS for word in words)
 
 DATE_PAD_DAYS = 3
 PEOPLE_FUZZY_THRESHOLD = 85.0  # rapidfuzz score, 0-100; prefer no filter to a wrong one
@@ -115,6 +154,12 @@ def _looks_like_a_real_date_match(substring: str, full_text: str = "") -> bool:
     ambiguous_hit = words & _AMBIGUOUS_DATE_WORDS
     if not ambiguous_hit:
         return False
+    # "in March" / "back in May": nobody writes the verb that way, so the
+    # preposition is all the corroboration needed. Without it "messages in
+    # March" got no date filter at all.
+    if re.search(r"\b(?:in|during|of|since|from|before|after)\s+" + re.escape(substring),
+                 full_text, re.I):
+        return True
     # Corroborate against the rest of the query: a digit anywhere, or a
     # second unambiguous date word, makes it plausible this really is a
     # month reference rather than the common verb/modal usage.
@@ -160,6 +205,10 @@ _RANGE_PATTERNS = [
     (re.compile(r"\b(?:the past|past|last) (\d+) days?\b", re.I), "days", None),
     (re.compile(r"\b(?:the past|past|last) (\d+) weeks?\b", re.I), "weeks", None),
     (re.compile(r"\b(?:the past|past|last) (\d+) months?\b", re.I), "months", None),
+    # "this morning" is when the message arrived; a bare "tonight" is
+    # usually the *subject* ("dinner tonight"), so it stays in the residual.
+    (re.compile(r"\bthis (?:morning|afternoon|evening)\b", re.I), "day", 0),
+    (re.compile(r"\blast night\b", re.I), "day", 1),
     (re.compile(r"\brecently\b", re.I), "days", 30),
     (re.compile(r"\b(\d+) days? ago\b", re.I), "day", None),
 ]
@@ -193,6 +242,29 @@ def _extract_month_range(text: str):
     return start.timestamp(), min(end.timestamp(), now.timestamp()), [match.group(0)]
 
 
+_WEEKEND_PATTERN = re.compile(r"\b(?:this|last|past|the)\s+weekend\b", re.I)
+
+
+def _extract_weekend(text: str):
+    """The most recent Saturday-Sunday.
+
+    "this weekend" is a range with a shape no relative-days pattern
+    expresses; without it the phrase produced no date filter at all and the
+    query was answered by similarity alone.
+    """
+    match = _WEEKEND_PATTERN.search(text)
+    if match is None:
+        return None
+    now = dt.datetime.now()
+    today = dt.datetime(now.year, now.month, now.day)
+    # Monday=0 .. Saturday=5. On a Saturday or Sunday, "this weekend" is the
+    # one in progress.
+    days_since_saturday = (today.weekday() - 5) % 7
+    start = today - dt.timedelta(days=days_since_saturday)
+    end = min(start + dt.timedelta(days=2), now)
+    return start.timestamp(), end.timestamp(), [match.group(0)]
+
+
 def _extract_range_phrase(text: str):
     """A (date_from, date_to, substrings) span for a relative range phrase."""
     now = dt.datetime.now()
@@ -219,7 +291,7 @@ def _extract_date_range(text: str) -> Tuple[Optional[float], Optional[float], Li
     """Returns (date_from, date_to, matched_substrings), or (None, None, [])
     if nothing plausible was found.
     """
-    span = _extract_range_phrase(text) or _extract_month_range(text)
+    span = _extract_weekend(text) or _extract_range_phrase(text) or _extract_month_range(text)
     if span is not None:
         return span
 
@@ -239,6 +311,125 @@ def _extract_date_range(text: str) -> Tuple[Optional[float], Optional[float], Li
     return date_from, date_to, matched_substrings
 
 
+# Ordinary English words are one edit away from real names surprisingly
+# often -- "same"/"sage", "mine"/"Mike" -- so the typo-tolerant resolver is
+# not allowed to run on them. Generated from the 600 most frequent words in
+# this corpus with every contact given name removed, so it cannot suppress
+# a real name. It gates *only* the typo path: an exact match on a contact
+# called "Sunday" still resolves.
+_COMMON_WORDS = frozenset(
+    """able about actually after again airport almost already also always
+    amazon another anyone anything apartment apple around asked away awesome
+    babe back beautiful because been before being believe best better
+    bike birthday boat book booked both bought bring brother bruh
+    building bunch busy call called came card care case cause
+    change chat check chill christmas class close code coffee come
+    coming cool could couple crazy cute damn date days deal
+    definitely didn different dinner disliked does doesn doing done double
+    down drink drive driving dude each earlier early easy either
+    else email emphasized enjoy enough even evening ever every everyone
+    everything excited family feel feeling find fine first flight food
+    forgot found free friday friend friends from fuck full funny
+    game getting give glad going gonna good goodnight gotta grab
+    great group guess guys haha hahaha hang happy hard have
+    haven having head headed heading hear hehe hello help here
+    high holy honestly hope hopefully hotel hour hours house huge
+    idea image interested into join just keep kinda know last
+    late later laughed least leave leaving left less life like
+    liked line link literally little lmao long look looking looks
+    lots love loved lunch made make makes making many maybe
+    mean meet meeting might mine miss monday money month more
+    morning most move movie much must myself name need never
+    next nice night nothing office okay okie ones only open
+    other outside over parents park parking part party pass people
+    perfect person phone pick place plan plane planning plans play
+    please point pretty prob probably puzzle reacted read ready real
+    really remember rest ride right room safe said same saturday
+    says seems seen send sent share shit should show sick
+    side since skiing sleep small snow some someone something soon
+    sorry sounds spend spot start started stay still stop stuff
+    such sunday super sure take taking talk talking team tell
+    than thank thanks that thats their them then there these
+    they thing things think thinking this those though thought through
+    thursday time tired today together told tomorrow tonight took trip
+    trying tuesday until used very visit wait walk walking wanna
+    want wanted wants wasn watch watching water wednesday week weekend
+    weeks well went were what when whenever where which while
+    whole wine wish with woah work working works worries would
+    yall yeah year years yesterday your yours yummy""".split()
+)
+
+
+def _is_capitalised(span: str) -> bool:
+    return all(word[:1].isupper() for word in span.split() if word)
+
+
+def _name_candidates(span: str) -> List[str]:
+    """The captured span, then each of its words alone.
+
+    The name group takes up to two words, so "from kaya yesterday" captures
+    "kaya yesterday" and "the last thing Kaya sent" captures "thing Kaya".
+    When capitals were required neither extra word was ever swallowed; now
+    they can be, and the individual words have to be tried too or the person
+    is lost.
+    """
+    span = span.strip().strip("\"“”'‘’")
+    words = span.split()
+    candidates = [span, *words] if len(words) > 1 else ([span] if span else [])
+    # "kaya's" reaches here from patterns that do not strip the suffix.
+    return [re.sub(r"['’]s$", "", c) or c for c in candidates]
+
+
+def resolve_name(span: str, contact_index: Optional[ContactIndex],
+                 threshold: float = PEOPLE_FUZZY_THRESHOLD) -> Tuple[List[str], str]:
+    """Resolve a name span to handle ids. Returns (handles, resolved_span).
+
+    A capitalized span is fuzzy-matched, which tolerates surnames and
+    misspellings. A lower-case span carries no evidence that it is a name at
+    all, so it has to match a contact name exactly -- fuzzy matching a
+    lower-cased "the trip" partial-matches real contact names well above the
+    threshold, which would be a confident, wrong filter.
+    """
+    if contact_index is None:
+        return [], ''
+    for candidate in _name_candidates(span):
+        words = candidate.lower().split()
+        if any(word in _NOT_A_NAME for word in words):
+            continue
+        if not _is_capitalised(candidate) and all(word in _FILLER_WORDS for word in words):
+            continue
+        # Ordered by precision, not by convenience: an exact name beats a
+        # typo of a different name, which beats a loose fuzzy match. Running
+        # fuzzy first resolved the typo "Alyia" to a stranger while a
+        # contact one edit away sat in the address book.
+        found = contact_index.handle_ids_for_exact_name(candidate)
+        if found:
+            return found, candidate
+        if candidate.lower() not in _COMMON_WORDS:
+            found = contact_index.handle_ids_for_similar_given_name(candidate)
+            if found:
+                return found, candidate
+        # Fuzzy needs the evidence of a capital: it is what resolves
+        # surnames and partial names, and also what matches "the trip" to a
+        # real contact if allowed to run on ordinary words.
+        if _is_capitalised(candidate):
+            found = contact_index.handle_ids_for_names(candidate, threshold=threshold)
+            if found:
+                return found, candidate
+    return [], ''
+
+
+def _matched_span(match: re.Match, resolved: str) -> str:
+    """The part of `match` up to the end of the name that actually resolved,
+    so "from mom about work" removes "from mom" from the residual and leaves
+    the topic behind."""
+    offset = match.group(1).find(resolved)
+    if offset < 0:
+        return match.group(0)
+    end = match.start(1) + offset + len(resolved)
+    return match.string[match.start(0):end]
+
+
 def _extract_participants(
     text: str, contact_index: Optional[ContactIndex]
 ) -> Tuple[List[str], List[str]]:
@@ -250,12 +441,12 @@ def _extract_participants(
         return [], []
     handle_ids: List[str] = []
     matched: List[str] = []
-    for match in _PARTICIPANT_PATTERN.finditer(text):
-        name_guess = match.group(1)
-        found_handles = contact_index.handle_ids_for_names(name_guess, threshold=PEOPLE_FUZZY_THRESHOLD)
-        if found_handles:
-            handle_ids.extend(found_handles)
-            matched.append(match.group(0))
+    for pattern in [_PARTICIPANT_PATTERN] + _ADDRESSED_PATTERNS:
+        for match in pattern.finditer(text):
+            found, resolved = resolve_name(match.group(1), contact_index)
+            if found:
+                handle_ids.extend(found)
+                matched.append(_matched_span(match, resolved))
     return handle_ids, matched
 
 
@@ -269,21 +460,30 @@ def _extract_senders(
     matched: List[str] = []
     for pattern in _SENDER_PATTERNS:
         for match in pattern.finditer(text):
-            if match.group(1).strip().lower() in _NOT_A_NAME:
-                continue
-            found = contact_index.handle_ids_for_names(match.group(1), threshold=PEOPLE_FUZZY_THRESHOLD)
+            found, resolved = resolve_name(match.group(1), contact_index)
             if found:
                 handle_ids.extend(found)
-                matched.append(match.group(0))
+                matched.append(_matched_span(match, resolved))
     return handle_ids, matched
 
 
-def _mentions_another_sender(text: str) -> bool:
-    return any(
-        match.group(1).strip().lower() not in _NOT_A_NAME
-        for pattern in _SENDER_PATTERNS
-        for match in pattern.finditer(text)
-    )
+def _mentions_another_sender(text: str, contact_index: Optional[ContactIndex] = None) -> bool:
+    """Does the query name someone *other than me* as the author?
+
+    A capitalized candidate counts even when it resolves to no contact --
+    the query is still about them. A lower-case one does not, or "messages i
+    sent from work" would read "work" as a person and drop the self filter.
+    """
+    for pattern in _SENDER_PATTERNS:
+        for match in pattern.finditer(text):
+            for candidate in _name_candidates(match.group(1)):
+                if candidate.lower() in _NOT_A_NAME:
+                    continue
+                if _is_capitalised(candidate):
+                    return True
+                if resolve_name(candidate, contact_index)[0]:
+                    return True
+    return False
 
 
 def _extract_self_sender(text: str):
@@ -305,7 +505,7 @@ def parse_query(text: str, contact_index: Optional[ContactIndex] = None) -> Pars
     # their name is the stronger signal, so the self filter yields -- even
     # when the name resolves to no contact, since the query is still about
     # them rather than about me.
-    if people_sender or _mentions_another_sender(text):
+    if people_sender or _mentions_another_sender(text, contact_index):
         from_me, self_substrings = None, []
     # A named sender is necessarily a participant, and narrowing candidate
     # chunks to their chats is what makes the sender filter cheap.

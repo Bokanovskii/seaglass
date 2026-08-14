@@ -64,18 +64,27 @@ class Oracle:
         since: Optional[float] = None,
         until: Optional[float] = None,
         with_media: bool = False,
+        from_me: bool = False,
         limit: int = 500,
     ) -> List[dict]:
-        """Messages *written by* one of `handles`, newest first.
+        """Messages *written by* one of `handles`, newest first -- or, when
+        `from_me` is set, messages *I* wrote to one of them.
 
-        `is_from_me = 0` is not redundant: chat.db stamps outgoing 1:1
+        The direction test is not redundant: chat.db stamps outgoing 1:1
         messages with the *recipient's* handle_id, so a handle test alone
-        returns both halves of the conversation.
+        returns both halves of the conversation. Which half is the answer
+        depends on the question -- "what did I tell Kaya" is asking for the
+        outgoing half, and scoring it against Kaya's own messages marks the
+        engine wrong for being right.
         """
         if not handles:
             return []
         marks = ",".join("?" for _ in handles)
-        where = [f"h.id IN ({marks})", "m.is_from_me = 0", "m.associated_message_type = 0"]
+        where = [
+            f"h.id IN ({marks})",
+            f"m.is_from_me = {1 if from_me else 0}",
+            "m.associated_message_type = 0",
+        ]
         params: List[object] = list(handles)
         if since is not None:
             where.append(f"{_TS_EXPR} >= ?")
@@ -88,14 +97,30 @@ class Oracle:
                 "EXISTS (SELECT 1 FROM message_attachment_join maj WHERE maj.message_id = m.ROWID)"
             )
         params.append(limit)
+        # Which join defines "a message between me and X" depends on the
+        # direction. Incoming messages carry X's handle_id directly. My
+        # *outgoing* messages in a group chat carry handle_id 0 -- there is
+        # no single recipient -- so a handle join sees only the 1:1 half and
+        # declares yesterday's 1:1 message the newest thing I ever told
+        # them, while the engine correctly returns today's group message.
+        # Scoping the outgoing half by chat membership is the same
+        # definition the engine applies: messages in a conversation X is
+        # part of, written by me.
+        join = (
+            "JOIN chat_message_join cmj ON cmj.message_id = m.ROWID "
+            "JOIN chat_handle_join chj ON chj.chat_id = cmj.chat_id "
+            "JOIN handle h ON h.ROWID = chj.handle_id"
+            if from_me
+            else "JOIN handle h ON m.handle_id = h.ROWID "
+                 "JOIN chat_message_join cmj ON cmj.message_id = m.ROWID"
+        )
         rows = self.con.execute(
             f"""
-            SELECT m.ROWID, {_TS_EXPR} AS ts, m.text, m.attributedBody IS NOT NULL
+            SELECT DISTINCT m.ROWID, {_TS_EXPR} AS ts, m.text, m.attributedBody IS NOT NULL
             FROM message m
-            JOIN handle h ON m.handle_id = h.ROWID
-            JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
+            {join}
             WHERE {' AND '.join(where)}
-            ORDER BY m.date DESC LIMIT ?
+            ORDER BY ts DESC LIMIT ?
             """,
             params,
         ).fetchall()
@@ -126,6 +151,27 @@ class Case:
     expects_results: bool = True
     lexical: Optional[str] = None
     notes: str = ""
+    # TEST-EVAL-PLAN-V2.md §3. What the case was *built* to ask for, which
+    # is not the same as what the engine thought it was asked. Judging a
+    # payload against its own `effective_filters` is circular: a parse that
+    # extracts nothing makes every filter property inapplicable, and the
+    # case passes vacuously. That is exactly how "recent messages from
+    # kaya" scored a clean pass while returning a stranger's messages.
+    expect_handles: List[str] = field(default_factory=list)
+    expect_person: Optional[str] = None
+    expect_date: bool = False
+    expect_from_me: bool = False
+    expect_media: bool = False
+    form: str = "plain"
+    # A filter-only case: chat.db can compute its exact answer set. Declared
+    # by the suite rather than inferred from the parse, because a parse that
+    # failed leaves the name in the residual and would look "topical".
+    oracle_scored: bool = False
+    # Is the named person the *author* of the wanted messages, or just a
+    # participant in the conversation? Other people speaking in a
+    # conversation you asked to see is correct; other people answering
+    # "what did Kaya say" is not.
+    expect_sender: bool = True
 
 
 @dataclass
@@ -159,15 +205,47 @@ def check_properties(case: Case, payload: dict, parsed, oracle: Oracle) -> Dict[
     sessions = payload.get("sessions", [])
     hits = _hits(payload)
 
+    # --- declared expectations (TEST-EVAL-PLAN-V2.md §3) -------------------
+    # These are the only properties that can fail when the parse comes back
+    # empty, which is precisely the failure mode the rest of this function
+    # cannot see.
+    if case.expect_handles:
+        wanted = {h.lower() for h in case.expect_handles}
+        found = {h.lower() for h in list(parsed.people_sender) + list(parsed.people_participant)}
+        props["person_filter_applied"] = bool(found & wanted)
+        if hits and case.expect_person and case.expect_sender:
+            # Hydration resolves handles to display names, so the check is
+            # on the name: every message we were handed should be from the
+            # person asked for (or from me, in a conversation with them).
+            wanted_name = case.expect_person.lower()
+            senders = {
+                (m.get("sender") or "").lower() for m in hits if not m.get("is_from_me")
+            }
+            props["sender_is_expected"] = all(
+                wanted_name in sender or sender in wanted_name for sender in senders
+            ) if senders else None
+        else:
+            props["sender_is_expected"] = None
+    else:
+        props["person_filter_applied"] = None
+        props["sender_is_expected"] = None
+
+    props["date_filter_applied"] = (
+        (parsed.date_from is not None or parsed.date_to is not None) if case.expect_date else None
+    )
+    props["self_filter_applied"] = bool(parsed.from_me) if case.expect_from_me else None
+    props["media_filter_applied"] = bool(parsed.has_media) if case.expect_media else None
+
     # "Did it find anything" is only a fair question when there is something
     # to find. "what did Sraddha say yesterday" returns nothing because
     # Sraddha last wrote in 2021 -- scoring that as a miss punished the
     # engine for being right, and hid the cases where it is wrong.
     expected = case.expects_results
-    if expected and parsed.people_sender:
+    handles = case.expect_handles or parsed.people_sender
+    if expected and handles:
         expected = bool(
             oracle.messages_from(
-                parsed.people_sender, since=parsed.date_from, until=parsed.date_to,
+                handles, since=parsed.date_from, until=parsed.date_to,
                 with_media=parsed.has_media, limit=1,
             )
         )
@@ -243,21 +321,29 @@ def check_properties(case: Case, payload: dict, parsed, oracle: Oracle) -> Dict[
 
 def score_against_oracle(
     parsed, payload: dict, oracle: Oracle, index_horizon: Optional[float] = None,
-    index_con=None,
+    index_con=None, case: Optional[Case] = None,
+    reachable_ids: Optional[set] = None,
 ) -> Dict[str, float]:
     """Precision/recall of the returned hits against chat.db's answer, for
     queries whose answer set is exactly computable."""
+    # Keyed on what the case *asked for* where that is declared, not on what
+    # the engine decided it was asked (TEST-EVAL-PLAN-V2.md §3). Keying on
+    # the engine's own parse meant a dropped person filter skipped oracle
+    # scoring entirely instead of scoring zero.
+    handles = list(case.expect_handles) if case is not None and case.expect_handles else list(parsed.people_sender)
     # Only filter-only queries have a computable answer set. "what did Kaya
     # say about dinner" is answered by similarity, so the newest message is
     # not the right answer and scoring it as one would punish the engine for
     # being correct (QUERY-EVAL-PLAN.md §3: classes 3, 4, 6, 7, 9, 11).
-    if not parsed.people_sender or parsed.semantic.strip():
+    topical = parsed.semantic.strip() and not (case is not None and case.oracle_scored)
+    if not handles or topical:
         return {}
     truth = oracle.messages_from(
-        parsed.people_sender,
+        handles,
         since=parsed.date_from,
         until=parsed.date_to,
         with_media=parsed.has_media,
+        from_me=bool(case.expect_from_me) if case is not None else parsed.from_me,
     )
     if not truth:
         return {}
@@ -306,8 +392,12 @@ def score_against_oracle(
         "precision": overlap / len(got_ids),
         # Recall over the whole history is meaningless for a paged result --
         # what matters is whether the newest messages, the ones a "latest"
-        # query is asking for, made it in.
-        "recall_top": len(got_ids & set(reachable)) / len(reachable) if reachable else 1.0,
+        # query is asking for, made it in -- across the pages a user can
+        # actually reach, since page 1 holds a fixed number of sessions.
+        "recall_top": (
+            len((reachable_ids if reachable_ids is not None else got_ids) & set(reachable))
+            / len(reachable)
+        ) if reachable else 1.0,
     }
     newest = truth[0]["message_id"]
     flat = _flat_in_caller_order(payload)
@@ -370,11 +460,11 @@ class AppSearcher:
 
         return _running_app_lock() is not None
 
-    def search(self, query: str) -> dict:
+    def search(self, query: str, offset: int = 0) -> dict:
         from seaglass.mcp_server import _search_via_running_app
 
         payload = _search_via_running_app(
-            query, max_sessions=self.max_sessions, redact=False
+            query, max_sessions=self.max_sessions, redact=False, offset=offset
         )
         if payload is None:
             raise RuntimeError("the running app stopped answering mid-run")
@@ -392,9 +482,11 @@ class EngineSearcher:
         self.engine.warmup(progress=lambda _name: contextlib.nullcontext())
         self.max_sessions = max_sessions
 
-    def search(self, query: str) -> dict:
+    def search(self, query: str, offset: int = 0) -> dict:
         return self.engine.search(
-            query, SearchFilters(), SearchOptions(max_sessions=self.max_sessions)
+            query,
+            SearchFilters(),
+            SearchOptions(max_sessions=self.max_sessions, offset=offset),
         )
 
 
@@ -423,6 +515,31 @@ def parsed_from_payload(payload: dict, query: str, contact_index=None) -> Parsed
     )
 
 
+ORACLE_EXTRA_PAGES = 2
+
+
+def _paged_message_ids(searcher, case: Case, payload: dict) -> set:
+    """Message ids reachable across the first few pages.
+
+    Page 1 holds a fixed number of day-sessions, and the 20 newest messages
+    from a chatty contact routinely span more. Scoring "are the newest
+    messages retrievable" against one page measures the page size, not the
+    engine: three of Sraddha's newest 20 were on page 2 the whole time.
+    Latency is still judged on page 1 alone.
+    """
+    ids = {hit.get("message_id") for hit in _hits(payload)}
+    seen = payload
+    for page in range(1, ORACLE_EXTRA_PAGES + 1):
+        if not seen.get("has_more"):
+            break
+        try:
+            seen = searcher.search(case.query, offset=seen.get("next_offset") or page * 8)
+        except (TypeError, RuntimeError):
+            break
+        ids |= {hit.get("message_id") for hit in _hits(seen)}
+    return ids
+
+
 def run_case(searcher, corpus: Corpus, case: Case) -> Result:
     started = time.time()
     try:
@@ -432,6 +549,13 @@ def run_case(searcher, corpus: Corpus, case: Case) -> Result:
         return Result(case, {}, parsed, time.time() - started, error=repr(error))
     elapsed = time.time() - started
     parsed = parsed_from_payload(payload, case.query, corpus.contact_index)
+    reachable_ids = None
+    # Any browse-ordered answer for a declared person is oracle-scored, not
+    # just the classes flagged `oracle_scored` -- "pictures Kaya sent" has
+    # an exactly computable answer set too, and gating on the flag left it
+    # scored against page 1 alone.
+    if case.expect_handles and payload.get("ordering") == "recent":
+        reachable_ids = _paged_message_ids(searcher, case, payload)
     return Result(
         case,
         payload,
@@ -439,7 +563,8 @@ def run_case(searcher, corpus: Corpus, case: Case) -> Result:
         elapsed,
         properties=check_properties(case, payload, parsed, corpus.oracle),
         oracle=score_against_oracle(
-            parsed, payload, corpus.oracle, corpus.index_horizon, corpus.index_con
+            parsed, payload, corpus.oracle, corpus.index_horizon, corpus.index_con,
+            case, reachable_ids,
         ),
     )
 

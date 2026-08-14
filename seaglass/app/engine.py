@@ -464,6 +464,8 @@ class SearchEngine:
                 hydrated = _filter_by_sender(hydrated, parsed.people_sender)
             elif parsed.from_me is not None:
                 hydrated = _filter_by_from_me(hydrated, parsed.from_me)
+            if parsed.has_media:
+                hydrated = _filter_by_media(hydrated)
             if not parsed.semantic.strip():
                 # Browsing: the whole day's chunks are "hits", and they are
                 # chronological, so a caller reading the first few gets the
@@ -619,6 +621,17 @@ def _filter_by_from_me(sessions, from_me: bool):
     return _keep_hits(sessions, lambda message: bool(message.is_from_me) is from_me)
 
 
+def _filter_by_media(sessions):
+    """Keep only hit messages that actually carry an attachment.
+
+    `chunks.has_attachment` is a *chunk*-level flag, so it can only narrow
+    the candidates to conversations where a picture was sent -- every other
+    message in that stretch of conversation comes along with it. "pictures
+    Kaya sent" answered with 80 hits, 5 of which were pictures.
+    """
+    return _keep_hits(sessions, lambda message: bool(message.has_attachment))
+
+
 def _keep_hits(sessions, predicate):
     kept = []
     for session in sessions:
@@ -685,6 +698,15 @@ def _chunks_containing_sender(index_con, chat_con, parsed, candidate_ids):
     # `candidate_ids` via the chunks table. Ordering newest-first is safe
     # under either unit.
     where = [f'h.id IN ({placeholders})', 'm.is_from_me = 0']
+    if parsed.has_media:
+        # "pictures Kaya sent" needs chunks where *she* sent the picture.
+        # `has_attachment` on `chunks` is a chunk-level flag, so without
+        # this a chunk qualifies when anyone in a group posted a photo and
+        # Kaya merely typed in it -- which is how the query came back with
+        # 80 hits of which 5 were actually pictures.
+        where.append(
+            'EXISTS (SELECT 1 FROM message_attachment_join maj WHERE maj.message_id = m.ROWID)'
+        )
     params: list = list(handles) + [SENDER_MESSAGE_LOOKBACK]
     # The join to chat_message_join is what makes the lookback window mean
     # anything. chat.db here holds 109,665 messages from one contact of

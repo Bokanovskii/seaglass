@@ -1,0 +1,294 @@
+# Test & evaluation plan v2 — closing the holes that shipped bugs
+
+`QUERY-EVAL-PLAN.md` (v1) moved evaluation from "is the answer somewhere in
+the payload" (recall@final) to "is the payload *right*" (properties + a
+chat.db oracle). It found and fixed six real defects. Then a seventh shipped
+anyway:
+
+> `recent messages from kaya` returned Biljana Makivic's messages from six
+> weeks earlier.
+
+The suite ran 136 cases across 18 classes and scored **1.00 on every
+property** while that query was broken. This plan is about why, and what a
+suite has to do differently so the next one cannot hide.
+
+---
+
+## 1. Why v1 could not see it
+
+Three independent holes, each of which alone was enough.
+
+### 1.1 The suite only ever typed names the way the parser likes
+
+Every person case is generated from `{name}`, filled with a contact's first
+name in its address-book capitalization — `Kaya`, `Vamski`, `Sraddha`. The
+parser required a leading capital to consider a word a name at all
+(`[A-Z][\w'-]*`, guarded by a comment explaining why the capital was
+load-bearing). So the suite and the parser shared an assumption, and the
+suite could only confirm it.
+
+Real callers do not share it. People type `from kaya`. Grogu relays whatever
+a model wrote, which is often lower case. **A generated suite tests the
+generator's assumptions unless the surface form is itself a dimension.**
+
+### 1.2 Properties were judged against the payload's own parse
+
+`check_properties` reads `effective_filters` out of the payload and judges
+the payload against it. That is circular: when the parse extracts nothing,
+every filter property is `None` ("does not apply") and the case passes
+vacuously.
+
+For `recent messages from kaya` the parse found no person, so
+`sender_purity`, `no_self_in_sender`, `date_containment` and the oracle
+scoring all declined to apply — and the case was scored a clean pass while
+returning a stranger's messages. **The expectation has to come from how the
+case was constructed, not from what the system under test believed.**
+
+### 1.3 A failure that fails *open* looks like a different, legitimate answer
+
+A dropped person filter does not error or return empty. It degrades to a
+plain semantic search, which returns confident, plausible, well-formed
+results about the right topic from the wrong person. Nothing short of "was
+this actually from Kaya" catches it.
+
+---
+
+## 2. What changes
+
+| v1 | v2 |
+| --- | --- |
+| `{name}` in address-book case | `{name}` × **surface forms**: lower, UPPER, first-name-only, possessive, typo, punctuated, quoted |
+| Properties judged vs. payload's parse | Properties judged vs. the case's **declared expectation** (`expect_*`), payload parse used only where no expectation exists |
+| Oracle keyed on `parsed.people_sender` | Oracle keyed on `case.expect_handles` when declared — a parse miss now collapses recall instead of skipping the case |
+| Parser tested by ~40 unit cases | **Parser probe**: thousands of generated positives and corpus-derived negatives, reporting precision *and* recall per surface form |
+| Assist untested end to end | Assist gating, merge, and apply covered; the "banner promised a filter that never ran" bug has a regression test |
+| Circumstances described in §5, partly exercised | Contacts-unavailable, stale-index and empty-index paths asserted |
+
+---
+
+## 3. The expectation model
+
+A case declares what it was built to test:
+
+```python
+Case("recent messages from kaya", "person_recency_lower",
+     expect_handles=[...], expect_person="Kaya", expect_recent=True)
+```
+
+and the harness asserts:
+
+* `person_filter_applied` — the payload's effective filters name that person.
+  This is the property that fails for the kaya bug, loudly, on the first case.
+* `sender_is_expected` — every non-self hit was written by them.
+* `date_filter_applied` / `self_filter_applied` / `media_filter_applied` —
+  same idea for the other filter kinds.
+
+Declared expectations are only ever asserted, never fed into the search: the
+query text is what goes in. A case with no declared expectation keeps v1's
+behaviour, so topical and adversarial classes are unaffected.
+
+### Why this is not "teaching to the test"
+
+The expectation is a property of the *question* ("I asked for Kaya"), not of
+the implementation. It is exactly what the user means and what any
+implementation must satisfy. v1's version — "judge it by whatever it thought
+the question was" — is the one that cannot fail.
+
+---
+
+## 4. Surface forms
+
+Generated for every person class, from the same contact pool:
+
+| form | example | why |
+| --- | --- | --- |
+| `plain` | `messages from Kaya` | v1's only form; the baseline |
+| `lower` | `messages from kaya` | **the shipped bug**; how people actually type |
+| `upper` | `messages from KAYA` | shouting, autocorrect |
+| `full` | `messages from Kaya Doe` | disambiguation |
+| `possessive` | `kaya's messages` | very common phrasing |
+| `punctuated` | `messages from kaya?` | trailing punctuation must not join the name |
+| `typo` | `messages from kyaa` | fuzzy path must still fire |
+| `quoted` | `messages from "kaya"` | pasted names |
+
+A form that *should* fail (a name that is not in contacts) is a negative
+case, and is expected to return results without a person filter rather than
+to error or to invent one.
+
+## 5. Parser probe (`seaglass/eval/parser_probe.py`)
+
+Models are not involved in parsing, so this can be run at a scale the search
+suite cannot: every contact × every surface form × every template, plus a
+large negative set, in seconds.
+
+**Positives** — contact names in every surface form and template, expecting a
+resolved person filter. Reported as recall per form; a form at <1.00 names
+the exact gap.
+
+**Negatives** — the risk created by relaxing the capitalization rule is
+false person filters. Negatives are drawn from the corpus itself rather than
+imagined: the most frequent words that follow `from`/`with` in real message
+text (`from work`, `from the airport`, `with the kids`), plus temporal words,
+plus filler. Expected: no person filter. Reported as precision; any failure
+is listed by name so it can be judged, not just counted.
+
+This is the harness that would have caught the bug in the first place, and
+it is the one that guards the fix from regressing into over-matching.
+
+## 6. Assist
+
+Assist had three defects that no test could see, because nothing exercised
+it end to end:
+
+1. `apply-assist` re-ran `engine.search(merged.raw, …)`. The engine re-parses
+   the text it is given, so the entire merged parse was discarded and only
+   keyword expansions ever applied — "Force" genuinely did nothing visible.
+2. `GET /api/assist/{token}` merged Copilot's parse into `parse_query('')`,
+   a parse of the empty string, so `changes` described a diff against nothing.
+3. Copilot copies name spans verbatim from the query, so it returned `kaya`,
+   and `handle_ids_for_names('kaya')` resolved to nobody — the banner named a
+   person filter that could not exist.
+
+Covered now by: gating tests (`should_assist` for force/auto/off across
+strong, weak and short parses), merge tests (including unresolved names), and
+endpoint tests that assert the *filters the engine was actually called with*.
+
+Auto's rule is stated positively: **assist when the deterministic parse looks
+inadequate for the query it was given** — a name-shaped word survived into
+the residual with no person filter to show for it, or a long query yielded no
+structure at all. Not "assist when no filters were found", which read a
+resolved date as proof that the unresolved person did not matter.
+
+## 7. Circumstances
+
+| circumstance | expected behaviour | how asserted | status |
+| --- | --- | --- | --- |
+| Contacts unavailable | no person filters, no crash, and **nothing silently dropped** — an unresolvable name is still good search text | `parser_probe --no-contacts`: all 1000 cases, compared against the with-contacts parse so date/media words aren't counted as losses | 1.00 |
+| Index stale | `index_stale` / freshness fields present and true; `newest_is_indexed` separates staleness from ranking | `freshness_declared` (208 cases), `newest_is_indexed` | 1.00 |
+| Index empty | empty payload with the same shape (`ordering`, freshness), **not an exception** | `TestEmptyIndexPayloadShape`, topical and filter-only | found a real crash; fixed |
+| App not running | Grogu lazy path loads its own engine | `test_mcp_server.py` + a live cold run with the app killed (1.32 s) | pass |
+| App running | Grogu reuses it; no second copy of the models | live: "answered from the running Seaglass app", 0.5–1.8 s | pass |
+
+A note on why the contacts-unavailable check compares two parses rather than
+the raw query: date and media words legitimately leave the semantic text in
+*both* parses. Checking the blind parse against the raw query flagged "texts
+from Sraddha last week" for "dropping" `last week`, which the date filter had
+correctly consumed. The invariant that actually means something is that the
+blind parse keeps everything the sighted one kept, **plus** the name it can no
+longer resolve.
+
+## 8. Budgets and exit criteria
+
+Unchanged from v1 §6 for latency (measured through the running app, never a
+second model copy). Added:
+
+* `person_filter_applied` = **1.00** on every declared person case, every
+  surface form. This is a correctness invariant, not a quality metric.
+* `sender_is_expected` = 1.00.
+* Parser probe: positive recall = 1.00 for `plain`, `lower`, `upper`,
+  `possessive`, `punctuated`, `quoted`; ≥0.5 for `typo` (fuzzy, best effort).
+  Negative precision = 1.00 — a false person filter is worse than a missed
+  one, because it answers confidently from the wrong person.
+
+## 9. Results
+
+All numbers measured through the **running desktop app** against the real
+index (386,278 messages, 17,039 chunks), so they are the code path a user's
+query actually takes and no second copy of the models was ever loaded.
+
+### 9.1 Behaviour suite — 212 cases
+
+Every property and every oracle metric at 1.00, zero failing queries.
+
+| property | checked | rate |
+| --- | --- | --- |
+| `date_containment` | 30 | 1.00 |
+| `date_filter_applied` | 19 | 1.00 |
+| `freshness_declared` | 208 | 1.00 |
+| `hits_before_context` | 206 | 1.00 |
+| `lexical_presence` | 6 | 1.00 |
+| `media_filter_applied` | 12 | 1.00 |
+| `no_empty_sessions` | 206 | 1.00 |
+| `no_self_in_sender` | 150 | 1.00 |
+| `nonempty` | 58 | 1.00 |
+| `ordering_declared` | 208 | 1.00 |
+| `person_filter_applied` | 168 | 1.00 |
+| `recency_order` | 149 | 1.00 |
+| `recency_session_order` | 147 | 1.00 |
+| `self_filter_applied` | 8 | 1.00 |
+| `sender_is_expected` | 150 | 1.00 |
+| `sender_purity` | 150 | 1.00 |
+
+| oracle metric | mean |
+| --- | --- |
+| `indexed_coverage` | 1.00 |
+| `newest_is_indexed` | 1.00 |
+| `newest_is_true_newest` | 1.00 |
+| `newest_present` | 1.00 |
+| `precision` | 1.00 |
+| `recall_top` | 1.00 |
+
+| class | n | pass | p50 s | p95 s |
+| --- | --- | --- | --- | --- |
+| `adversarial` | 6 | 1.00 | 1.036 | 1.381 |
+| `ambiguous` | 4 | 1.00 | 0.648 | 1.296 |
+| `date_only` | 4 | 1.00 | 0.044 | 0.419 |
+| `group` | 2 | 1.00 | 1.264 | 1.273 |
+| `lexical` | 6 | 1.00 | 0.906 | 1.265 |
+| `media` | 12 | 1.00 | 0.478 | 1.392 |
+| `name_typo` | 4 | 1.00 | 0.14 | 0.161 |
+| `natural` | 3 | 1.00 | 1.521 | 1.981 |
+| `person_date` | 12 | 1.00 | 0.04 | 0.06 |
+| `person_media` | 4 | 1.00 | 0.037 | 0.071 |
+| `person_only` | 18 | 1.00 | 0.151 | 0.894 |
+| `person_recency` | 24 | 1.00 | 0.143 | 0.198 |
+| `person_topical` | 6 | 1.00 | 1.162 | 2.509 |
+| `person_topical_participant` | 12 | 1.00 | 1.453 | 2.146 |
+| `self` | 2 | 1.00 | 0.721 | 1.403 |
+| `self_topical` | 6 | 1.00 | 0.237 | 1.25 |
+| `surface_lower` | 12 | 1.00 | 0.131 | 0.616 |
+| `surface_plain` | 12 | 1.00 | 0.139 | 0.19 |
+| `surface_possessive` | 4 | 1.00 | 0.144 | 0.171 |
+| `surface_punctuated` | 8 | 1.00 | 0.136 | 0.182 |
+| `surface_quoted` | 12 | 1.00 | 0.136 | 0.171 |
+| `surface_typo` | 12 | 1.00 | 0.131 | 0.178 |
+| `surface_upper` | 12 | 1.00 | 0.128 | 1.229 |
+| `time_of_day` | 3 | 1.00 | 0.015 | 0.401 |
+| `topical` | 6 | 1.00 | 1.218 | 1.341 |
+| `topical_date` | 2 | 1.00 | 1.128 | 1.134 |
+
+Filter-only queries (`person_*`, `surface_*`, `date_only`, `time_of_day`)
+answer in **0.02–0.2 s** because they skip the models entirely. Queries with
+a semantic component sit at **0.9–2.5 s**.
+
+### 9.2 Parser probe — 1000 cases, model-free
+
+`plain`, `lower`, `upper`, `possessive`, `punctuated`, `quoted`, `typo` and
+the corpus negative set **all 1.00**. Budgets met in both modes:
+
+* normal: `python -m seaglass.eval.parser_probe --chat-db ~/.seaglass/chat_snapshot.db`
+* contacts unavailable (§7): the same 1000 cases with `--no-contacts`, all 1.00.
+
+### 9.3 Golden-set recall (`eval/score.py`, 32 items)
+
+recall@50 0.62, recall@12 0.41, recall@final 0.41, filter kill rate 0.03 —
+**unchanged** before and after this work, confirming no regression. The set
+is small and dominated by `media_geo`; its one `exact_string` case is
+mislabelled (a topical query, not a quote), so it does not exercise the new
+phrase arm.
+
+### 9.4 Defects this suite found
+
+Every one of these was invisible to v1.
+
+| defect | why it mattered | fix |
+| --- | --- | --- |
+| `fuzzy_match` was case-sensitive | rapidfuzz applies no processor by default, so **every lowercase name** failed to resolve — and the assist path with it, since it looks up Copilot's verbatim span | `processor=default_process`, plus exact and typo resolvers ordered by precision |
+| `recency_ranked` sorted **within** each 900-id batch and concatenated | the result was "batch order, then recency", so a top-50 slice took the newest of an arbitrary batch. Above ~2000 candidates "what did I tell Vamski" answered with yesterday and dropped today | merge the batches into one global ordering |
+| media filter was chunk-level only | `chunks.has_attachment` marks a *conversation*, so "pictures Kaya sent" returned 80 hits of which 5 were pictures | narrow candidates to chunks where *that sender* attached something, and filter hits on `has_attachment` |
+| verbatim phrases could be unretrievable | a pasted sentence spreads across hundreds of near-ties in both dense and BM25 arms, so an exactly-matching chunk ranked below the fused cut | fourth retrieval arm: `phrase_search`, multi-word only |
+| empty index raised on every search | calibration samples the chunks, so a pre-first-sync index has no `int8_absmax` and searching it was a stack trace, not "no results yet" | return empty when the index has no chunks; still raise for a *populated* index with no calibration |
+| `apply-assist` 500 on a malformed body | a missing `assist_token` reported as a server error, sending the reader into the pipeline instead of their own payload | 400 |
+| oracle scored the wrong half of the conversation | `is_from_me = 0` was hardcoded, so "what did I tell Kaya" was judged against what *Kaya* wrote — the engine was marked wrong for being right | direction-aware oracle; outgoing scoped by chat membership, since my group messages carry `handle_id` 0 |
+| recall measured against page 1 only | the 20 newest messages from a chatty contact span more day-sessions than one page holds | the oracle follows `has_more` for up to two extra pages; latency still judged on page 1 |
+

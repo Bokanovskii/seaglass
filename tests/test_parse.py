@@ -191,6 +191,12 @@ class _StubContacts:
     def handle_ids_for_names(self, name, threshold=None):
         return ['+15550001111', 'kaya@example.com'] if name.lower() == 'kaya' else []
 
+    def handle_ids_for_exact_name(self, name):
+        return self.handle_ids_for_names(name)
+
+    def handle_ids_for_similar_given_name(self, name):
+        return []
+
     def resolve_handle(self, handle):
         return 'Kaya'
 
@@ -257,3 +263,43 @@ class TestFirstPersonSender:
         # "I" is capitalised like a name and was fuzzy-matched to contacts.
         parsed = parse_query('what did I say about rent')
         assert parsed.people_sender == []
+
+
+class TestNameSurfaceForms:
+    """TEST-EVAL-PLAN-V2.md §4. The suite only ever typed `Kaya`, so the
+    parser's requirement of a leading capital went unmeasured and
+    "recent messages from kaya" answered with a stranger's messages."""
+
+    def test_lower_case_name_still_resolves(self):
+        parsed = parse_query('recent messages from kaya', contact_index=_StubContacts())
+        assert parsed.people_sender
+
+    def test_upper_case_name_still_resolves(self):
+        assert parse_query('messages from KAYA', contact_index=_StubContacts()).people_sender
+
+    def test_quoted_name_still_resolves(self):
+        assert parse_query('messages from "kaya"', contact_index=_StubContacts()).people_sender
+
+    def test_possessive_is_a_sender_query(self):
+        parsed = parse_query("kaya's latest messages", contact_index=_StubContacts())
+        assert parsed.people_sender
+
+    def test_trailing_punctuation_is_not_part_of_the_name(self):
+        assert parse_query('messages from kaya?', contact_index=_StubContacts()).people_sender
+
+    def test_a_date_word_is_not_a_person(self):
+        # The capital requirement used to be what stopped this.
+        for text in ('texts from yesterday', 'messages from monday', 'photos from june'):
+            parsed = parse_query(text, contact_index=_StubContacts())
+            assert not parsed.people_participant, text
+            assert not parsed.people_sender, text
+
+    def test_an_ordinary_word_is_not_a_person(self):
+        for text in ('messages i sent from work', 'pictures from the wedding', 'notes from the meeting'):
+            parsed = parse_query(text, contact_index=_StubContacts())
+            assert not parsed.people_participant, text
+
+    def test_the_extra_word_is_not_swallowed_into_the_name(self):
+        parsed = parse_query('messages from kaya yesterday', contact_index=_StubContacts())
+        assert parsed.people_sender
+        assert parsed.date_from is not None

@@ -250,3 +250,50 @@ def test_search_payload_reports_index_staleness(tmp_path, monkeypatch):
     payload = engine.search('dinner plans', SearchFilters(), SearchOptions())
     assert payload['index_stale'] is True
     assert payload['n_messages_since_index'] == 1
+
+
+class TestEmptyIndexPayloadShape:
+    """TEST-EVAL-PLAN-V2.md §7. "No results" and "no results *yet*" are
+    different answers, and both have to arrive in the same shape as a full
+    one -- otherwise every consumer needs two code paths and the one it
+    reaches least often is the one that breaks."""
+
+    REQUIRED = (
+        'sessions', 'n_sessions', 'n_results', 'confidence', 'ordering',
+        'offset', 'total_sessions', 'has_more', 'next_offset',
+        'effective_filters', 'timings', 'elapsed_s',
+    )
+
+    def _empty_engine(self, tmp_path, monkeypatch):
+        chat_db = build_fixture_chat_db(tmp_path, [])
+        index_db = tmp_path / 'empty-index.db'
+        build_index(chat_db, index_db, embedding_model=FakeEmbeddingModel(), batch_size=10)
+        monkeypatch.setattr('seaglass.app.engine.EmbeddingModel', FakeEmbeddingModel)
+        monkeypatch.setattr('seaglass.app.engine.CrossEncoderReranker', FakeReranker)
+        monkeypatch.setattr(
+            'seaglass.app.engine.ContactIndex.load',
+            lambda: ContactIndex([Contact(identifier='1', display_name='Alice Chen', handles=('+15551234567',))]),
+        )
+        engine = SearchEngine(str(index_db), str(chat_db))
+        engine.warmup(progress=lambda _name: __import__('contextlib').nullcontext())
+        return engine
+
+    def _assert_shape(self, payload):
+        for field_name in self.REQUIRED:
+            assert field_name in payload, f'empty payload is missing {field_name}'
+        assert payload['sessions'] == []
+        assert payload['n_results'] == 0
+        assert payload['has_more'] is False
+        # Freshness is what separates "nothing matched" from "nothing
+        # indexed yet", so it cannot be the field that goes missing here.
+        assert 'index_stale' in payload or 'indexed_through' in payload
+
+    def test_topical_query_against_an_empty_index(self, tmp_path, monkeypatch):
+        engine = self._empty_engine(tmp_path, monkeypatch)
+        self._assert_shape(engine.search('dinner plans', SearchFilters(), SearchOptions()))
+
+    def test_filter_only_query_against_an_empty_index(self, tmp_path, monkeypatch):
+        engine = self._empty_engine(tmp_path, monkeypatch)
+        payload = engine.search('messages from Alice Chen', SearchFilters(), SearchOptions())
+        self._assert_shape(payload)
+        assert payload['ordering'] == 'recent'
