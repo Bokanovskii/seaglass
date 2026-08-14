@@ -190,8 +190,22 @@ def _hits(payload: dict) -> List[dict]:
 
 
 def _flat_in_caller_order(payload: dict) -> List[dict]:
-    """What a caller honouring `limit` actually reads: every session's hits,
-    then every session's context (the order grogu_imessage flattens to)."""
+    """What a caller honouring `limit` actually reads.
+
+    When the target emits a flat list of its own (grogu does), that list
+    *is* the caller order and gets read back verbatim. Rebuilding it as
+    "every session's hits, then every session's context" instead quietly
+    repaired the ordering before grading it: grogu shipped a session's
+    context above a later session's match for two commits while this
+    harness reported the property it broke at 1.00.
+
+    For a target that returns nested sessions and leaves flattening to
+    its caller, that hits-then-context reconstruction is still the right
+    model, because it is what the caller will do.
+    """
+    order = payload.get("_caller_order")
+    if order is not None:
+        return list(order)
     hits, context = [], []
     for session in payload.get("sessions", []):
         hits.extend(session.get("messages", []))
@@ -299,11 +313,21 @@ def check_properties(case: Case, payload: dict, parsed, oracle: Oracle) -> Dict[
         props["recency_order"] = None
         props["recency_session_order"] = None
 
-    if sessions:
-        first = sessions[0]
-        props["hits_before_context"] = bool(first.get("messages"))
+    # Only a target that emits its own flat list can get this wrong; a
+    # nested payload has no single order to be wrong about. The old check
+    # here asked whether the first session was non-empty, which is what
+    # `no_empty_sessions` already answers -- so it read 1.00 on 206 of 208
+    # cases while grogu was shipping context above a later session's match.
+    caller_order = payload.get("_caller_order")
+    if caller_order:
+        kinds = [row.get("_kind", "hit") for row in caller_order]
+        first_context = next((i for i, k in enumerate(kinds) if k == "context"), None)
+        props["context_after_hits"] = (
+            True if first_context is None
+            else all(k == "context" for k in kinds[first_context:])
+        )
     else:
-        props["hits_before_context"] = None
+        props["context_after_hits"] = None
 
     if case.lexical and sessions:
         needle = case.lexical.lower()
@@ -314,8 +338,36 @@ def check_properties(case: Case, payload: dict, parsed, oracle: Oracle) -> Dict[
     else:
         props["lexical_presence"] = None
 
-    props["freshness_declared"] = "index_stale" in payload
-    props["ordering_declared"] = "ordering" in payload
+    # These two were `"key" in payload` -- structurally true on every case
+    # that ever ran, so they contributed two guaranteed 1.00 rows to the
+    # report and could never fail. Judge the value instead of its presence.
+    stale = payload.get("index_stale")
+    behind = payload.get("n_messages_since_index")
+    props["freshness_declared"] = (
+        isinstance(stale, bool)
+        and isinstance(behind, int)
+        and behind >= 0
+        # "stale" has to mean something: it is a claim about messages the
+        # answer could not see, so it must agree with the count.
+        and (behind > 0) == bool(stale)
+    ) if "index_stale" in payload else False
+
+    ordering = payload.get("ordering")
+    if ordering not in ("recent", "relevance"):
+        props["ordering_declared"] = False
+    elif ordering == "recent" and payload.get("_caller_order"):
+        # A declared chronological answer must actually be chronological
+        # for a target that emits one flat list -- that declaration is
+        # exactly what grogu acts on when it re-sorts. A nested payload
+        # groups by session and has no single order to check, which is
+        # what recency_order and recency_session_order grade instead.
+        stamps = [m.get("ts") or 0 for m in payload["_caller_order"]
+                  if m.get("_kind", "hit") == "hit"]
+        props["ordering_declared"] = (
+            stamps == sorted(stamps, reverse=True) if len(stamps) > 1 else True
+        )
+    else:
+        props["ordering_declared"] = True
     return props
 
 
@@ -552,6 +604,15 @@ def as_grogu_shows_it(pages, flat: Sequence[dict]) -> dict:
     # score it on messages no caller of Grogu can ever reach.
     out["has_more"] = False
     out["_source_sessions"] = len(sources)
+    # The order grogu actually emitted, before this function split it into
+    # hits and context. Without it the split silently sorts grogu's answer
+    # into the shape the properties expect, and an ordering defect in the
+    # code under test becomes unobservable.
+    out["_caller_order"] = [
+        dict(by_id[row["id"]], _kind=row.get("kind") or "hit")
+        for row in flat
+        if row.get("id") in by_id
+    ]
     return out
 
 

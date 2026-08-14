@@ -223,7 +223,7 @@ def _recent_senders(engine, days: int = 45, limit: int = 4) -> List[str]:
 _TAPBACK = re.compile(r"^(Laughed at|Liked|Loved|Disliked|Emphasized|Questioned)\b")
 
 
-def _corpus_phrases(engine, limit: int = 6) -> List[str]:
+def _corpus_phrases(engine, limit: int = 24) -> List[str]:
     """Phrases that provably exist in the *index*, not just in chat.db.
 
     Two traps, both of which made this measure the sampler instead of the
@@ -239,9 +239,17 @@ def _corpus_phrases(engine, limit: int = 6) -> List[str]:
         """
         SELECT text FROM message
         WHERE is_from_me = 0 AND text IS NOT NULL AND LENGTH(text) BETWEEN 40 AND 160
-        ORDER BY date DESC LIMIT 600
+        ORDER BY date DESC LIMIT 4000
         """
     ).fetchall()
+    # Drawing every phrase from the newest few hundred messages tested one
+    # week of one conversation, and only six of them: verbatim recall is
+    # the property that has caught the most real defects, and it was
+    # grading 6 of 208 cases. Stride across the sample instead, so the
+    # phrases span months and speakers, and stay deterministic -- a random
+    # sample would make a regression irreproducible.
+    stride = max(1, len(rows) // (limit * 12) if limit else 1)
+    rows = rows[::stride]
     phrases: List[str] = []
     for (text,) in rows:
         text = (text or "").strip()
