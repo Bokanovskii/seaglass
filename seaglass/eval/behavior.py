@@ -587,8 +587,14 @@ class GroguSearcher:
         # The public entry point, not the flattener underneath it: paging,
         # limit and ordering are all decided here, and a harness that
         # reaches past them measures code no caller runs.
+        started = time.time()
         rows = self.imessage.search_via_seaglass(query, limit=self.limit)
-        return as_grogu_shows_it(self._pages_covering(query, rows), rows)
+        elapsed = time.time() - started
+        payload = as_grogu_shows_it(self._pages_covering(query, rows), rows)
+        # Hydrating for the oracle costs another round trip or three, and
+        # a caller pays none of it. Report what Grogu itself took.
+        payload["_elapsed_s"] = elapsed
+        return payload
 
     def _pages_covering(self, query: str, rows: Sequence[dict]) -> List[dict]:
         """The pages Grogu's rows came from.
@@ -685,7 +691,7 @@ def run_case(searcher, corpus: Corpus, case: Case) -> Result:
     except Exception as error:  # noqa: BLE001 - a crash is a result, not a stop
         parsed = parse_query(case.query, contact_index=corpus.contact_index)
         return Result(case, {}, parsed, time.time() - started, error=repr(error))
-    elapsed = time.time() - started
+    elapsed = payload.get("_elapsed_s", time.time() - started)
     parsed = parsed_from_payload(payload, case.query, corpus.contact_index)
     reachable_ids = None
     # Any browse-ordered answer for a declared person is oracle-scored, not

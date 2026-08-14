@@ -293,3 +293,78 @@ Every one of these was invisible to v1.
 | recency reservation ignored the query | the two reserved slots went to the strictly newest sessions, so on the 4-session page Grogu asks for, **half the answer** could be unrelated. "what did kaya say about the boat" spent a slot on a sourdough conversation while a day with two boat messages sat below the cut | scale the slots with the page (`head_size // 3`) and prefer sessions whose chunks matched the query's terms — the BM25 arm's ids, threaded out of `retrieve`, since the phrase arm only fires on a verbatim sentence |
 | recall measured against page 1 only | the 20 newest messages from a chatty contact span more day-sessions than one page holds | the oracle follows `has_more` for up to two extra pages; latency still judged on page 1 |
 
+
+## 10. Grogu and the app, side by side
+
+Everything above measures one front door. Grogu is the other, and it is
+the one most of these queries actually arrive through — so the suite now
+runs both on the same cases, in one process, against one running app:
+
+```
+.venv/bin/python -m seaglass.eval.behavior \
+  --index-db ~/.seaglass/index.db --chat-db ~/.seaglass/chat_snapshot.db \
+  --compare --json-out /tmp/compare.json
+```
+
+Both targets share an engine, so every difference is something Grogu
+does to the answer on its way to the caller rather than a second engine
+ranking it differently. Grogu is driven through `search_via_seaglass`,
+its real public entry point — paging, limits and ordering are decisions
+that belong to the code under test, and a harness that reaches past them
+into the flattener measures code no caller runs.
+
+### 10.1 First run
+
+The app scored 1.00 on every property. Grogu, asking the same questions
+of the same engine, failed **160 of 208 queries**:
+
+| metric | app | grogu |
+| --- | --- | --- |
+| `recency_order` | 1.00 | 0.01 |
+| `no_self_in_sender` | 1.00 | 0.23 |
+| `sender_purity` | 1.00 | 0.64 |
+| `precision` | 1.00 | 0.51 |
+| `recall_top` | 1.00 | 0.50 |
+| sessions reaching the caller (mean) | 5.8 | 1.7 |
+| failing queries | 0 | 160 |
+
+None of this was a ranking problem. Seaglass returns a ranked page of
+sessions, each with its matches and the context it expanded them with;
+Grogu flattened that into one list and truncated it to a message count.
+
+### 10.2 Defects found, all on the Grogu side
+
+| defect | why it mattered | fix |
+| --- | --- | --- |
+| truncation kept only the first session | flattening emitted one session completely before starting the next, so a 20-message limit was spent inside session 0 — which alone holds 50+ messages once context is expanded. Eight sessions were reranked and hydrated; 1.7 reached the caller | share the budget: every session contributes before any contributes twice, then the surplus follows the reranker's order |
+| context was indistinguishable from a match | surrounding messages are frequently from the other participant or from the user; presented as results they took sender purity to 0.23 and precision to 0.51 | matches fill the budget first, every row is labelled `kind`, context only tops up an answer short of matches |
+| a declared ordering was discarded | seaglass says `ordering: "recent"` for "latest from Sam"; per-session emission scrambled it | honour it explicitly |
+| a match was demoted by a neighbouring session | the same message is a match in one session and context in another; keeping whichever came first made it context, and matches are spent first, so it fell off the limit — six of one contact's newest twenty vanished, each a match elsewhere in the same answer | a match anywhere is a match |
+| eight days could not hold twenty messages | a contact who texts in bursts across two handles has their newest twenty spread past the eight day-sessions one page holds; recall of the true newest sat at 0.77 | ask again, wider — a chronological answer is a filter, not a search, so seaglass skips the models and answered sixteen days *faster* than eight |
+| stitched pages had holes | two pages ranked separately and concatenated gave a locally sorted answer missing messages from the middle | one wider request, ordered once, globally; a page is fetched only when even the wide answer came back short |
+| `search_messages` could not page | the HTTP API supported `offset`; the MCP tool hid it, so no caller could ever reach page two | expose it |
+
+Two were harness defects, fixed there: `per_case` keyed on the query
+alone, so queries appearing in several classes reported one case's
+numbers twice; and Grogu's latency included the harness's own hydration
+round trips, which no caller pays.
+
+### 10.3 After
+
+| metric | app | grogu |
+| --- | --- | --- |
+| every property | 1.00 | 1.00 |
+| every oracle metric | 1.00 | 1.00 |
+| failing queries | 0 | 0 |
+| p50 latency | 0.53 s | 0.48 s |
+| p90 latency | 1.55 s | 1.46 s |
+
+Grogu still returns fewer messages by design — a mean of 18.9 against
+the app's 69 — because `--limit 20` is a message count and the app shows
+a whole page. It now spends those 20 on the same answer the app would
+give.
+
+Three queries per target exceeded 10 s during the run, on *different*
+queries for each target, and all four re-ran in under 2 s: the machine
+stalled mid-run, not the code. Judge p50/p90, and re-measure outliers
+before believing them.
