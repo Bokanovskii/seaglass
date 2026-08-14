@@ -19,6 +19,8 @@ golden-set eval (Phase 3.5) shows it hurts precision.
 
 from __future__ import annotations
 
+import re
+
 import dataclasses
 from typing import Dict, Iterable, List, Optional, Sequence, Set
 
@@ -214,6 +216,30 @@ def dense_search(
     return [row[0] for row in index_con.execute(query, params)]
 
 
+_FTS_TOKEN = re.compile(r"\w+", re.UNICODE)
+
+
+def fts_match_query(query_text: str) -> str:
+    """Turn arbitrary user text into an FTS5 MATCH expression.
+
+    FTS5 MATCH is a *query language*, not a string: `-` is NOT, `:` is a
+    column filter, `"` opens a phrase, and AND/OR/NOT are keywords. Passing
+    raw user text meant "what about the boat?" and "re: lease" and
+    "12-24" all raised, and the caller failed open to zero results -- so
+    an ordinary question silently lost BM25 entirely and was answered by
+    the vector half alone. It failed *quietly*, which is why it survived:
+    the search still returned something plausible.
+
+    Each word token is extracted and quoted individually, which keeps the
+    implicit-AND semantics the unquoted form had while making every input
+    syntactically inert. Returns "" when there is no word character to
+    search for, which the caller treats as "no sparse results" -- the one
+    case where that answer is actually correct.
+    """
+    tokens = _FTS_TOKEN.findall(query_text)
+    return " ".join('"' + token + '"' for token in tokens)
+
+
 def sparse_search(
     index_con,
     query_text: str,
@@ -224,7 +250,8 @@ def sparse_search(
     ⚠️ FTS5 bm25() returns negative values; best matches sort ascending
     (PLAN.md §6 Phase 4).
     """
-    if not query_text.strip():
+    match = fts_match_query(query_text)
+    if not match:
         return []
     if candidate_ids is not None:
         if not candidate_ids:
@@ -237,10 +264,10 @@ def sparse_search(
             f"SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH ? AND rowid IN ({placeholders}) "
             "ORDER BY bm25(chunks_fts) ASC LIMIT ?"
         )
-        params = [query_text, *candidate_ids, top_k]
+        params = [match, *candidate_ids, top_k]
     else:
         query = "SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH ? ORDER BY bm25(chunks_fts) ASC LIMIT ?"
-        params = [query_text, top_k]
+        params = [match, top_k]
     try:
         return [row[0] for row in index_con.execute(query, params)]
     except Exception:

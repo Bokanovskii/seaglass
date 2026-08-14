@@ -450,3 +450,109 @@ to fail on code that deserves it.
 **The rule this earns:** a property that has never failed is not
 evidence, it is an untested assertion. Before believing a clean report,
 break the code on purpose and confirm the suite notices.
+
+---
+
+## §12 — What running the suite against the live tail turned up
+
+Wiring the chat.db tail (filters-only queries answered from the live
+database rather than the index) made the suite fail 31 of 226 cases. Only
+one of those was a real engine defect, and it was not the one the report
+pointed at. Chasing each to root cause found two genuine bugs that had
+nothing to do with the feature under test.
+
+### 12.1 The oracle was scored against the wrong horizon
+
+`score_against_oracle` clipped ground truth to `MAX(end_ts)` of the
+index, on the reasoning that a message the index has never seen cannot be
+ranked. That reasoning stopped being true the moment the engine could
+read past the index. The engine answered "latest from Kaya" with the
+genuinely newest message, the oracle compared it against the newest
+*indexed* message, and 30 person-recency cases were marked wrong for the
+improvement.
+
+The horizon is now dropped when the payload declares
+`unindexed_included`. The allowance is earned by the coverage flag, not
+granted to everyone — a second test pins that an index-only answer is
+still clipped, so a genuinely stale answer cannot score clean.
+
+### 12.2 The oracle opened a live database as `immutable`
+
+`Corpus` opened the live `chat.db` with `immutable=1`. That flag asserts
+the file cannot change, so SQLite skips the WAL entirely.
+`imessage/source.py` documents this exact hazard in its docstring —
+"never `immutable=1` ... yields silently corrupt reads on a live
+database" — and the oracle violated it.
+
+It surfaced as `database disk image is malformed`, but only once Messages
+was actively writing; every previous run had been against a quiescent
+file. The loud failure is the lucky case. The dangerous one is the
+documented one: silently corrupt reads *in the component that decides
+whether the engine is right*, which would mark correct answers wrong with
+no error anywhere.
+
+### 12.3 FTS5 MATCH was being handed raw user text
+
+The find that mattered most, and it was not what the failing case was
+about.
+
+`sparse_search` passed the user's query straight into `chunks_fts MATCH`.
+FTS5 MATCH is a query language, not a string: `-` is NOT, `:` is a column
+filter, `"` opens a phrase, and `AND`/`OR`/`NOT` are keywords. So:
+
+| query | BM25 hits (before) |
+|---|---|
+| `what about the boat?` | **0** |
+| `let's meet` | **0** |
+| `re: lease` | **0** |
+| `not contagious after 12-24 of antibiotics` | **0** |
+| `dinner plans` | 20 |
+
+Every one of those raised inside SQLite, and the handler failed open to
+`return []`. An ordinary question containing an apostrophe, a question
+mark, a hyphen or a colon silently lost the entire lexical half of the
+hybrid search and was answered by the vector half alone.
+
+It survived this long precisely because it failed *quietly* and
+*plausibly* — the search still returned topical-looking results, so
+nothing looked broken. This is the same shape of bug as §11's vacuous
+properties: the system reported success while doing less than it claimed.
+
+`fts_match_query` now extracts word tokens and quotes each one, which
+keeps the implicit-AND semantics the unquoted form had while making every
+input syntactically inert. Seven tests, all mutation-verified against a
+raw-text passthrough.
+
+### 12.4 The one case that is still red, and why it is not being "fixed"
+
+`lexical_presence` on `not contagious after 12-24 of antibiotics` is a
+**parser** false positive, not a lexical one. `parse_query` reads
+`after 12-24` as a date filter — Dec 21–27 2025 — and strips those tokens
+from `semantic`. The message the phrase was drawn from is from July 2026,
+so the date filter excludes the very message being searched for, and the
+surviving `not contagious antibiotics` no longer contains the phrase for
+`phrase_search` to match.
+
+Both halves of the retriever are working correctly here; they are being
+asked the wrong question. Re-tuning date extraction is a real change with
+real regression risk against every legitimate date query, so it is
+recorded here rather than rushed. `"12 24"` (unhyphenated) parses as a
+date too, so any fix has to address the heuristic, not the hyphen.
+
+### 12.5 A caveat on measuring recency against a live corpus
+
+`newest_is_true_newest` compares an answer computed at query time against
+an oracle read at scoring time. On a corpus that is actively receiving
+messages, a message arriving between those two moments marks a correct
+answer wrong. One `self_topical` case failed exactly this way and passed
+cleanly on re-run.
+
+Re-run a single-case recency failure before believing it. A failure that
+does not reproduce on a live corpus is evidence about the clock, not
+about the engine.
+
+### 12.6 Result
+
+226 cases, app target: all sixteen properties at 1.00 except
+`lexical_presence` (23/24, §12.4). `newest_is_true_newest` went 0.79 →
+1.00. `precision` 0.99–1.00, `recall_top` 1.00.

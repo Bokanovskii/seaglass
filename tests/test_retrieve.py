@@ -426,3 +426,72 @@ class TestUncalibratedIndex:
 
         with pytest.raises(RuntimeError, match="int8_absmax"):
             retrieve(self._con(True), parse_query("dinner"), FakeEmbeddingModel())
+
+
+class TestFtsMatchQueryMakesUserTextInert:
+    """FTS5 MATCH is a query language, not a string: `-` is NOT, `:` is a
+    column filter, `"` opens a phrase, and AND/OR/NOT are keywords. Raw
+    user text therefore *raised* for a large share of ordinary questions,
+    and `sparse_search` failed open to zero results -- so "what about the
+    boat?" silently lost BM25 entirely and was answered by the vector half
+    alone. It failed quietly, which is why it survived: the search still
+    returned something plausible.
+    """
+
+    @staticmethod
+    def _fts():
+        from seaglass.search.retrieve import fts_match_query
+
+        return fts_match_query
+
+    def test_each_word_is_quoted_so_operators_cannot_survive(self):
+        assert self._fts()("12-24 of antibiotics") == '"12" "24" "of" "antibiotics"'
+
+    def test_fts5_keywords_are_defused(self):
+        assert self._fts()("AND OR NOT") == '"AND" "OR" "NOT"'
+
+    def test_text_with_no_word_characters_yields_no_query(self):
+        assert self._fts()("???") == ""
+        assert self._fts()("") == ""
+
+    def test_unicode_words_survive(self):
+        assert self._fts()("café niseko") == '"café" "niseko"'
+
+
+class TestSparseSearchSurvivesRealPunctuation:
+    def _index(self, tmp_path, texts):
+        chat_db = build_fixture_chat_db(
+            tmp_path,
+            [{
+                'chat_id': 1,
+                'handles': ['+15551234567'],
+                'messages': [(t, 700000000 + i * 60, False, 0) for i, t in enumerate(texts)],
+            }],
+        )
+        index_db = tmp_path / 'index.db'
+        build_index(chat_db, index_db, embedding_model=FakeEmbeddingModel(), batch_size=10)
+        return open_index_db(index_db)
+
+    def test_a_hyphenated_number_no_longer_kills_the_query(self, tmp_path):
+        from seaglass.search.retrieve import sparse_search
+
+        con = self._index(tmp_path, ["you're not contagious after 12-24 of antibiotics tho"])
+        assert sparse_search(con, "not contagious after 12-24 of antibiotics", None) != []
+
+    def test_a_question_mark_no_longer_kills_the_query(self, tmp_path):
+        from seaglass.search.retrieve import sparse_search
+
+        con = self._index(tmp_path, ["what about the boat this weekend"])
+        assert sparse_search(con, "what about the boat?", None) != []
+
+    def test_a_colon_no_longer_reads_as_a_column_filter(self, tmp_path):
+        from seaglass.search.retrieve import sparse_search
+
+        con = self._index(tmp_path, ["re lease paperwork signed"])
+        assert sparse_search(con, "re: lease", None) != []
+
+    def test_punctuation_only_input_still_returns_nothing(self, tmp_path):
+        from seaglass.search.retrieve import sparse_search
+
+        con = self._index(tmp_path, ["anything at all"])
+        assert sparse_search(con, "???", None) == []

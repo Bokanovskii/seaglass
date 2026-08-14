@@ -406,6 +406,15 @@ def score_against_oracle(
     # messages that arrived after the last build" need opposite fixes
     # (QUERY-EVAL-PLAN.md §6).
     scores_extra: Dict[str, float] = {}
+    # ...unless the engine reached past the index to answer. A filters-only
+    # query is served from chat.db directly, so "the index has never seen
+    # it" no longer implies "the engine could not return it". Clipping the
+    # truth here anyway scored the engine against the newest *indexed*
+    # message while it correctly answered with a newer unindexed one, and
+    # marked it wrong for the improvement: 30 person-recency cases failed
+    # newest_is_true_newest the first time the tail ran.
+    if payload.get("unindexed_included"):
+        index_horizon = None
     if index_horizon is not None:
         indexed = [m for m in truth if m["ts"] <= index_horizon]
         scores_extra["newest_is_indexed"] = 1.0 if truth and truth[0]["ts"] <= index_horizon else 0.0
@@ -479,8 +488,15 @@ class Corpus:
         # bounded by the same snapshot the index was built from can never
         # observe staleness, which is one of the failures the suite exists
         # to tell apart.
+        # `connect_readonly`, not a bare `immutable=1` connect. `immutable`
+        # asserts the file cannot change, so SQLite skips the WAL -- on a
+        # database Messages is actively writing that raises "database disk
+        # image is malformed" at best and, per imessage.source, returns
+        # silently corrupt reads at worst. Silently corrupt is the real
+        # hazard here: the oracle is what decides whether the engine was
+        # right, so a bad read marks a correct answer wrong.
         self.oracle_con = (
-            sqlite3.connect(f"file:{chat_db_source}?mode=ro&immutable=1", uri=True)
+            connect_readonly(Path(chat_db_source))
             if chat_db_source else self.chat_con
         )
         self.oracle = Oracle(self.oracle_con)

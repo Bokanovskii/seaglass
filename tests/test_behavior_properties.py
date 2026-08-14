@@ -185,3 +185,61 @@ def test_the_suite_draws_verbatim_phrases_from_more_than_one_week():
     assert signature.parameters["limit"].default >= 24
     source = inspect.getsource(suites._corpus_phrases)
     assert "stride" in source, "phrases must be spread across the sample, not taken from its head"
+
+
+class TestTheOracleAllowsTheEngineToReachPastTheIndex:
+    """The oracle used to clip ground truth to the index horizon, because a
+    message the index had never seen could not be ranked. That stopped
+    being true when seaglass began serving filters-only queries from
+    chat.db: the engine now answers with messages past the horizon, and
+    clipping marked it wrong for the improvement -- 30 person-recency
+    cases failed `newest_is_true_newest` the first time the tail ran.
+    """
+
+    @staticmethod
+    def _oracle(messages):
+        class _O:
+            def messages_from(self, handles, **kwargs):
+                return messages
+        return _O()
+
+    @staticmethod
+    def _payload(message_id, ts, unindexed):
+        return {
+            "sessions": [{
+                "messages": [{
+                    "message_id": message_id, "ts": ts,
+                    "is_from_me": False, "sender": "+1", "text": "hi",
+                }],
+                "context_messages": [],
+            }],
+            "unindexed_included": unindexed,
+        }
+
+    def _score(self, unindexed):
+        from seaglass.eval.behavior import score_against_oracle
+
+        newest = {"message_id": 2, "ts": 200.0, "text": "newest, not indexed"}
+        older = {"message_id": 1, "ts": 100.0, "text": "older, indexed"}
+        parsed = SimpleNamespace(
+            people_sender=["+1"], semantic="", date_from=None, date_to=None,
+            has_media=False, from_me=None,
+        )
+        case = Case(query="latest from x", cls="person_recency", expect_handles=["+1"])
+        return score_against_oracle(
+            parsed,
+            self._payload(2, 200.0, unindexed),
+            self._oracle([newest, older]),
+            index_horizon=150.0,
+            case=case,
+        )
+
+    def test_an_unindexed_answer_is_scored_against_the_real_newest(self):
+        assert self._score(unindexed=3)["newest_is_true_newest"] == 1.0
+
+    def test_an_index_only_answer_is_still_clipped_to_the_horizon(self):
+        """The allowance must be earned by the coverage flag, not granted
+        to everyone -- otherwise a genuinely stale answer scores clean."""
+        scores = self._score(unindexed=0)
+        assert scores["newest_is_true_newest"] == 0.0
+        assert scores["newest_is_indexed"] == 0.0
