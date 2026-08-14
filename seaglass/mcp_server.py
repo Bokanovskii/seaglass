@@ -233,6 +233,7 @@ def search_messages(
     query: str,
     max_sessions: int = 8,
     redact: bool = False,
+    offset: int = 0,
 ) -> dict:
     """Search the user's iMessage history by topic or content and return
     ranked, hydrated conversation sessions with message_id citations.
@@ -244,9 +245,16 @@ def search_messages(
     corpus. Any date range or participant name mentioned in `query` is
     parsed automatically (e.g. "last week", "with Sam") -- `person`
     matches chat participants, not people merely mentioned in message text.
+
+    Pass `offset` to page: a chronological answer ("latest from Sam")
+    orders whole days, and one page of them holds fewer messages than a
+    caller often wants. `has_more` and `next_offset` in the result say
+    whether paging is worth it and where to resume.
     """
     with _pipeline_lock:
-        return _search_messages_impl(query, max_sessions=max_sessions, redact=redact)
+        return _search_messages_impl(
+            query, max_sessions=max_sessions, redact=redact, offset=offset
+        )
 
 
 def _strip_ui_fields(payload: dict) -> dict:
@@ -372,10 +380,14 @@ def _search_via_running_app(
     return payload
 
 
-def _search_messages_impl(query: str, *, max_sessions: int, redact: bool) -> dict:
+def _search_messages_impl(
+    query: str, *, max_sessions: int, redact: bool, offset: int = 0
+) -> dict:
     t0 = time.time()
 
-    payload = _search_via_running_app(query, max_sessions=max_sessions, redact=redact)
+    payload = _search_via_running_app(
+        query, max_sessions=max_sessions, redact=redact, offset=offset
+    )
     if payload is not None:
         return _strip_ui_fields(payload)
 
@@ -386,7 +398,9 @@ def _search_messages_impl(query: str, *, max_sessions: int, redact: bool) -> dic
         from seaglass.app.filters import SearchFilters
 
         payload = _get_engine().search(
-            query, SearchFilters(), SearchOptions(max_sessions=max_sessions, redact=redact)
+            query,
+            SearchFilters(),
+            SearchOptions(max_sessions=max_sessions, redact=redact, offset=offset),
         )
         return _strip_ui_fields(payload)
 

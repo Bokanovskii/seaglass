@@ -312,3 +312,33 @@ class _FakeResponse:
 
     def __exit__(self, *exc):
         return False
+
+
+def test_search_messages_forwards_offset_to_the_running_app(monkeypatch):
+    """Grogu pages a chronological answer. If `offset` stops here, every
+    page is page one and the caller loops on the same messages."""
+    seen = {}
+
+    def fake(query, *, max_sessions, redact, offset=0):
+        seen.update(query=query, max_sessions=max_sessions, offset=offset)
+        return {"sessions": [], "has_more": False}
+
+    monkeypatch.setattr(mcp_server, "_search_via_running_app", fake)
+
+    mcp_server.search_messages("latest from sam", max_sessions=8, offset=16)
+
+    assert seen["offset"] == 16
+
+
+def test_search_messages_offset_defaults_to_the_first_page(monkeypatch):
+    seen = {}
+
+    def fake(query, *, max_sessions, redact, offset=0):
+        seen["offset"] = offset
+        return {"sessions": [], "has_more": False}
+
+    monkeypatch.setattr(mcp_server, "_search_via_running_app", fake)
+
+    mcp_server.search_messages("latest from sam")
+
+    assert seen["offset"] == 0

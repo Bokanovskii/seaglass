@@ -490,6 +490,144 @@ class EngineSearcher:
         )
 
 
+GROGU_SRC = Path.home() / "src" / "grogu" / "src"
+
+
+def _import_grogu():
+    """Import Grogu's real modules. Never reimplement its flattening here:
+    the whole question this target answers is what *Grogu's own code* does
+    to our payload before a user sees it."""
+    if str(GROGU_SRC) not in sys.path:
+        sys.path.insert(0, str(GROGU_SRC))
+    import grogu_imessage
+    import grogu_mcp
+
+    return grogu_imessage, grogu_mcp
+
+
+def as_grogu_shows_it(pages, flat: Sequence[dict]) -> dict:
+    """Rebuild a scoreable payload from the rows Grogu actually returns.
+
+    Grogu's public shape is a flat list, so that is what gets modelled:
+    one session, messages in Grogu's own order. Anything else would judge
+    an arrangement no caller of Grogu ever receives -- and the order is
+    exactly what is under test, since Grogu re-sorts when seaglass
+    declares a chronological answer.
+
+    Rows Grogu labels `context` go to `context_messages`, matching the
+    distinction the app draws, so both targets are judged on their
+    matches. Before Grogu labelled them, everything was a match, which is
+    precisely what made its sender purity 0.23.
+
+    The top-level fields (`effective_filters`, `ordering`, `freshness`)
+    come through untouched: they describe the search, which both targets
+    share.
+    """
+    if isinstance(pages, dict):
+        pages = [pages]
+    pages = list(pages) or [{}]
+    payload = pages[0]
+    by_id, session_of = {}, {}
+    for page, page_payload in enumerate(pages):
+        for index, session in enumerate(page_payload.get("sessions", [])):
+            for message in session.get("messages", []) + session.get("context_messages", []):
+                identifier = message.get("message_id")
+                by_id.setdefault(identifier, message)
+                session_of.setdefault(identifier, (page, index))
+    hits, context, sources, seen = [], [], set(), set()
+    for row in flat:
+        identifier = row.get("id")
+        if identifier not in by_id or identifier in seen:
+            continue
+        seen.add(identifier)
+        sources.add(session_of.get(identifier))
+        (context if row.get("kind") == "context" else hits).append(by_id[identifier])
+
+    out = {k: v for k, v in payload.items() if k != "sessions"}
+    out["sessions"] = (
+        [{"chat_id": None, "messages": hits, "context_messages": context}]
+        if hits or context else []
+    )
+    # Grogu cannot ask for more; saying otherwise would let the oracle
+    # score it on messages no caller of Grogu can ever reach.
+    out["has_more"] = False
+    out["_source_sessions"] = len(sources)
+    return out
+
+
+class GroguSearcher:
+    """Grogu's path end to end: its MCP call, its flatten, its limit.
+
+    Runs against the same running app as `AppSearcher` -- the MCP server
+    forwards to it -- so this measures Grogu's *handling* of the answer,
+    not a second engine's ranking of it.
+    """
+
+    name = "grogu (MCP -> running app)"
+
+    def __init__(self, max_sessions: int = 8, limit: int = 20):
+        self.imessage, self.mcp = _import_grogu()
+        self.max_sessions = max_sessions
+        self.limit = limit
+
+    @staticmethod
+    def available() -> bool:
+        try:
+            imessage, _ = _import_grogu()
+        except Exception:  # noqa: BLE001 - grogu simply is not installed
+            return False
+        return bool(imessage.seaglass_available())
+
+    def search(self, query: str, offset: int = 0) -> dict:
+        # Grogu's own paging is inside search_via_seaglass, driven by the
+        # ordering seaglass declares. An offset from the harness would be
+        # a second, contradictory pager measuring nothing real.
+        if offset:
+            raise RuntimeError("grogu pages internally; it takes no offset")
+        # The public entry point, not the flattener underneath it: paging,
+        # limit and ordering are all decided here, and a harness that
+        # reaches past them measures code no caller runs.
+        rows = self.imessage.search_via_seaglass(query, limit=self.limit)
+        return as_grogu_shows_it(self._pages_covering(query, rows), rows)
+
+    def _pages_covering(self, query: str, rows: Sequence[dict]) -> List[dict]:
+        """The pages Grogu's rows came from.
+
+        Grogu returns `{id, text, date, handle, kind}`; judging a filter
+        needs `is_from_me` and `has_attachment` too, which only the
+        payload carries. Grogu pages a chronological answer, so following
+        the same pages is what makes every returned row resolvable --
+        stopping at page one would silently drop the rows paging was
+        added to reach and score Grogu for a gap it no longer has.
+        """
+        wanted = {row.get("id") for row in rows}
+        pages, offset = [], 0
+        for _ in range(getattr(self.imessage, "SEAGLASS_MAX_PAGES", 3)):
+            payload = self.mcp.call_tool(
+                self.imessage.SEAGLASS_SERVER_NAME,
+                "search_messages",
+                query=query,
+                max_sessions=self.max_sessions,
+                offset=offset,
+            )
+            if not isinstance(payload, dict):
+                break
+            pages.append(payload)
+            wanted -= {
+                m.get("message_id")
+                for session in payload.get("sessions", [])
+                for m in session.get("messages", []) + session.get("context_messages", [])
+            }
+            if not wanted or not payload.get("has_more"):
+                break
+            offset = payload.get("next_offset") or offset + self.max_sessions
+        return pages
+
+    def close(self) -> None:
+        with contextlib.suppress(Exception):
+            self.mcp.close_all()
+
+
 def parsed_from_payload(payload: dict, query: str, contact_index=None) -> ParsedQuery:
     """Recover what the engine decided the query meant.
 
@@ -659,6 +797,134 @@ def print_report(report: dict) -> None:
             print(f"  [{row['class']}] {row['query']!r}: {detail}")
 
 
+def run_comparison(args, corpus) -> int:
+    """The same cases through both front doors.
+
+    Grogu and the app share an engine, so every difference here is
+    something Grogu does to the answer on its way to the caller. Running
+    them in one process against one app keeps that honest: same index,
+    same models, same warm caches, no second engine to blame.
+    """
+    from seaglass.eval.suites import build_suite
+
+    if not AppSearcher.available():
+        print("No running app; --compare needs one.", file=sys.stderr)
+        return 2
+    if not GroguSearcher.available():
+        print("grogu has no seaglass MCP server configured.", file=sys.stderr)
+        return 2
+
+    cases = build_suite(corpus, path=Path(args.suite) if args.suite else None)
+    if args.only:
+        cases = [c for c in cases if c.cls == args.only]
+
+    targets = {
+        "app": AppSearcher(max_sessions=args.max_sessions),
+        "grogu": GroguSearcher(max_sessions=args.max_sessions, limit=args.grogu_limit),
+    }
+    reports = {}
+    per_case = {}
+    for label, searcher in targets.items():
+        print(f"\nrunning {len(cases)} cases through {searcher.name}...", file=sys.stderr)
+        results = [run_case(searcher, corpus, case) for case in cases]
+        report = summarize(results)
+        report["target"] = searcher.name
+        reports[label] = report
+        # Keyed by class *and* query: the same text appears in several
+        # classes (surface forms overlap person classes), and keying on
+        # the query alone silently reported one case's numbers twice.
+        per_case[label] = {(r.case.cls, r.case.query): r for r in results}
+        print_report(report)
+        if hasattr(searcher, "close"):
+            searcher.close()
+
+    print_comparison(reports, per_case, cases)
+    if args.json_out:
+        Path(args.json_out).write_text(json.dumps(
+            {"reports": reports, "cases": _case_deltas(per_case, cases)}, indent=2
+        ))
+    return 0
+
+
+def _case_deltas(per_case: dict, cases: Sequence[Case]) -> list:
+    rows = []
+    for case in cases:
+        app = per_case["app"].get((case.cls, case.query))
+        grogu = per_case["grogu"].get((case.cls, case.query))
+        if not app or not grogu:
+            continue
+        rows.append({
+            "query": case.query,
+            "class": case.cls,
+            "app_hits": len(_hits(app.payload)),
+            "grogu_hits": len(_hits(grogu.payload)),
+            "app_sessions": len(app.payload.get("sessions", [])),
+            "grogu_sessions": grogu.payload.get(
+                "_source_sessions", len(grogu.payload.get("sessions", []))
+            ),
+            "app_latency_s": round(app.elapsed_s, 3),
+            "grogu_latency_s": round(grogu.elapsed_s, 3),
+            "app_oracle": {k: round(v, 3) for k, v in app.oracle.items()},
+            "grogu_oracle": {k: round(v, 3) for k, v in grogu.oracle.items()},
+            "app_failed": [n for n, v in app.properties.items() if v is False],
+            "grogu_failed": [n for n, v in grogu.properties.items() if v is False],
+        })
+    return rows
+
+
+def print_comparison(reports: dict, per_case: dict, cases: Sequence[Case]) -> None:
+    app, grogu = reports["app"], reports["grogu"]
+    print("\n" + "=" * 68)
+    print("SIDE BY SIDE: the app's page vs what grogu hands its caller")
+    print("=" * 68)
+
+    names = sorted(set(app["properties"]) | set(grogu["properties"]))
+    print(f"\n{'property':<24}{'app':>8}{'grogu':>8}{'delta':>8}")
+    for name in names:
+        a = (app["properties"].get(name) or {}).get("rate")
+        g = (grogu["properties"].get(name) or {}).get("rate")
+        delta = f"{g - a:+.2f}" if a is not None and g is not None else "--"
+        print(f"{name:<24}{_fmt(a):>8}{_fmt(g):>8}{delta:>8}")
+
+    names = sorted(set(app["oracle"]) | set(grogu["oracle"]))
+    print(f"\n{'oracle metric':<24}{'app':>8}{'grogu':>8}{'delta':>8}")
+    for name in names:
+        a, g = app["oracle"].get(name), grogu["oracle"].get(name)
+        delta = f"{g - a:+.2f}" if a is not None and g is not None else "--"
+        print(f"{name:<24}{_fmt(a):>8}{_fmt(g):>8}{delta:>8}")
+
+    rows = _case_deltas(per_case, cases)
+    if rows:
+        print(f"\n{'coverage':<24}{'app':>8}{'grogu':>8}")
+        for label, key in (("sessions shown (mean)", "sessions"), ("messages shown (mean)", "hits")):
+            a = statistics.mean(r[f"app_{key}"] for r in rows)
+            g = statistics.mean(r[f"grogu_{key}"] for r in rows)
+            print(f"{label:<24}{a:>8.1f}{g:>8.1f}")
+        dropped = [r for r in rows if r["grogu_sessions"] < r["app_sessions"]]
+        print(f"{'queries losing sessions':<24}{'':>8}{len(dropped):>8}  of {len(rows)}")
+
+    print(f"\n{'latency (s)':<24}{'app':>8}{'grogu':>8}")
+    for label, fn in (("p50", statistics.median), ("p95", max)):
+        a = fn([r["app_latency_s"] for r in rows])
+        g = fn([r["grogu_latency_s"] for r in rows])
+        print(f"{label:<24}{a:>8.2f}{g:>8.2f}")
+
+    print(f"\nfailing queries{'':<9}{len(app['failures']):>8}{len(grogu['failures']):>8}")
+    only_grogu = (
+        {f["query"] for f in grogu["failures"]} - {f["query"] for f in app["failures"]}
+    )
+    if only_grogu:
+        print(f"\n{len(only_grogu)} quer{'y' if len(only_grogu) == 1 else 'ies'} that only grogu fails:")
+        for row in grogu["failures"]:
+            if row["query"] in only_grogu:
+                print(f"  [{row['class']}] {row['query']!r}: "
+                      f"{row['error'] or ', '.join(row['failed'])}")
+
+
+def _fmt(value) -> str:
+    return "--" if value is None else f"{value:.2f}"
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--index-db", required=True)
@@ -668,8 +934,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--only", default=None, help="run one class")
     parser.add_argument("--json-out", default=None)
     parser.add_argument(
-        "--target", choices=("auto", "app", "in-process"), default="auto",
+        "--target", choices=("auto", "app", "in-process", "grogu"), default="auto",
         help="auto: reuse the running app if there is one, else load an engine",
+    )
+    parser.add_argument(
+        "--compare", action="store_true",
+        help="run the app and grogu on the same cases and print the delta",
+    )
+    parser.add_argument(
+        "--grogu-limit", type=int, default=20,
+        help="message limit grogu applies (its `imessage search --limit`)",
     )
     parser.add_argument("--max-sessions", type=int, default=8)
     args = parser.parse_args(argv)
@@ -683,12 +957,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # rerank that takes 2.6s alone took 96s alongside the app, which made
     # every latency number meaningless. Reusing it also measures the path
     # that actually answers a user's query.
-    use_app = args.target == "app" or (args.target == "auto" and AppSearcher.available())
-    if use_app:
-        searcher = AppSearcher(max_sessions=args.max_sessions)
+    if args.compare:
+        return run_comparison(args, corpus)
+
+    if args.target == "grogu":
+        if not GroguSearcher.available():
+            print("grogu has no seaglass MCP server configured.", file=sys.stderr)
+            return 2
+        searcher = GroguSearcher(max_sessions=args.max_sessions, limit=args.grogu_limit)
+    elif args.target == "app" or (args.target == "auto" and AppSearcher.available()):
         if not AppSearcher.available():
             print("No running app to target (--target app).", file=sys.stderr)
             return 2
+        searcher = AppSearcher(max_sessions=args.max_sessions)
     else:
         searcher = EngineSearcher(
             args.index_db, args.chat_db, args.chat_db_source, max_sessions=args.max_sessions
