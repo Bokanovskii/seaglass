@@ -15,9 +15,9 @@ privacy boundary and its two consequences.
 Working end-to-end: index build, hybrid retrieval, reranking, session
 aggregation, and the MCP server are implemented and tested (see the
 [interactive architecture reference](https://bokanovskii.github.io/seaglass/architecture.html)
-for a detailed breakdown of every component). Grogu integrates with seaglass over MCP and prefers
-it over its legacy SQL `LIKE` fallback whenever seaglass is configured and
-reachable.
+for a detailed breakdown of every component). Seaglass is the provider for
+iMessage retrieval; harnesses such as Grogu load its skill and MCP server
+without implementing a separate Messages database fallback.
 
 See `development-plans/` for the design docs driving this build:
 
@@ -76,6 +76,25 @@ You can also build/update the index from the CLI instead of the app's UI
 ```bash
 seaglass build <chat_db_snapshot> <index_db>
 ```
+
+## Copilot capability plugin
+
+Seaglass owns its iMessage-specific agent guidance rather than requiring an AI
+harness to bundle macOS behavior. This repository is a Copilot plugin with a
+read-only `imessage` skill backed by the Seaglass MCP tools.
+
+Grogu users can add a local Seaglass checkout to their personal capability set:
+
+```bash
+grogu capability add /path/to/seaglass
+grogu capability list
+```
+
+Grogu then loads this repository with `--plugin-dir` on normal launches. The
+plugin registers its repository-local MCP entry point automatically; run
+`./setup.sh` first so `.venv` and the Seaglass package exist. Seaglass remains
+responsible for its own macOS requirements, Full Disk Access, index freshness,
+privacy boundary, and skill behavior.
 
 ## Development
 
@@ -137,4 +156,3 @@ seaglass-app --index-db /path/to/index.db --chat-db /path/to/chat_snapshot.db --
 ```
 
 By default this opens a native `pywebview` window. Use `--browser` if you want a browser tab for debugging. On first run, if no index exists yet, the app shows a "Build index now" screen instead of the warmup screen — building runs in the background with live progress, and the app automatically warms up and becomes searchable as soon as it finishes. Once ready, the app shows a real warmup screen while it loads model weights, warms SQLite, and prepares contacts, and its status bar always reports how in-sync the index is, with a "Sync now" button to pick up new messages any time. A Sync button also sits permanently in the status bar, so a re-index can be forced at any point rather than only when new messages happen to be detected. If `chat.db` or Full Disk Access is unavailable, the app explains that hydration is limited and tells you how to fix it. If GitHub Copilot CLI is missing, search still works normally; only optional query assist stays off.
-

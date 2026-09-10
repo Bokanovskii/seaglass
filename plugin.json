@@ -1,0 +1,9 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "seaglass",
+  "description": "Local iMessage search capabilities provided by Seaglass.",
+  "version": "0.1.0",
+  "repository": "https://github.com/Bokanovskii/seaglass",
+  "license": "MIT",
+  "keywords": ["imessage", "search", "local", "privacy"]
+}
