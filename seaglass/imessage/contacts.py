@@ -5,13 +5,20 @@ emails, so identity unification is system-maintained -- this is why
 seaglass has no `person` table (DESIGN-NOTES.md §9, "A `person` table
 mirroring contacts"). Contacts are loaded into memory once and resolved
 live; nothing about a contact is ever persisted into `index.db`.
+
+When the framework is denied, contacts are read read-only from the Contacts
+database instead (see `ContactIndex.load`).
 """
 
 from __future__ import annotations
 
 import dataclasses
+import glob
+import os
 import re
+import sqlite3
 import unicodedata
+from pathlib import Path
 from typing import Dict, List, Optional
 
 try:
@@ -33,6 +40,8 @@ except ImportError:  # pragma: no cover
     rf_distance = None
 
 DEFAULT_REGION = "US"
+ADDRESS_BOOK_DIR = Path.home() / "Library" / "Application Support" / "AddressBook"
+_ADDRESS_BOOK_FILE = "AddressBook-v22.abcddb"
 
 
 class ContactsUnavailableError(RuntimeError):
@@ -75,6 +84,62 @@ def _fold_name(raw: str) -> str:
     stripped = "".join(c for c in decomposed if not unicodedata.combining(c))
     cleaned = re.sub(r"[^\w\s]+", " ", stripped)
     return " ".join(cleaned.lower().split())
+
+
+def _display_name(given: object, family: object, nickname: object) -> str:
+    return str(nickname or "") or f"{given or ''} {family or ''}".strip()
+
+
+def _read_address_book(path: str, region: str) -> List[Contact]:
+    con = sqlite3.connect(f"{Path(path).as_uri()}?mode=ro", uri=True)
+    try:
+        handles_by_owner: Dict[int, List[str]] = {}
+        for query in (
+            "SELECT ZOWNER, ZFULLNUMBER FROM ZABCDPHONENUMBER "
+            "WHERE ZFULLNUMBER IS NOT NULL ORDER BY Z_PK",
+            "SELECT ZOWNER, ZADDRESS FROM ZABCDEMAILADDRESS "
+            "WHERE ZADDRESS IS NOT NULL ORDER BY Z_PK",
+        ):
+            for owner, raw in con.execute(query):
+                handles_by_owner.setdefault(owner, []).append(_normalise_handle(str(raw), region))
+        contacts: List[Contact] = []
+        for pk, unique_id, given, family, nickname in con.execute(
+            "SELECT Z_PK, ZUNIQUEID, ZFIRSTNAME, ZLASTNAME, ZNICKNAME FROM ZABCDRECORD ORDER BY Z_PK"
+        ):
+            display_name = _display_name(given, family, nickname)
+            if not display_name:
+                continue
+            contacts.append(
+                Contact(
+                    identifier=str(unique_id or pk),
+                    display_name=display_name,
+                    handles=tuple(handles_by_owner.get(pk, ())),
+                )
+            )
+        return contacts
+    finally:
+        con.close()
+
+
+def _load_address_book_contacts(
+    region: str = DEFAULT_REGION, root: Optional[Path] = None
+) -> Optional[List[Contact]]:
+    """Contacts read straight from every Contacts database, or None if none
+    could be read (no Full Disk Access, not macOS, or an unknown schema)."""
+    root = ADDRESS_BOOK_DIR if root is None else root
+    paths = [os.path.join(root, _ADDRESS_BOOK_FILE)]
+    paths.extend(sorted(glob.glob(os.path.join(glob.escape(str(root)), "Sources", "*", _ADDRESS_BOOK_FILE))))
+    contacts: List[Contact] = []
+    read_any = False
+    for path in paths:
+        if not os.path.isfile(path):
+            continue
+        try:
+            contacts.extend(_read_address_book(path, region))
+        except sqlite3.Error:
+            continue
+        read_any = True
+    return contacts if read_any else None
 
 
 def contacts_authorization_status() -> int:
@@ -141,6 +206,69 @@ def _request_access(store, timeout: float = 30.0) -> None:
         pass
 
 
+def _load_framework_contacts(region: str) -> List[Contact]:
+    if _Contacts is None:
+        raise ContactsUnavailableError(
+            "pyobjc-framework-Contacts is not installed or unavailable on this platform"
+        )
+    status = contacts_authorization_status()
+    # 0=notDetermined 1=restricted 2=denied 3=authorized (values per CNAuthorizationStatus)
+    if status not in (0, 3):
+        raise ContactsUnavailableError(
+            f"Contacts access not authorized (status={status}); grant access in "
+            "System Settings > Privacy & Security > Contacts, or grant Full Disk Access"
+        )
+    store = _Contacts.CNContactStore.alloc().init()
+    if status == 0:
+        # Best effort only, with a short timeout: during warmup there is
+        # usually no Cocoa event loop yet to present the prompt on (see
+        # request_contacts_access), so this must not stall startup.
+        _request_access(store, timeout=2.0)
+        status = contacts_authorization_status()
+        if status != 3:
+            raise ContactsUnavailableError(f"Contacts access not granted (status={status})")
+    keys = [
+        _Contacts.CNContactGivenNameKey,
+        _Contacts.CNContactFamilyNameKey,
+        _Contacts.CNContactNicknameKey,
+        _Contacts.CNContactPhoneNumbersKey,
+        _Contacts.CNContactEmailAddressesKey,
+        _Contacts.CNContactIdentifierKey,
+    ]
+    request = _Contacts.CNContactFetchRequest.alloc().initWithKeysToFetch_(keys)
+    contacts: List[Contact] = []
+    collected: List[object] = []
+
+    def handler(contact, stop):
+        collected.append(contact)
+
+    ok, error = store.enumerateContactsWithFetchRequest_error_usingBlock_(
+        request, None, handler
+    )
+    if not ok:
+        raise ContactsUnavailableError(f"enumerateContactsWithFetchRequest failed: {error}")
+
+    for contact in collected:
+        display_name = _display_name(contact.givenName(), contact.familyName(), contact.nickname())
+        if not display_name:
+            continue
+        handles = []
+        for labeled in contact.phoneNumbers():
+            value = labeled.value()
+            digits = str(value.stringValue())
+            handles.append(_normalise_handle(digits, region))
+        for labeled in contact.emailAddresses():
+            handles.append(_normalise_handle(str(labeled.value()), region))
+        contacts.append(
+            Contact(
+                identifier=str(contact.identifier()),
+                display_name=display_name,
+                handles=tuple(handles),
+            )
+        )
+    return contacts
+
+
 class ContactIndex:
     """In-memory contact roster, loaded once from the Contacts framework.
 
@@ -163,67 +291,20 @@ class ContactIndex:
 
     @classmethod
     def load(cls, region: str = DEFAULT_REGION) -> "ContactIndex":
-        if _Contacts is None:
-            raise ContactsUnavailableError(
-                "pyobjc-framework-Contacts is not installed or unavailable on this platform"
-            )
-        status = _Contacts.CNContactStore.authorizationStatusForEntityType_(
-            _Contacts.CNEntityTypeContacts
-        )
-        # 0=notDetermined 1=restricted 2=denied 3=authorized (values per CNAuthorizationStatus)
-        if status not in (0, 3):
-            raise ContactsUnavailableError(
-                f"Contacts access not authorized (status={status}); grant access in "
-                "System Settings > Privacy & Security > Contacts"
-            )
-        store = _Contacts.CNContactStore.alloc().init()
-        if status == 0:
-            # Best effort only, with a short timeout: during warmup there is
-            # usually no Cocoa event loop yet to present the prompt on (see
-            # request_contacts_access), so this must not stall startup.
-            _request_access(store, timeout=2.0)
-        keys = [
-            _Contacts.CNContactGivenNameKey,
-            _Contacts.CNContactFamilyNameKey,
-            _Contacts.CNContactNicknameKey,
-            _Contacts.CNContactPhoneNumbersKey,
-            _Contacts.CNContactEmailAddressesKey,
-            _Contacts.CNContactIdentifierKey,
-        ]
-        request = _Contacts.CNContactFetchRequest.alloc().initWithKeysToFetch_(keys)
-        contacts: List[Contact] = []
-        collected: List[object] = []
+        """Load every contact, from the framework or else the database.
 
-        def handler(contact, stop):
-            collected.append(contact)
-
-        ok, error = store.enumerateContactsWithFetchRequest_error_usingBlock_(
-            request, None, handler
-        )
-        if not ok:
-            raise ContactsUnavailableError(f"enumerateContactsWithFetchRequest failed: {error}")
-
-        for contact in collected:
-            given = str(contact.givenName() or "")
-            family = str(contact.familyName() or "")
-            nickname = str(contact.nickname() or "")
-            display_name = nickname or f"{given} {family}".strip()
-            if not display_name:
-                continue
-            handles = []
-            for labeled in contact.phoneNumbers():
-                value = labeled.value()
-                digits = str(value.stringValue())
-                handles.append(_normalise_handle(digits, region))
-            for labeled in contact.emailAddresses():
-                handles.append(_normalise_handle(str(labeled.value()), region))
-            contacts.append(
-                Contact(
-                    identifier=str(contact.identifier()),
-                    display_name=display_name,
-                    handles=tuple(handles),
-                )
-            )
+        The database fallback is for processes macOS never asks about
+        Contacts: an unbundled interpreter run by launchd (a headless
+        gateway, say) is denied by service policy, with no prompt and no
+        Settings toggle to grant. Full Disk Access, which chat.db already
+        needs, does cover the database files.
+        """
+        try:
+            contacts = _load_framework_contacts(region)
+        except ContactsUnavailableError:
+            contacts = _load_address_book_contacts(region)
+            if contacts is None:
+                raise
         return cls(contacts, region=region)
 
     def resolve_handle(self, handle: str) -> Optional[str]:

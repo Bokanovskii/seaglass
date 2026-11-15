@@ -1123,7 +1123,7 @@ whole-conversation questions. Add only if Phase 8 shows the gap.
 |---|---|
 | `~/Library/Messages/chat.db` | SQLite database — all message data |
 | `~/Library/Messages/Attachments/` | Attachment files (usually the bulk of disk usage) |
-| `~/Library/Application Support/AddressBook/…/AddressBook-v22.abcddb` | Contacts (Core Data; **use the framework instead**) |
+| `~/Library/Application Support/AddressBook/…/AddressBook-v22.abcddb` | Contacts (Core Data; **use the framework instead**, reading these read-only only when the framework is denied) |
 
 ### Key tables in `chat.db`
 

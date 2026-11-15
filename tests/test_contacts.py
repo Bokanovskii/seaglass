@@ -5,7 +5,19 @@ touching the real Contacts framework.
 
 from __future__ import annotations
 
-from seaglass.imessage.contacts import Contact, ContactIndex, _normalise_handle
+import sqlite3
+from types import SimpleNamespace
+
+import pytest
+
+from seaglass.imessage import contacts as contacts_module
+from seaglass.imessage.contacts import (
+    Contact,
+    ContactIndex,
+    ContactsUnavailableError,
+    _load_address_book_contacts,
+    _normalise_handle,
+)
 
 
 def test_normalise_handle_lowercases_email():
@@ -90,3 +102,101 @@ def test_similar_given_name_rejects_distant_and_short_words():
     assert index.handle_ids_for_similar_given_name('kayaking') == []
     assert index.handle_ids_for_similar_given_name('maya') == []  # different first letter
     assert index.handle_ids_for_similar_given_name('kay') == []   # too short to be sure
+
+
+_ADDRESS_BOOK = "AddressBook-v22.abcddb"
+
+
+def _write_address_book(path, records, phones=(), emails=()):
+    """A Contacts database with only the columns seaglass reads.
+    `records` rows are (Z_PK, ZUNIQUEID, ZFIRSTNAME, ZLASTNAME, ZNICKNAME, ZNAME)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(path)
+    con.executescript(
+        """
+        CREATE TABLE ZABCDRECORD (Z_PK INTEGER PRIMARY KEY, ZUNIQUEID TEXT, ZFIRSTNAME TEXT,
+                                  ZLASTNAME TEXT, ZNICKNAME TEXT, ZNAME TEXT);
+        CREATE TABLE ZABCDPHONENUMBER (Z_PK INTEGER PRIMARY KEY, ZOWNER INTEGER, ZFULLNUMBER TEXT);
+        CREATE TABLE ZABCDEMAILADDRESS (Z_PK INTEGER PRIMARY KEY, ZOWNER INTEGER, ZADDRESS TEXT);
+        """
+    )
+    con.executemany("INSERT INTO ZABCDRECORD VALUES (?, ?, ?, ?, ?, ?)", records)
+    con.executemany("INSERT INTO ZABCDPHONENUMBER VALUES (?, ?, ?)", phones)
+    con.executemany("INSERT INTO ZABCDEMAILADDRESS VALUES (?, ?, ?)", emails)
+    con.commit()
+    con.close()
+
+
+def test_address_book_reads_every_source_with_the_framework_name_rule(tmp_path):
+    import phonenumbers
+
+    example = phonenumbers.example_number("US")
+    national = phonenumbers.format_number(example, phonenumbers.PhoneNumberFormat.NATIONAL)
+    e164 = phonenumbers.format_number(example, phonenumbers.PhoneNumberFormat.E164)
+    _write_address_book(tmp_path / _ADDRESS_BOOK, [(1, "uid-local", "Local", "Person", None, None)])
+    _write_address_book(
+        tmp_path / "Sources" / "A" / _ADDRESS_BOOK,
+        [
+            (1, "uid-1", "Alice", "Chen", None, None),
+            (2, "uid-2", "Robert", "Smith", "Bob", None),
+            (3, "uid-group", None, None, None, "Family"),  # a group, not a person
+        ],
+        phones=[(1, 1, national)],
+        emails=[(1, 1, "Alice@Example.com")],
+    )
+
+    contacts = _load_address_book_contacts(root=tmp_path)
+
+    assert [(c.identifier, c.display_name, c.handles) for c in contacts] == [
+        ("uid-local", "Local Person", ()),
+        ("uid-1", "Alice Chen", (e164, "alice@example.com")),
+        ("uid-2", "Bob", ()),
+    ]
+
+
+def test_address_book_is_unavailable_when_nothing_can_be_read(tmp_path):
+    assert _load_address_book_contacts(root=tmp_path) is None
+    (tmp_path / _ADDRESS_BOOK).write_bytes(b"not a database")
+    assert _load_address_book_contacts(root=tmp_path) is None
+
+
+def _denied_framework(initial_status):
+    """A Contacts framework that denies access, as macOS does for an
+    unbundled interpreter run by launchd: the request fails without a prompt."""
+    state = {"status": initial_status}
+
+    def request_access(_entity, completion):
+        state["status"] = 2
+        completion(False, None)
+
+    store = SimpleNamespace(requestAccessForEntityType_completionHandler_=request_access)
+    return SimpleNamespace(
+        CNEntityTypeContacts=0,
+        CNContactStore=SimpleNamespace(
+            authorizationStatusForEntityType_=lambda _entity: state["status"],
+            alloc=lambda: SimpleNamespace(init=lambda: store),
+        ),
+    )
+
+
+@pytest.mark.parametrize("initial_status", [0, 2], ids=["request-denied", "already-denied"])
+def test_load_falls_back_to_the_database_when_the_framework_is_denied(
+    tmp_path, monkeypatch, initial_status
+):
+    _write_address_book(
+        tmp_path / "Sources" / "A" / _ADDRESS_BOOK,
+        [(1, "uid-1", "Alice", "Chen", None, None)],
+        emails=[(1, 1, "alice@example.com")],
+    )
+    monkeypatch.setattr(contacts_module, "_Contacts", _denied_framework(initial_status))
+    monkeypatch.setattr(contacts_module, "ADDRESS_BOOK_DIR", tmp_path)
+
+    assert ContactIndex.load().resolve_handle("alice@example.com") == "Alice Chen"
+
+
+def test_load_reports_the_denial_when_the_database_is_unreadable(tmp_path, monkeypatch):
+    monkeypatch.setattr(contacts_module, "_Contacts", _denied_framework(2))
+    monkeypatch.setattr(contacts_module, "ADDRESS_BOOK_DIR", tmp_path)
+
+    with pytest.raises(ContactsUnavailableError, match="status=2"):
+        ContactIndex.load()
