@@ -34,6 +34,10 @@ the architecture reference's performance section for the measured numbers.
 ## Requirements
 
 - macOS (Apple Silicon), Full Disk Access granted to whatever runs this
+- Contacts access, for sender names. Where macOS cannot ask for it -- an
+  unbundled interpreter run by launchd, such as a headless gateway, gets no
+  prompt and no Settings toggle -- seaglass reads the Contacts database
+  directly, which the Full Disk Access above already covers.
 - Python 3.11+ — **use a Homebrew or python.org build**, not the macOS system
   Python (`/usr/bin/python3`), which typically links an older SQLite lacking
   FTS5's `contentless_delete` support. Verified working with Homebrew's
@@ -114,7 +118,7 @@ seaglass/
   imessage/
     source.py            # the ONLY module aware of Apple's chat.db schema
     attributedbody.py    # typedstream decoding for the attributedBody blob
-    contacts.py           # PyObjC Contacts resolution
+    contacts.py           # Contacts resolution (PyObjC, database fallback)
   index/                 # chunking, embedding, build, sync
   search/                # query parsing, retrieval, reranking
   eval/                  # golden set + evaluation harness
