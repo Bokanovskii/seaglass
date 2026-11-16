@@ -25,7 +25,7 @@ from __future__ import annotations
 import dataclasses
 import sqlite3
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Optional
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence
 
 from seaglass.imessage.attributedbody import decode_attributed_body
 
@@ -111,10 +111,142 @@ def connect_readonly(chat_db: Path) -> sqlite3.Connection:
     change and yields silently corrupt reads on a live database
     (PLAN.md §6 Phase 1). Requires Full Disk Access for the caller.
     """
-    con = sqlite3.connect(":memory:", check_same_thread=False)
-    con.execute(f"ATTACH DATABASE 'file:{chat_db}?mode=ro' AS im")
-    assert_schema(con)
+    con = sqlite3.connect(":memory:", uri=True, check_same_thread=False)
+    try:
+        uri = chat_db.expanduser().absolute().as_uri() + "?mode=ro"
+        con.execute("ATTACH DATABASE ? AS im", (uri,))
+        assert_schema(con)
+        con.execute("PRAGMA query_only = ON")
+    except Exception:
+        con.close()
+        raise
     return con
+
+
+def apple_timestamp_sql(column: str = "m.date") -> str:
+    """Internal SQL equivalent of apple_to_unix, including mixed-unit history."""
+    return (
+        f"(CASE WHEN {column} > {NS_VS_S_THRESHOLD} "
+        f"THEN {column} / 1e9 ELSE {column} END + {APPLE_EPOCH_UNIX})"
+    )
+
+
+def newest_message_ts(con: sqlite3.Connection) -> Optional[float]:
+    value = con.execute(f"SELECT MAX({apple_timestamp_sql()}) FROM im.message m").fetchone()[0]
+    return float(value) if value is not None else None
+
+
+def count_messages_newer_than(con: sqlite3.Connection, ts: float) -> int:
+    return con.execute(
+        f"SELECT COUNT(*) FROM im.message m WHERE {apple_timestamp_sql()} > ?",
+        (ts,),
+    ).fetchone()[0]
+
+
+def _recent_selection(
+    *,
+    since_ts: float,
+    before_ts: float,
+    chat_id: Optional[int] = None,
+    chat_ids: Optional[Sequence[int]] = None,
+    sender_handles: Sequence[str] = (),
+    from_me: Optional[bool] = None,
+    has_media: bool = False,
+) -> tuple[str, list]:
+    has_attachment = (
+        "EXISTS (SELECT 1 FROM im.message_attachment_join maj WHERE maj.message_id = m.ROWID)"
+    )
+    conditions = [
+        "m.associated_message_type = 0",
+        f"{apple_timestamp_sql()} >= ?",
+        f"{apple_timestamp_sql()} <= ?",
+        f"(LENGTH(TRIM(m.text)) > 0 OR LENGTH(m.attributedBody) > 0 OR {has_attachment})",
+    ]
+    params: list = [since_ts, before_ts]
+    if chat_id is not None:
+        conditions.append("cmj.chat_id = ?")
+        params.append(chat_id)
+    if chat_ids is not None:
+        conditions.append(f"cmj.chat_id IN ({','.join('?' for _ in chat_ids)})")
+        params.extend(chat_ids)
+    if sender_handles:
+        conditions.append(f"h.id IN ({','.join('?' for _ in sender_handles)}) AND m.is_from_me = 0")
+        params.extend(sender_handles)
+    elif from_me is not None:
+        conditions.append("m.is_from_me = ?")
+        params.append(int(from_me))
+    if has_media:
+        conditions.append(has_attachment)
+    selection = f"""
+        FROM im.message m
+        JOIN im.chat_message_join cmj ON cmj.message_id = m.ROWID
+        LEFT JOIN im.handle h ON h.ROWID = m.handle_id
+        WHERE {' AND '.join(conditions)}
+    """
+    return selection, params
+
+
+def read_recent_messages(
+    con: sqlite3.Connection,
+    *,
+    since_ts: float,
+    before_ts: float,
+    limit: int,
+    offset: int = 0,
+    include_text: bool = True,
+    session_page: Optional[tuple[int, int]] = None,
+    **filters,
+) -> tuple[List[Message], Optional[int]]:
+    """Bounded, date-ordered live rows, without any index or model dependency.
+
+    An optional (offset, limit) day/chat session page supports the legacy
+    search result contract. Both selection and paging happen before bodies
+    are decoded; high-ROWID iCloud backfill cannot hide recent rows.
+    """
+    selection, params = _recent_selection(
+        since_ts=since_ts, before_ts=before_ts, **filters
+    )
+    total_sessions = None
+    if session_page is not None:
+        day = f"date({apple_timestamp_sql()}, 'unixepoch', 'localtime')"
+        grouped = f"SELECT cmj.chat_id, {day} AS day {selection} GROUP BY cmj.chat_id, day"
+        total_sessions = con.execute(f"SELECT COUNT(*) FROM ({grouped})", params).fetchone()[0]
+        session_offset, session_limit = session_page
+        groups = con.execute(
+            grouped + f" ORDER BY MAX({apple_timestamp_sql()}) DESC, cmj.chat_id DESC LIMIT ? OFFSET ?",
+            params + [session_limit, session_offset],
+        ).fetchall()
+        if not groups:
+            return [], total_sessions
+        selection += " AND (" + " OR ".join(
+            f"(cmj.chat_id = ? AND {day} = ?)" for _ in groups
+        ) + ")"
+        params += [value for group in groups for value in group]
+    bodies = "m.text, m.attributedBody" if include_text else "NULL, NULL"
+    rows = con.execute(
+        f"""
+        SELECT DISTINCT m.ROWID, cmj.chat_id, m.date, m.is_from_me, h.id, {bodies},
+               EXISTS (SELECT 1 FROM im.message_attachment_join maj WHERE maj.message_id = m.ROWID)
+        {selection}
+        ORDER BY {apple_timestamp_sql()} DESC, m.ROWID DESC, cmj.chat_id DESC
+        LIMIT ? OFFSET ?
+        """,
+        params + [limit, offset],
+    ).fetchall()
+    messages = []
+    for rowid, chat, date, is_from_me, handle, text, attributed_body, has_attachment in rows:
+        if include_text and not text and attributed_body:
+            text = decode_attributed_body(attributed_body)
+            if text is None:
+                # The historical decoder is deliberately best effort. A live
+                # lookup must not silently claim an unreadable body is absent.
+                raise RuntimeError("Live chat.db attributedBody decoding failed; update the typedstream decoder.")
+        messages.append(Message(
+            rowid=rowid, chat_id=chat, ts=apple_to_unix(date),
+            is_from_me=bool(is_from_me), handle=handle, text=text,
+            date_edited=None, date_retracted=None, has_attachment=bool(has_attachment),
+        ))
+    return messages, total_sessions
 
 
 _MESSAGE_QUERY = """

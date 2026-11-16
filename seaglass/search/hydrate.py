@@ -12,12 +12,14 @@ so a naive range spans other conversations (PLAN.md §6 step 7).
 from __future__ import annotations
 
 import dataclasses
-from typing import Dict, List, Optional, Sequence
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence
 
 from seaglass.imessage.attributedbody import decode_attributed_body
-from seaglass.imessage.contacts import ContactIndex
-from seaglass.imessage.source import apple_to_unix
-from seaglass.search.rank import Session
+from seaglass.imessage.source import apple_to_unix, read_recent_messages
+
+if TYPE_CHECKING:
+    from seaglass.imessage.contacts import ContactIndex
+    from seaglass.search.rank import Session
 
 # Stay well under SQLite's default 999-variable limit for `IN (...)`.
 _SQLITE_VARIABLE_BATCH = 800
@@ -240,74 +242,37 @@ def hydrate_recent_messages(
 
     Returns `(chat_id, HydratedMessage)` pairs, newest first.
 
-    The *scan* is by `ROWID` because `message.date` mixes seconds and
-    nanoseconds depending on the macOS version at write time (see
-    `imessage.source.apple_to_unix`), so it cannot be compared in SQL
-    across that boundary. The *result* is then sorted by real timestamp in
-    Python, because ROWID order is not date order: measured against a real
-    chat.db, 3000 consecutive rows contained 1234 places where the older
-    ROWID held the newer message. iCloud backfill is why -- a conversation
-    synced from another device is appended now but dated whenever it
-    happened.
-
-    That is also why the horizon is applied as a filter rather than as an
-    early `break`. Breaking at the first row at or before `since_ts` would
-    be correct only if ROWID order were date order; during a backfill it
-    would stop at a freshly-appended old message and silently drop every
-    genuinely new message behind it -- losing exactly the messages this
-    function exists to find.
+    Normalize mixed Apple timestamp units in SQL before filtering, sorting
+    and limiting. Limiting a ROWID-descending scan first can lose every new
+    message behind a large iCloud backfill, even if Python re-sorts it.
     """
+    import math
+
     if limit <= 0:
         return []
-    rows = chat_con.execute(
-        f"""
-        SELECT m.ROWID, m.text, m.attributedBody, m.date, m.is_from_me, h.id,
-               EXISTS (SELECT 1 FROM im.message_attachment_join maj
-                       WHERE maj.message_id = m.ROWID),
-               (SELECT cmj.chat_id FROM im.chat_message_join cmj
-                WHERE cmj.message_id = m.ROWID LIMIT 1)
-        FROM im.message m
-        LEFT JOIN im.handle h ON h.ROWID = m.handle_id
-        ORDER BY m.ROWID DESC
-        LIMIT ?
-        """,
-        (limit,),
-    ).fetchall()
+    rows, _ = read_recent_messages(
+        chat_con, since_ts=math.nextafter(since_ts, math.inf),
+        before_ts=until_ts if until_ts is not None else math.inf, limit=limit,
+    )
     if not rows:
         return []
-    attachment_kinds = _fetch_attachment_kinds(chat_con, [row[0] for row in rows])
+    attachment_kinds = _fetch_attachment_kinds(chat_con, [row.rowid for row in rows])
 
     out: List[tuple] = []
-    for rowid, text, attributed_body, date, is_from_me, handle, has_attachment, chat_id in rows:
-        ts = apple_to_unix(date)
-        if ts <= since_ts:
-            continue
-        if until_ts is not None and ts > until_ts:
-            continue
-        if chat_id is None:
-            continue
-        if not text and attributed_body:
-            text = decode_attributed_body(attributed_body)
-        kind = attachment_kinds.get(rowid) if has_attachment else None
-        if not (text or "").strip() and not kind:
-            # Same system-row filter hydration applies everywhere else: a
-            # group rename or a shared-location start carries neither text
-            # nor an attachment and renders as an empty bubble.
-            continue
+    for row in rows:
         out.append((
-            chat_id,
+            row.chat_id,
             HydratedMessage(
-                message_id=rowid,
-                ts=ts,
-                is_from_me=bool(is_from_me),
-                sender=_resolve_sender(is_from_me, handle, contact_index),
-                text=text,
-                has_attachment=bool(has_attachment),
-                attachment_kind=kind,
-                handle=handle,
+                message_id=row.rowid,
+                ts=row.ts,
+                is_from_me=row.is_from_me,
+                sender=_resolve_sender(row.is_from_me, row.handle, contact_index),
+                text=row.text,
+                has_attachment=row.has_attachment,
+                attachment_kind=attachment_kinds.get(row.rowid),
+                handle=row.handle,
             ),
         ))
-    out.sort(key=lambda pair: pair[1].ts, reverse=True)
     return out
 
 
@@ -316,11 +281,11 @@ def sessions_from_messages(pairs: Sequence[tuple], *, score: float = 0.0) -> Lis
     `(chat_id, day)` sessions the ranked path produces, newest first, so
     they can be merged with -- and are indistinguishable from -- sessions
     that came through the index."""
-    from seaglass.search.rank import _day_key
+    from datetime import datetime
 
     grouped: Dict[tuple, List[HydratedMessage]] = {}
     for chat_id, message in pairs:
-        grouped.setdefault((chat_id, _day_key(message.ts)), []).append(message)
+        grouped.setdefault((chat_id, datetime.fromtimestamp(message.ts).strftime("%Y-%m-%d")), []).append(message)
     sessions = [
         HydratedSession(
             chat_id=chat_id,

@@ -28,6 +28,11 @@ import numpy as np
 
 from seaglass.index.embed import EmbeddingModel, quantize_int8
 from seaglass.search.parse import ParsedQuery
+from seaglass.search.chat_filter import (
+    resolve_chat_id_filter,
+    resolve_group_chat_ids,
+    resolve_participant_chat_ids,
+)
 
 # BGE is an asymmetric embedder: queries need this instruction prefix,
 # documents never do. Omitting it is a measurable quality regression
@@ -58,83 +63,6 @@ RECENCY_RESERVED_SLOTS = 10
 class RetrievalResult:
     chunk_id: int
     rrf_score: float
-
-
-def resolve_participant_chat_ids(chat_con, handle_ids: Sequence[str]) -> Set[int]:
-    """"with X" semantics: chat_ids where these handles are a member.
-
-    Membership is the union of two sources, not just `chat_handle_join`.
-    That table is chat.db's *current* roster and it is not complete: on this
-    machine a 3,614-message SMS group listed none of its long-standing
-    participants, so "messages from Sachu" prefiltered his busiest chat
-    away and answered from the scraps that survived. Someone who wrote
-    messages in a chat was in that chat, whatever the roster says.
-    """
-    if not handle_ids:
-        return set()
-    placeholders = ",".join("?" for _ in handle_ids)
-    roster = f"""
-        SELECT DISTINCT chj.chat_id
-        FROM im.chat_handle_join chj
-        JOIN im.handle h ON h.ROWID = chj.handle_id
-        WHERE h.id IN ({placeholders})
-    """
-    authored = f"""
-        SELECT DISTINCT cmj.chat_id
-        FROM im.message m
-        JOIN im.handle h ON h.ROWID = m.handle_id
-        JOIN im.chat_message_join cmj ON cmj.message_id = m.ROWID
-        WHERE h.id IN ({placeholders}) AND m.is_from_me = 0
-    """
-    params = list(handle_ids)
-    found = {row[0] for row in chat_con.execute(roster, params)}
-    found |= {row[0] for row in chat_con.execute(authored, params)}
-    return found
-
-
-def resolve_group_chat_ids(chat_con, is_group: bool) -> Set[int]:
-    rows = chat_con.execute(
-        """
-        SELECT c.ROWID, c.style, COUNT(DISTINCT chj.handle_id)
-        FROM im.chat c
-        LEFT JOIN im.chat_handle_join chj ON chj.chat_id = c.ROWID
-        GROUP BY c.ROWID, c.style
-        """
-    ).fetchall()
-    matched = set()
-    for chat_id, style, participant_count in rows:
-        chat_is_group = int((style or 0) not in (45,)) if style is not None else participant_count > 1
-        if bool(chat_is_group) is bool(is_group):
-            matched.add(chat_id)
-    return matched
-
-def resolve_chat_id_filter(chat_con, parsed_query) -> Optional[Set[int]]:
-    """Which chats a query is allowed to answer from, or None for "any".
-
-    Shared rather than inlined because the filters-only path answers from
-    chat.db directly and must scope to exactly the same chats as the index
-    would. Two copies of this would drift, and the drift would be silent:
-    the answer would still look plausible, just drawn from a chat the user
-    excluded.
-
-    An empty set is meaningful -- it means "a filter resolved to no chats"
-    and callers must fail closed on it, not treat it as unfiltered.
-    """
-    if chat_con is None:
-        return None
-    filters: list[Set[int]] = []
-    if parsed_query.people_participant:
-        filters.append(resolve_participant_chat_ids(chat_con, parsed_query.people_participant))
-    if getattr(parsed_query, "is_group", None) is not None:
-        filters.append(resolve_group_chat_ids(chat_con, parsed_query.is_group))
-    if getattr(parsed_query, "chat_ids", None):
-        filters.append(set(parsed_query.chat_ids))
-    if not filters:
-        return None
-    chat_id_filter = filters[0]
-    for subset in filters[1:]:
-        chat_id_filter &= subset
-    return chat_id_filter
 
 
 def build_candidate_chunk_ids(

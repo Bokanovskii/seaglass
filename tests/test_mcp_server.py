@@ -40,6 +40,7 @@ def no_running_app(monkeypatch):
     """Never let a desktop app that happens to be running on the dev
     machine answer for the pipeline under test."""
     monkeypatch.setattr(mcp_server, "_running_app_lock", lambda: None)
+    monkeypatch.setattr(mcp_server, "_get_contact_index", lambda: None)
 
 
 def _fixture(tmp_path):
@@ -74,6 +75,7 @@ def _patch_server(monkeypatch, tmp_path):
     env vars and real model loads entirely.
     """
     chat_db_path, index_db_path = _fixture(tmp_path)
+    monkeypatch.setenv("SEAGLASS_CHAT_DB_SOURCE", str(chat_db_path))
     index_con = open_index_db(index_db_path)
     chat_con = connect_readonly(chat_db_path)
 
@@ -172,6 +174,7 @@ def test_get_conversation_around_ts_finds_old_message_beyond_2000_row_window(tmp
         }
     ]
     chat_db_path = build_fixture_chat_db(tmp_path, chats)
+    monkeypatch.setenv("SEAGLASS_CHAT_DB_SOURCE", str(chat_db_path))
     index_db_path = tmp_path / "index.db"
     build_index(chat_db_path, index_db_path, embedding_model=FakeEmbeddingModel(), batch_size=200)
     index_con = open_index_db(index_db_path)
@@ -193,6 +196,7 @@ def test_get_conversation_requires_chat_db(tmp_path, monkeypatch):
     index_con = open_index_db(index_db_path)
     monkeypatch.setattr(mcp_server, "_get_index_con", lambda: index_con)
     monkeypatch.setattr(mcp_server, "_get_chat_con", lambda: None)
+    monkeypatch.setenv("SEAGLASS_CHAT_DB_SOURCE", str(tmp_path / "missing-live.db"))
 
     try:
         mcp_server.get_conversation(chat_id=1)
@@ -325,7 +329,7 @@ def test_search_messages_forwards_offset_to_the_running_app(monkeypatch):
 
     monkeypatch.setattr(mcp_server, "_search_via_running_app", fake)
 
-    mcp_server.search_messages("latest from sam", max_sessions=8, offset=16)
+    mcp_server.search_messages("dinner reservation", max_sessions=8, offset=16)
 
     assert seen["offset"] == 16
 
@@ -339,6 +343,6 @@ def test_search_messages_offset_defaults_to_the_first_page(monkeypatch):
 
     monkeypatch.setattr(mcp_server, "_search_via_running_app", fake)
 
-    mcp_server.search_messages("latest from sam")
+    mcp_server.search_messages("dinner reservation")
 
     assert seen["offset"] == 0

@@ -10,11 +10,12 @@ from __future__ import annotations
 import dataclasses
 import datetime as dt
 import re
-from typing import List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 from dateparser.search import search_dates
 
-from seaglass.imessage.contacts import ContactIndex
+if TYPE_CHECKING:
+    from seaglass.imessage.contacts import ContactIndex
 
 # "photo/picture/video/screenshot" media keyword set (PLAN.md §6 Phase 4).
 _MEDIA_KEYWORDS = {"photo", "photos", "picture", "pictures", "pic", "pics",
@@ -114,7 +115,7 @@ def _is_contentless(residual: str) -> bool:
     # orphaned "s" behind, which made the residual look contentful and sent
     # a pure recency query through the embedder instead of browse.
     words = [w for w in words if len(w) > 1]
-    return bool(words) and all(word in _FILLER_WORDS for word in words)
+    return bool(words) and all(word in _FILLER_WORDS or word in _MEDIA_KEYWORDS for word in words)
 
 DATE_PAD_DAYS = 3
 PEOPLE_FUZZY_THRESHOLD = 85.0  # rapidfuzz score, 0-100; prefer no filter to a wrong one

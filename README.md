@@ -26,10 +26,60 @@ See `development-plans/` for the design docs driving this build:
 - **`EVALUATION.md`** — how retrieval quality, latency, and correctness are measured.
 - **`ADDENDUM.md`** — running log of decisions and findings as the build progressed.
 
-There is currently no persistent daemon — each invocation loads the
-embedding model and reranker fresh and exits. This was a deliberate initial
-choice to measure real cold-start cost before building a daemon/shim; see
-the architecture reference's performance section for the measured numbers.
+There is no shared model daemon. Each MCP process loads semantic models only
+when a topical search needs them, then keeps them warm for that client session.
+Listing tools, recent-message reads, conversation reads and filters-only searches
+do not open the semantic index or load model weights.
+
+## Live recent iMessages over MCP
+
+Use `recent_messages` (projected as `seaglass__recent_messages` by OpenClaw)
+for current messages, without building or syncing the index:
+
+```json
+{"since_ts": null, "before_ts": null, "limit": 50, "offset": 0, "chat_id": null, "include_text": true}
+```
+
+`since_ts` and `before_ts` are inclusive Unix-seconds bounds. Null defaults
+mean the last 24 hours through the observation time. `limit` is 1–100 and
+`offset` is a nonnegative page offset; `chat_id` optionally narrows to one chat.
+Set `include_text=false` for freshness/setup checks: the `text` key is omitted
+and attributed bodies are not decoded. Attachment bytes/files are never loaded.
+
+The response contains `source: "live_chat_db"`, `observed_at_ts`,
+`newest_source_ts` (global live newest timestamp, independent of filters or
+index coverage), resolved `since_ts`/`before_ts`, `limit`, `offset`, `has_more`,
+`next_offset` (null on the last page), and `messages`. Each message has
+`message_id`, `chat_id`, `ts`, `is_from_me`, contact-resolved `sender`,
+`has_attachment`, and, when requested, resolved `text` or null for attachments.
+`sender` is the contact display name when available, the raw handle for an
+unknown sender, or null for outgoing messages. Contact resolution also applies
+to metadata-only reads and cold `get_conversation` calls. Unavailable Contacts
+access logs a warning and leaves raw handles rather than guessing names.
+Rows are newest first with descending message/chat ID tie-breakers. Reuse
+the returned time bounds with `next_offset` to page the same window. Bounds
+freeze time, not database membership: late iCloud backfill within that window
+can still shift offset pages.
+
+The live source is resolved from `SEAGLASS_CHAT_DB_SOURCE`, then the app's
+`chat_db_source`, then `~/Library/Messages/chat.db`. Connections use `mode=ro`
+and `query_only`, never `immutable=1`, so committed WAL messages are visible.
+No stale snapshot fallback is allowed: missing access, schema changes, SQLite
+errors and undecodable attributed bodies produce explicit tool errors.
+Grant Full Disk Access to the **actual MCP/Gateway launcher** and recreate its
+MCP process after permission/source changes; a successful terminal read does
+not prove the Gateway's child has permission.
+
+`search_messages` preserves its session-shaped response but routes empty,
+recency-only and filters-only queries directly to this live path before
+consulting the desktop app or opening the index/models. Its `offset` remains
+a **session** offset, unlike `recent_messages`' message offset. The result
+reports `served_from: "live_chat_db"` and the live newest timestamp; index
+coverage fields are null because the index was deliberately not inspected.
+Live reads load Contacts for sender names, but not search models. `get_conversation`
+also reads live, including historical `around_ts` drill-downs. Explicit
+topical/semantic searches still use the app/index and its coverage diagnostics;
+only those searches need a built index and its normal sync lifecycle.
 
 ## Requirements
 
