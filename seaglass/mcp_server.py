@@ -25,11 +25,9 @@ then.
 even without a separate shim). All logging in this module goes to
 stderr.
 
-Tools implemented (PLAN.md §6 table, minus `sync_index` -- there is no
-`index/sync.py` yet; Phase 7 incremental sync is still unbuilt, so
-re-indexing is the only update path for now, exactly as the user agreed
-to when told the machine is mid-iCloud-backfill):
+Tools:
 
+- `recent_messages(...)` -- bounded live date/chat paging, no semantic resources.
 - `search_messages(query, max_sessions=8, redact=False)` -- the main
   tool: full pre-filter -> RRF -> rerank -> aggregate -> expand ->
   hydrate -> format pipeline.
@@ -39,50 +37,59 @@ to when told the machine is mid-iCloud-backfill):
 - `index_status()` -- chunk/vector counts and index paths, so the
   calling model (or a human debugging a session) can tell whether the
   index is stale or missing before trusting a search result.
+- `sync_index(wait=False)` -- explicitly ask the running app to sync.
 
 Configuration is by environment variable (there being no daemon config
 file / launchd plist yet, per the above deviation):
 
-- `SEAGLASS_INDEX_DB` (required) -- path to a built `index.db`.
+- `SEAGLASS_CHAT_DB_SOURCE` -- live Apple database for recent/conversation reads;
+  otherwise app config's chat_db_source, then ~/Library/Messages/chat.db.
+- `SEAGLASS_INDEX_DB` (semantic searches only) -- path to a built `index.db`.
 - `SEAGLASS_CHAT_DB` (optional) -- path to a `chat.db` snapshot for
   hydration and people-filtering; if unset, `search_messages` still
   works but returns un-hydrated chunk previews instead of real messages,
-  and `get_conversation` is unavailable.
+  without affecting live recent/conversation reads.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import os
 import sqlite3
 import sys
 import threading
 import time
-import zstandard
+from contextlib import contextmanager
 from pathlib import Path
-from typing import List, Optional
+from typing import TYPE_CHECKING, Annotated, Optional
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from mcp.server import MCPServer
+from pydantic import Field
 
-from seaglass.imessage.contacts import ContactIndex, ContactsUnavailableError
-from seaglass.imessage.source import apple_to_unix, connect_readonly
-from seaglass.index.build import open_index_db
-from seaglass.index.embed import EmbeddingModel
-from seaglass.search.format import format_search_result
-from seaglass.search.hydrate import hydrate_sessions
-from seaglass.search.conversation import fetch_conversation
-from seaglass.search.parse import parse_query
-from seaglass.search.rank import aggregate_sessions, expand_sessions, rerank_candidates
-from seaglass.search.rerank import CrossEncoderReranker
-from seaglass.search.retrieve import retrieve
+from seaglass.imessage.source import (
+    SchemaDriftError,
+    apple_to_unix,
+    connect_readonly,
+    count_messages_newer_than,
+    newest_message_ts,
+    read_recent_messages,
+)
+
+if TYPE_CHECKING:
+    from seaglass.imessage.contacts import ContactIndex
+    from seaglass.index.embed import EmbeddingModel
+    from seaglass.search.rerank import CrossEncoderReranker
 
 server = MCPServer(
     name="seaglass",
     version="0.1.0",
     instructions=(
-        "Search the user's iMessage history by topic/content. Good for: "
+        "Use recent_messages for current/recent messages directly from live chat.db, "
+        "without indexing or loading models; include_text=false checks freshness. "
+        "Use search_messages to search the user's iMessage history by topic/content. Good for: "
         "\"what did we say about X\", \"find the message where Y\", topical "
         "recall over past conversations. Bad at: exhaustive enumeration "
         "(\"list every time we talked about X\") or counting -- this is a "
@@ -147,6 +154,8 @@ def _resolve_path(env_var: str, from_config) -> Optional[str]:
 
 
 def _get_index_con() -> sqlite3.Connection:
+    from seaglass.index.build import open_index_db
+
     global _index_con
     if _index_con is None:
         with _init_lock:
@@ -183,6 +192,8 @@ def _get_chat_con() -> Optional[sqlite3.Connection]:
 
 
 def _get_embedding_model() -> EmbeddingModel:
+    from seaglass.index.embed import EmbeddingModel
+
     global _embedding_model
     if _embedding_model is None:
         with _init_lock:
@@ -195,6 +206,8 @@ def _get_embedding_model() -> EmbeddingModel:
 
 
 def _get_reranker() -> CrossEncoderReranker:
+    from seaglass.search.rerank import CrossEncoderReranker
+
     global _reranker
     if _reranker is None:
         with _init_lock:
@@ -207,6 +220,8 @@ def _get_reranker() -> CrossEncoderReranker:
 
 
 def _get_contact_index() -> Optional[ContactIndex]:
+    from seaglass.imessage.contacts import ContactIndex, ContactsUnavailableError
+
     global _contact_index, _contact_index_attempted
     if not _contact_index_attempted:
         with _init_lock:
@@ -217,6 +232,114 @@ def _get_contact_index() -> Optional[ContactIndex]:
                 except ContactsUnavailableError:
                     _log("Contacts unavailable -- names will degrade to raw handles")
     return _contact_index
+
+
+def _live_source_path() -> Path:
+    value = os.environ.get("SEAGLASS_CHAT_DB_SOURCE")
+    if not value:
+        from seaglass.app.config import DEFAULT_CHAT_DB_SOURCE, load_config
+
+        try:
+            value = load_config().chat_db_source or DEFAULT_CHAT_DB_SOURCE
+        except (OSError, ValueError, TypeError) as error:
+            raise RuntimeError(
+                "Cannot resolve live chat.db source: fix the Seaglass app config "
+                "or set SEAGLASS_CHAT_DB_SOURCE explicitly. No snapshot fallback was used."
+            ) from error
+    return Path(value).expanduser()
+
+
+@contextmanager
+def _live_chat():
+    con = None
+    try:
+        con = connect_readonly(_live_source_path())
+        # Keep metadata and the bounded page on one observed SQLite snapshot,
+        # then close it immediately so the next call sees new WAL commits.
+        con.execute("BEGIN")
+        yield con
+    except (OSError, sqlite3.Error, SchemaDriftError) as error:
+        raise RuntimeError(
+            "Live chat.db read failed. Check SEAGLASS_CHAT_DB_SOURCE and grant "
+            "Full Disk Access to the actual MCP/Gateway launcher, then recreate "
+            "its MCP process. No snapshot/index fallback was used "
+            f"({type(error).__name__}: {error})."
+        ) from error
+    finally:
+        if con is not None:
+            con.close()
+
+
+def _bounded_int(name: str, value: int, minimum: int, maximum: Optional[int] = None) -> None:
+    if type(value) is not int or value < minimum or (maximum is not None and value > maximum):
+        raise ValueError(f"{name} must be an integer >= {minimum}" + (
+            f" and <= {maximum}" if maximum is not None else ""
+        ))
+
+
+def _timestamp(name: str, value: float) -> None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ValueError(f"{name} must be finite Unix seconds")
+
+
+@server.tool()
+def recent_messages(
+    since_ts: Annotated[Optional[float], Field(strict=True, allow_inf_nan=False)] = None,
+    before_ts: Annotated[Optional[float], Field(strict=True, allow_inf_nan=False)] = None,
+    limit: Annotated[int, Field(strict=True, ge=1, le=100)] = 50,
+    offset: Annotated[int, Field(strict=True, ge=0)] = 0,
+    chat_id: Annotated[Optional[int], Field(strict=True)] = None,
+    include_text: Annotated[bool, Field(strict=True)] = True,
+) -> dict:
+    """Read recent iMessages directly from live chat.db, never the search index.
+
+    Null bounds mean the last 24 hours through now. Bounds are inclusive.
+    Reuse returned since_ts/before_ts with next_offset for stable time-window
+    paging. include_text=false omits bodies and never decodes attributedBody.
+    Missing Full Disk Access, schema problems and decoding errors fail loudly;
+    no sync, model loading or stale snapshot fallback is attempted.
+    """
+    _bounded_int("limit", limit, 1, 100)
+    _bounded_int("offset", offset, 0)
+    if chat_id is not None and type(chat_id) is not int:
+        raise ValueError("chat_id must be an integer or null")
+    if type(include_text) is not bool:
+        raise ValueError("include_text must be a boolean")
+    observed_at = time.time()
+    since = observed_at - 86400 if since_ts is None else since_ts
+    before = observed_at if before_ts is None else before_ts
+    _timestamp("since_ts", since)
+    _timestamp("before_ts", before)
+    if since > before:
+        raise ValueError("since_ts must not be after before_ts")
+    with _live_chat() as con:
+        newest = newest_message_ts(con)
+        rows, _ = read_recent_messages(
+            con, since_ts=since, before_ts=before, limit=limit + 1,
+            offset=offset, chat_id=chat_id, include_text=include_text,
+        )
+    has_more = len(rows) > limit
+    from seaglass.search.hydrate import _resolve_sender
+
+    contact_index = _get_contact_index()
+    messages = []
+    for row in rows[:limit]:
+        message = {
+            "message_id": row.rowid, "chat_id": row.chat_id, "ts": row.ts,
+            "is_from_me": row.is_from_me,
+            "sender": _resolve_sender(row.is_from_me, row.handle, contact_index),
+            "has_attachment": row.has_attachment,
+        }
+        if include_text:
+            message["text"] = row.text
+        messages.append(message)
+    return {
+        "source": "live_chat_db", "observed_at_ts": observed_at,
+        "newest_source_ts": newest, "since_ts": since, "before_ts": before,
+        "limit": limit, "offset": offset, "has_more": has_more,
+        "next_offset": offset + len(messages) if has_more else None,
+        "messages": messages,
+    }
 
 
 # Separate from _init_lock: this serializes actual MLX inference calls
@@ -245,6 +368,10 @@ def search_messages(
     corpus. Any date range or participant name mentioned in `query` is
     parsed automatically (e.g. "last week", "with Sam") -- `person`
     matches chat participants, not people merely mentioned in message text.
+
+    Recency-only and filters-only requests read live chat.db without the
+    app bridge, semantic index, model loading or syncing. Use recent_messages
+    instead for explicit message-level bounds and metadata-only checks.
 
     Pass `offset` to page: a chronological answer ("latest from Sam")
     orders whole days, and one page of them holds fewer messages than a
@@ -287,13 +414,7 @@ def _get_engine():
     # Staleness must be judged against the *live* chat.db. Without this the
     # engine falls back to the snapshot, which is by definition exactly as
     # stale as the index, so every result claims to be up to date.
-    if not _engine.chat_db_source:
-        try:
-            from seaglass.app.config import load_config
-
-            _engine.chat_db_source = load_config().chat_db_source
-        except Exception:  # noqa: BLE001 - no config is not a search failure
-            pass
+    _engine.chat_db_source = str(_live_source_path())
     _engine.index_con = _get_index_con()
     _engine.chat_con = _get_chat_con()
     _engine.embedding_model = _get_embedding_model()
@@ -384,6 +505,20 @@ def _search_messages_impl(
     query: str, *, max_sessions: int, redact: bool, offset: int = 0
 ) -> dict:
     t0 = time.time()
+    from seaglass.search.parse import parse_query
+
+    parsed = parse_query(query)
+    contact_index = None
+    if parsed.semantic.strip():
+        contact_index = _get_contact_index()
+        if contact_index is not None:
+            parsed = parse_query(query, contact_index=contact_index)
+    if not parsed.semantic.strip():
+        contact_index = _get_contact_index()
+        return _search_live_recent(
+            parsed, max_sessions=max_sessions, redact=redact, offset=offset,
+            contact_index=contact_index, t0=t0,
+        )
 
     payload = _search_via_running_app(
         query, max_sessions=max_sessions, redact=redact, offset=offset
@@ -407,6 +542,10 @@ def _search_messages_impl(
     # No chat.db to hydrate from: fall back to un-hydrated chunk previews
     # rather than failing the tool call outright. This path can't use the
     # engine, which has nothing to show without message bodies.
+    import zstandard
+    from seaglass.search.rank import aggregate_sessions, expand_sessions, rerank_candidates
+    from seaglass.search.retrieve import retrieve
+
     index_con = _get_index_con()
     contact_index = _get_contact_index()
     parsed = parse_query(query, contact_index=contact_index)
@@ -452,6 +591,52 @@ def _search_messages_impl(
         }
 
 
+def _search_live_recent(parsed, *, max_sessions, redact, offset, contact_index, t0):
+    from seaglass.search.chat_filter import resolve_chat_id_filter
+    from seaglass.search.format import format_search_result
+    from seaglass.search.hydrate import HydratedMessage, _fetch_attachment_kinds, _resolve_sender, sessions_from_messages
+
+    _bounded_int("max_sessions", max_sessions, 1, 100)
+    _bounded_int("offset", offset, 0)
+    observed_at = time.time()
+    since = parsed.date_from if parsed.date_from is not None else 0
+    before = parsed.date_to if parsed.date_to is not None else observed_at
+    with _live_chat() as con:
+        allowed = resolve_chat_id_filter(con, parsed)
+        newest = newest_message_ts(con)
+        rows, total_sessions = read_recent_messages(
+            con, since_ts=since, before_ts=before, limit=10 * max_sessions,
+            session_page=(offset, max_sessions), chat_ids=sorted(allowed) if allowed is not None else None,
+            sender_handles=parsed.people_sender, from_me=parsed.from_me, has_media=parsed.has_media,
+        )
+        kinds = _fetch_attachment_kinds(con, [row.rowid for row in rows])
+    pairs = [
+        (row.chat_id, HydratedMessage(
+            message_id=row.rowid, ts=row.ts, is_from_me=row.is_from_me,
+            sender=_resolve_sender(row.is_from_me, row.handle, contact_index),
+            text=row.text, has_attachment=row.has_attachment,
+            attachment_kind=kinds.get(row.rowid), handle=row.handle,
+        ))
+        for row in rows
+    ]
+    payload = format_search_result(sessions_from_messages(pairs), redact=redact)
+    payload.update({
+        "ordering": "recent", "offset": offset, "total_sessions": total_sessions,
+        "has_more": offset + max_sessions < total_sessions,
+        "next_offset": offset + max_sessions,
+        "effective_filters": {
+            key: getattr(parsed, key) for key in (
+                "people_participant", "people_sender", "date_from", "date_to",
+                "has_media", "from_me", "is_group", "chat_ids", "semantic",
+            )
+        },
+        # Index coverage is deliberately unknown: this read does not open it.
+        "index_stale": None, "n_messages_since_index": None, "unindexed_included": None,
+        "served_from": "live_chat_db", "source": "live_chat_db",
+        "observed_at_ts": observed_at, "newest_source_ts": newest,
+        "elapsed_s": round(time.time() - t0, 2),
+    })
+    return payload
 
 
 @server.tool()
@@ -462,19 +647,19 @@ def get_conversation(chat_id: int, around_ts: Optional[float] = None, limit: int
     given, returns the `limit` messages closest in time to it; otherwise
     returns the most recent `limit` messages in the chat.
     """
-    chat_con = _get_chat_con()
-    if chat_con is None:
-        raise RuntimeError(
-            "get_conversation requires SEAGLASS_CHAT_DB to be set -- "
-            "no chat.db snapshot is configured for this server."
+    from seaglass.search.conversation import fetch_conversation
+
+    _bounded_int("limit", limit, 1, 100)
+    if type(chat_id) is not int:
+        raise ValueError("chat_id must be an integer")
+    if around_ts is not None:
+        _timestamp("around_ts", around_ts)
+    contact_index = _get_contact_index()
+    with _live_chat() as chat_con:
+        return fetch_conversation(
+            chat_con, chat_id=chat_id, around_ts=around_ts, limit=limit,
+            contact_index=contact_index,
         )
-    return fetch_conversation(
-        chat_con,
-        chat_id=chat_id,
-        around_ts=around_ts,
-        limit=limit,
-        contact_index=_get_contact_index(),
-    )
 
 
 
@@ -482,9 +667,9 @@ def get_conversation(chat_id: int, around_ts: Optional[float] = None, limit: int
 def index_status() -> dict:
     """Report index size, freshness and hydration support.
 
-    Freshness is the part that matters to a caller: the index is a
-    snapshot, so anything said since the last build is simply invisible to
-    search. Reporting only chunk counts (as this once did) meant a caller
+    This diagnoses topical/semantic index coverage, not live-reader coverage:
+    recent_messages and recency-only searches do not need an up-to-date index.
+    Reporting only chunk counts (as this once did) meant a caller
     could not distinguish "she never mentioned it" from "she mentioned it
     after the last sync", which are opposite answers. `n_messages_since_index`
     is that gap; `stale` is the same thing as a yes/no.
@@ -525,22 +710,22 @@ def index_status() -> dict:
 
 
 def _staleness(most_recent_chunk_ts) -> dict:
-    """How many messages have arrived since the index was last built.
-
-    Delegated to the engine rather than reimplemented: it reads the *live*
-    chat.db (the snapshot is by definition as stale as the index) and it
-    already handles chat.db's seconds-or-nanoseconds `date` column, which
-    is exactly the sort of detail a second copy gets subtly wrong.
-    """
-    result = {"n_messages_since_index": 0, "live_chat_readable": False, "stale": False}
+    """Freshness diagnostics do not require a semantic engine or model."""
+    result = {"n_messages_since_index": None, "live_chat_readable": False, "stale": None}
     try:
-        engine = _get_engine()  # already points at the live chat.db
-        _, newer = engine._cached_freshness(most_recent_chunk_ts)
+        with _live_chat() as con:
+            newest = newest_message_ts(con)
+            newer = count_messages_newer_than(
+                con, most_recent_chunk_ts if most_recent_chunk_ts is not None else 0,
+            )
     except Exception as error:  # noqa: BLE001 - usually Full Disk Access
         result["live_chat_error"] = str(error)
         return result
     result.update(
-        {"n_messages_since_index": int(newer), "live_chat_readable": True, "stale": bool(newer)}
+        {
+            "n_messages_since_index": int(newer), "live_chat_readable": True,
+            "stale": bool(newer), "newest_source_ts": newest,
+        }
     )
     return result
 
@@ -569,12 +754,11 @@ def sync_index(wait: bool = False) -> dict:
     """Bring the search index up to date with messages sent since it was
     last built.
 
-    Call this when `index_status` reports `stale`: anything said after the
-    last build is invisible to `search_messages`, which is indistinguishable
-    from it never having been said. A sync re-snapshots chat.db and indexes
-    only what is new. Pass `wait=true` to block until it finishes (minutes
-    for a large backlog); otherwise it returns immediately and progress can
-    be polled with `index_status`.
+    Only needed for topical/semantic index coverage. recent_messages,
+    get_conversation and recency-only search_messages read live and never
+    require a sync. A sync re-snapshots chat.db and indexes only what is new.
+    Pass `wait=true` to block until it finishes (minutes for a large backlog);
+    otherwise it returns immediately and progress can be polled with index_status.
     """
     lock = _running_app_lock()
     if lock is None:

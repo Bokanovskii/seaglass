@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from seaglass.imessage.attributedbody import decode_attributed_body
-from seaglass.imessage.contacts import ContactIndex
-from seaglass.imessage.source import apple_to_unix
+from seaglass.imessage.source import apple_timestamp_sql, apple_to_unix
 from seaglass.search.hydrate import HydratedMessage, _fetch_attachment_kinds, _resolve_sender
+
+if TYPE_CHECKING:
+    from seaglass.imessage.contacts import ContactIndex
 
 
 def fetch_conversation(
@@ -17,12 +19,12 @@ def fetch_conversation(
 ) -> dict:
     if around_ts is not None:
         id_date_rows = chat_con.execute(
-            """
+            f"""
             SELECT m.ROWID, m.date
             FROM im.message m
             JOIN im.chat_message_join cmj ON cmj.message_id = m.ROWID
-            WHERE cmj.chat_id = ?
-            ORDER BY m.date ASC
+            WHERE cmj.chat_id = ? AND m.associated_message_type = 0
+            ORDER BY {apple_timestamp_sql()} ASC, m.ROWID ASC
             """,
             (chat_id,),
         ).fetchall()
@@ -48,13 +50,13 @@ def fetch_conversation(
         rows = chat_con.execute(query, target_ids).fetchall()
     else:
         rows = chat_con.execute(
-            """
+            f"""
             SELECT m.ROWID, m.text, m.attributedBody, m.date, m.is_from_me, h.id
             FROM im.message m
             JOIN im.chat_message_join cmj ON cmj.message_id = m.ROWID
             LEFT JOIN im.handle h ON h.ROWID = m.handle_id
-            WHERE cmj.chat_id = ?
-            ORDER BY m.date DESC
+            WHERE cmj.chat_id = ? AND m.associated_message_type = 0
+            ORDER BY {apple_timestamp_sql()} DESC, m.ROWID DESC
             LIMIT ?
             """,
             (chat_id, limit),

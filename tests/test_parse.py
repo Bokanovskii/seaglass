@@ -22,6 +22,10 @@ def _sample_index() -> ContactIndex:
 
 
 class TestMediaFilter:
+    def test_media_only_query_browses_but_media_topic_still_searches(self):
+        assert parse_query("latest photos").semantic == ""
+        assert "sunset" in parse_query("photos of the sunset").semantic
+
     def test_detects_photo_keyword(self):
         parsed = parse_query("find that photo of the sunset")
         assert parsed.has_media is True

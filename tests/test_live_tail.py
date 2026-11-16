@@ -141,6 +141,21 @@ class TestHydrateRecentMessages:
         texts = [m.text for _, m in hydrate_recent_messages(con, since_ts=0)]
         assert texts == ['newest but lowest rowid', 'oldest but highest rowid']
 
+    def test_limit_applies_after_dates_not_before_backfill(self, tmp_path):
+        chat_db = build_fixture_chat_db(
+            tmp_path,
+            [{
+                "chat_id": 1, "handles": ["synthetic@example.invalid"],
+                "messages": [
+                    ("newest", (APPLE_EPOCH_START + 900) * 10**9, False, 0),
+                    ("second", APPLE_EPOCH_START + 800, False, 0),
+                ] + [("backfill", APPLE_EPOCH_START - i, False, 0) for i in range(50)],
+            }],
+        )
+        con = connect_readonly(chat_db)
+        pairs = hydrate_recent_messages(con, since_ts=0, limit=2)
+        assert [message.text for _, message in pairs] == ["newest", "second"]
+
 
 class TestSessionsFromMessages:
     def test_groups_by_chat_and_day_newest_session_first(self):
